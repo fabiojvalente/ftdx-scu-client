@@ -25,10 +25,12 @@
 mod config;
 mod event;
 mod session;
+mod transport;
 
 pub use config::ConnectConfig;
 pub use event::Event;
 pub use session::{ClientError, ScuClient, ScuHandle};
+pub use transport::timeout;
 
 pub use scu_audio::AudioFrame;
 pub use scu_cat::{Mode, RadioModel};

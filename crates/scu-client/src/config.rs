@@ -10,6 +10,10 @@ pub struct ConnectConfig {
     pub base_port: u16,
     pub username: String,
     pub password: String,
+    /// WebSocket URL of a `scu-bridge` relay. Required by the browser build;
+    /// ignored by the native build, which speaks UDP directly.
+    #[serde(default)]
+    pub bridge_url: Option<String>,
 }
 
 impl Default for ConnectConfig {
@@ -19,6 +23,7 @@ impl Default for ConnectConfig {
             base_port: DEFAULT_BASE_PORT,
             username: "defaultuser".into(),
             password: "defaultuser".into(),
+            bridge_url: None,
         }
     }
 }
@@ -34,6 +39,7 @@ impl ConnectConfig {
             base_port: DEFAULT_BASE_PORT,
             username: username.into(),
             password: password.into(),
+            bridge_url: None,
         }
     }
 

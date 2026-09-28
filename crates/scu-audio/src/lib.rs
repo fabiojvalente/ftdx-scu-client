@@ -3,11 +3,22 @@
 //! Each RX packet carries a 24-byte inner header followed by 640 bytes of
 //! interleaved stereo `Int16 LE` PCM at 16 kHz (160 stereo frames / 10 ms).
 //!
-//! This module is pure decoding + a small PCM ring buffer. The `cpal` playback
-//! backend lives in [`output`].
+//! This module is pure decoding + a small PCM ring buffer. The platform
+//! playback/capture backends live in [`output`] and [`input`]: `cpal` on the
+//! desktop, the Web Audio API in the browser.
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod input;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod output;
+
+#[cfg(target_arch = "wasm32")]
+#[path = "web/input.rs"]
+pub mod input;
+#[cfg(target_arch = "wasm32")]
+#[path = "web/output.rs"]
+pub mod output;
+
 mod resample;
 
 use scu_protocol::{AUDIO_BODY_LEN, AUDIO_INNER_HEADER_LEN, AUDIO_PAYLOAD_LEN};

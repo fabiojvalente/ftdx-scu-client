@@ -1,9 +1,11 @@
 mod app;
+mod theme;
 mod waterfall;
 
-use eframe::egui;
-
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
+    use eframe::egui;
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -24,4 +26,38 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(app::ScuApp::new(cc)))),
     )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn main() {}
+
+/// Browser entry point, invoked automatically by the wasm-bindgen glue.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn start() {
+    console_error_panic_hook::set_once();
+    tracing_wasm::set_as_global_default();
+
+    wasm_bindgen_futures::spawn_local(async {
+        use wasm_bindgen::JsCast;
+
+        let document = web_sys::window()
+            .expect("no window")
+            .document()
+            .expect("no document");
+        let canvas = document
+            .get_element_by_id("scu_canvas")
+            .expect("missing <canvas id=\"scu_canvas\">");
+        let canvas: web_sys::HtmlCanvasElement =
+            canvas.dyn_into().expect("#scu_canvas is not a canvas");
+
+        eframe::WebRunner::new()
+            .start(
+                canvas,
+                eframe::WebOptions::default(),
+                Box::new(|cc| Ok(Box::new(app::ScuApp::new(cc)))),
+            )
+            .await
+            .expect("failed to start eframe");
+    });
 }

@@ -6,6 +6,7 @@ members = [
     "crates/scu-scope",
     "crates/scu-audio",
     "crates/scu-client",
+    "crates/scu-bridge",
     "app",
 ]
 
@@ -25,11 +26,17 @@ scu-client = { path = "crates/scu-client" }
 thiserror = "1"
 anyhow = "1"
 rand = "0.8"
+futures = "0.3"
+futures-util = "0.3"
+serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+web-time = "1"
+# Base Tokio feature set is wasm-safe (net and rt-multi-thread are compile
+# errors on wasm32-unknown-unknown and are added per-target where needed).
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
 
 [profile.release]
 opt-level = 3
