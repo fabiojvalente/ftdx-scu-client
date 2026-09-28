@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/scu-protocol",
+    "crates/scu-cat",
+    "crates/scu-scope",
+    "crates/scu-audio",
+    "crates/scu-client",
+    "app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/anomalyco/ftdx10-scu-client"
+
+[workspace.dependencies]
+scu-protocol = { path = "crates/scu-protocol" }
+scu-cat = { path = "crates/scu-cat" }
+scu-scope = { path = "crates/scu-scope" }
+scu-audio = { path = "crates/scu-audio" }
+scu-client = { path = "crates/scu-client" }
+
+thiserror = "1"
+anyhow = "1"
+rand = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
