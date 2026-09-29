@@ -22,7 +22,7 @@ Operation Reference manuals).
 - **Waterfall / panadapter** — decoupled decode pipeline, circular texture with
   partial uploads, colormaps, span, and follow-VFO.
 - **Full CAT rig control** — VFO-A/B, RX/TX VFO select, split, swap, RIT/XIT,
-  all 10 Yaesu modes, filters, DSP (NB/NR/auto-notch/narrow), AGC, RF gain,
+  all 15 Yaesu modes, filters, DSP (NB/NR/auto-notch/narrow), AGC, RF gain,
   squelch, click-to-tune, and a raw CAT console.
 - **Meters** — S-meter plus selectable `RM` meters.
 - **RX/TX audio** — playback, volume/mute/stereo, resampling, PTT, TX audio,
@@ -53,8 +53,9 @@ the **Panels** menu to show and hide panels.
   selectable in Settings.
 - **Scale** menu — Extra small … Extra large. Scaling changes fonts, spacing and
   hit targets together; it never moves panels.
-- **Settings** — high-contrast and large-target accessibility options, meter
-  visibility, and the CAT console pane toggle.
+- **Settings** — a tabbed window: appearance (theme, UI size, high-contrast and
+  large-target options), visible meters, optional panes, and the console log
+  level. The log level is applied live to the running app (native builds).
 
 ## Workspace layout
 

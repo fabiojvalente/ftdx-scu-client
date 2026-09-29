@@ -2,19 +2,26 @@ mod app;
 #[cfg(not(target_arch = "wasm32"))]
 mod cat_server;
 mod layout;
+mod logging;
 mod theme;
 mod waterfall;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
     use eframe::egui;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+    let initial = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let (filter, handle) = tracing_subscriber::reload::Layer::new(initial);
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(filter)
         .init();
+    logging::install(Box::new(move |level: &str| {
+        let _ = handle.reload(tracing_subscriber::EnvFilter::new(level));
+    }));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

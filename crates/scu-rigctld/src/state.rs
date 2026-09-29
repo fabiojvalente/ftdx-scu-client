@@ -104,8 +104,8 @@ impl RadioState {
                     }
                 }
             }
-            "FR" => {
-                if let Some(sub) = scu_cat::parse_rx_vfo(frame) {
+            "VS" => {
+                if let Some(sub) = scu_cat::parse_vfo(frame) {
                     self.sub_vfo = sub;
                 }
             }
@@ -124,13 +124,11 @@ impl RadioState {
                     self.xit_on = on;
                 }
             }
-            "RC" => {
-                if let Some((tx, hz)) = scu_cat::parse_clarifier(frame) {
-                    if tx {
-                        self.xit_hz = hz;
-                    } else {
-                        self.rit_hz = hz;
-                    }
+            "CF" => {
+                if let Some(hz) = scu_cat::parse_clarifier_offset(frame) {
+                    // The FTDX10 shares one clarifier offset between RIT and XIT.
+                    self.rit_hz = hz;
+                    self.xit_hz = hz;
                 }
             }
             "TX" => {
@@ -227,12 +225,12 @@ mod tests {
         state.apply("FA014074000;");
         state.apply("FB007074000;");
         state.apply("MD02;");
-        state.apply("MD1B;");
-        state.apply("FR1;");
+        state.apply("MD1C;");
+        state.apply("VS1;");
         state.apply("ST1;");
         state.apply("TX1;");
         state.apply("PC050;");
-        state.apply("ID0670;");
+        state.apply("ID0761;");
 
         assert_eq!(state.freq_a, 14_074_000);
         assert_eq!(state.freq_b, 7_074_000);

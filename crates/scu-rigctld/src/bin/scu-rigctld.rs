@@ -160,7 +160,7 @@ async fn serve(args: Args) -> ExitCode {
         match tokio::time::timeout(Duration::from_millis(250), client.recv()).await {
             Ok(Some(Event::Cat(frame))) => state.lock().unwrap().apply(&frame),
             Ok(Some(Event::Radio(model))) => {
-                let frame = format!("ID{:04X};", model.id());
+                let frame = format!("ID{:04};", model.id());
                 state.lock().unwrap().apply(&frame);
             }
             Ok(Some(Event::Disconnected(reason))) => {

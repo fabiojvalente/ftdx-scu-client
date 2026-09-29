@@ -290,7 +290,7 @@ async fn handle_client(stream: TcpStream, ctx: Arc<Context>) {
         .map(|addr| addr.to_string())
         .unwrap_or_else(|_| "unknown".into());
     let client_id = format!("rigctld-{peer}");
-    tracing::info!(%client_id, "rigctld client connected");
+    tracing::debug!(%client_id, "rigctld client connected");
 
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -333,7 +333,7 @@ async fn handle_client(stream: TcpStream, ctx: Arc<Context>) {
         ctx.link.send("TX0;");
     }
     ctx.clients.fetch_sub(1, Ordering::Relaxed);
-    tracing::info!(%client_id, "rigctld client disconnected");
+    tracing::debug!(%client_id, "rigctld client disconnected");
 }
 
 /// Parse and answer one rigctld command. Returns `(response, close_connection)`.
@@ -500,7 +500,7 @@ fn get_vfo(ctx: &Context) -> String {
 
 fn set_vfo(ctx: &Context, vfo: &str) -> String {
     let sub = vfo.to_ascii_uppercase().contains('B') || vfo.eq_ignore_ascii_case("Sub");
-    ctx.link.send(scu_cat::select_rx_vfo(sub));
+    ctx.link.send(scu_cat::select_vfo(sub));
     ctx.state.lock().unwrap().sub_vfo = sub;
     "RPRT 0".to_string()
 }
@@ -587,8 +587,12 @@ fn set_rit(ctx: &Context, value: &str) -> String {
         return rprt_fail();
     };
     let hz = scu_cat::clamp_clarifier_hz(hz);
-    ctx.link.send(&scu_cat::set_clarifier(false, hz));
-    ctx.state.lock().unwrap().rit_hz = hz;
+    let sub = ctx.state.lock().unwrap().sub_vfo;
+    ctx.link.send(&scu_cat::set_clarifier_offset(sub, hz));
+    let mut state = ctx.state.lock().unwrap();
+    // One physical clarifier offset is shared by RIT and XIT.
+    state.rit_hz = hz;
+    state.xit_hz = hz;
     "RPRT 0".to_string()
 }
 
@@ -601,8 +605,11 @@ fn set_xit(ctx: &Context, value: &str) -> String {
         return rprt_fail();
     };
     let hz = scu_cat::clamp_clarifier_hz(hz);
-    ctx.link.send(&scu_cat::set_clarifier(true, hz));
-    ctx.state.lock().unwrap().xit_hz = hz;
+    let sub = ctx.state.lock().unwrap().sub_vfo;
+    ctx.link.send(&scu_cat::set_clarifier_offset(sub, hz));
+    let mut state = ctx.state.lock().unwrap();
+    state.rit_hz = hz;
+    state.xit_hz = hz;
     "RPRT 0".to_string()
 }
 
@@ -650,12 +657,12 @@ fn set_level(ctx: &Context, level: &str, value: &str) -> String {
         }
         "NB" => {
             let on = raw != 0.0;
-            ctx.link.send(scu_cat::set_noise_blanker(on));
+            ctx.link.send(&scu_cat::set_noise_blanker(on));
             ctx.state.lock().unwrap().nb = on;
         }
         "NR" => {
             let on = raw != 0.0;
-            ctx.link.send(scu_cat::set_noise_reduction(on));
+            ctx.link.send(&scu_cat::set_noise_reduction(on));
             ctx.state.lock().unwrap().nr = on;
         }
         _ => return "RPRT 0".to_string(),
@@ -697,15 +704,15 @@ fn set_func(ctx: &Context, func: &str, value: &str) -> String {
             ctx.state.lock().unwrap().xit_on = on;
         }
         "NB" => {
-            ctx.link.send(scu_cat::set_noise_blanker(on));
+            ctx.link.send(&scu_cat::set_noise_blanker(on));
             ctx.state.lock().unwrap().nb = on;
         }
         "NR" => {
-            ctx.link.send(scu_cat::set_noise_reduction(on));
+            ctx.link.send(&scu_cat::set_noise_reduction(on));
             ctx.state.lock().unwrap().nr = on;
         }
         "ANF" | "BC" => {
-            ctx.link.send(scu_cat::set_auto_notch(on));
+            ctx.link.send(&scu_cat::set_auto_notch(on));
             ctx.state.lock().unwrap().auto_notch = on;
         }
         _ => return rprt_fail(),
@@ -759,7 +766,7 @@ fn get_info(ctx: &Context) -> String {
     let state = ctx.state.lock().unwrap();
     let (name, id) = match &state.radio {
         Some(model) => (model.name(), model.id()),
-        None => ("FTDX10".to_string(), 0x0670),
+        None => ("FTDX10".to_string(), 761),
     };
     format!("Yaesu;{name};1.0.0;000000;{id}")
 }

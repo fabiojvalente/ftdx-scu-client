@@ -26,31 +26,37 @@ pub fn set_frequency_b(hz: u64) -> String {
     format!("FB{:09};", hz.min(999_999_999))
 }
 
-/// Build a "select receive VFO" command (`FR`). `sub = true` selects VFO-B.
-pub fn select_rx_vfo(sub: bool) -> &'static str {
+/// Build a "select VFO" command (`VS`). `sub = true` selects VFO-B.
+///
+/// The FTDX10 uses `VS` ("VFO SELECT") for the operating VFO; the `FR`
+/// command found on the FTDX101 is not documented for this radio.
+pub fn select_vfo(sub: bool) -> &'static str {
     if sub {
-        "FR1;"
+        "VS1;"
     } else {
-        "FR0;"
+        "VS0;"
     }
 }
 
-/// Build a "read receive VFO" command.
-pub fn read_rx_vfo() -> &'static str {
-    "FR;"
+/// Build a "read selected VFO" command.
+pub fn read_vfo() -> &'static str {
+    "VS;"
 }
 
-/// Parse the receive VFO from an `FR` response (`true` = VFO-B / Sub).
-pub fn parse_rx_vfo(frame: &str) -> Option<bool> {
-    parse_on_off(frame, "FR")
+/// Parse the selected VFO from a `VS` response (`true` = VFO-B).
+pub fn parse_vfo(frame: &str) -> Option<bool> {
+    parse_on_off(frame, "VS")
 }
 
 /// Build a "select transmit VFO" command (`FT`). `sub = true` selects VFO-B.
+///
+/// The FTDX10 `FT` *set* form is `FT2;` (MAIN transmits) / `FT3;` (SUB
+/// transmits); the answer is `FT0;`/`FT1;`.
 pub fn select_tx_vfo(sub: bool) -> &'static str {
     if sub {
-        "FT1;"
+        "FT3;"
     } else {
-        "FT0;"
+        "FT2;"
     }
 }
 
@@ -141,118 +147,105 @@ pub fn parse_xit(frame: &str) -> Option<bool> {
     parse_on_off(frame, "XT")
 }
 
-/// Clarifier offset unit: the `RC` command expresses the offset in 10 Hz steps.
+/// Clarifier offset granularity on the FTDX10 (10 Hz).
 pub const CLARIFIER_STEP_HZ: i32 = 10;
-/// Maximum clarifier offset magnitude (`RC` 4-digit field, ±9999 * 10 Hz).
-pub const CLARIFIER_MAX_HZ: i32 = 9999 * CLARIFIER_STEP_HZ;
+/// Maximum clarifier offset magnitude (`CF` P5-P8 field, Hz).
+pub const CLARIFIER_MAX_HZ: i32 = 9990;
 
 /// Clamp an arbitrary offset to the 10 Hz grid the radio accepts.
 pub fn clamp_clarifier_hz(hz: i32) -> i32 {
     let steps = (hz as f64 / CLARIFIER_STEP_HZ as f64).round() as i32;
-    steps.clamp(-9999, 9999) * CLARIFIER_STEP_HZ
+    steps.clamp(-999, 999) * CLARIFIER_STEP_HZ
 }
 
-/// Build a "set clarifier offset" command (`RC`).
+/// Build a "set clarifier offset" command (`CF` P3=1) for `sub`'s VFO.
 ///
-/// `tx = false` sets the receive clarifier (RIT), `tx = true` the transmit
-/// clarifier (XIT). The offset is quantized to 10 Hz.
-pub fn set_clarifier(tx: bool, hz: i32) -> String {
+/// The FTDX10 has a single clarifier offset shared by RIT and XIT; use
+/// [`set_rit`] / [`set_xit`] to enable it for receive and/or transmit.
+pub fn set_clarifier_offset(sub: bool, hz: i32) -> String {
     let hz = clamp_clarifier_hz(hz);
     let sign = if hz < 0 { '-' } else { '+' };
-    let digits = (hz.abs() / CLARIFIER_STEP_HZ).min(9999);
-    format!("RC{}{}{:04};", tx as u8, sign, digits)
+    let digits = hz.abs().min(CLARIFIER_MAX_HZ);
+    format!("CF{}01{}{:04};", sub as u8, sign, digits)
 }
 
-/// Build a "read clarifier offset" command (`tx` selects RIT vs XIT).
-pub fn read_clarifier(tx: bool) -> String {
-    format!("RC{};", tx as u8)
+/// Build a "read clarifier offset" command (`CF` P3=1) for `sub`'s VFO.
+pub fn read_clarifier_offset(sub: bool) -> String {
+    format!("CF{}01;", sub as u8)
 }
 
-/// Parse an `RC` clarifier response into `(tx, offset_hz)`.
-pub fn parse_clarifier(frame: &str) -> Option<(bool, i32)> {
+/// Parse a `CF?01{sign}dddd;` clarifier-offset response into Hz.
+pub fn parse_clarifier_offset(frame: &str) -> Option<i32> {
     let parsed = split(frame)?;
-    if parsed.command != "RC" || parsed.payload.len() < 6 {
+    if parsed.command != "CF" || parsed.payload.len() < 8 {
         return None;
     }
-    let mut chars = parsed.payload.chars();
-    let tx = match chars.next()? {
-        '0' => false,
-        '1' => true,
-        _ => return None,
-    };
+    if parsed.payload.as_bytes().get(2) != Some(&b'1') {
+        return None;
+    }
+    let mut chars = parsed.payload[3..].chars();
     let sign: i32 = match chars.next()? {
         '+' => 1,
         '-' => -1,
         _ => return None,
     };
-    let digits: i32 = chars.as_str()[..4].parse().ok()?;
-    Some((tx, sign * digits * CLARIFIER_STEP_HZ))
+    let digits: i32 = chars.as_str().get(..4)?.parse().ok()?;
+    Some(sign * digits)
 }
 
-/// Build a "noise blanker on/off" command (`NB`).
-pub fn set_noise_blanker(on: bool) -> &'static str {
-    if on {
-        "NB1;"
-    } else {
-        "NB0;"
-    }
+/// Build a "clear the clarifier" command (`RC;`).
+pub fn clear_clarifier() -> &'static str {
+    "RC;"
+}
+
+/// Build a "noise blanker on/off" command (`NB` P1=0, P2).
+pub fn set_noise_blanker(on: bool) -> String {
+    format!("NB0{};", on as u8)
 }
 
 /// Build a "read noise blanker state" command.
 pub fn read_noise_blanker() -> &'static str {
-    "NB;"
+    "NB0;"
 }
 
-/// Parse the noise blanker state from an `NB` response.
+/// Parse the noise blanker state from an `NB0P2;` response.
 pub fn parse_noise_blanker(frame: &str) -> Option<bool> {
-    parse_on_off(frame, "NB")
+    parse_indexed_on_off(frame, "NB")
 }
 
-/// Build a "noise reduction on/off" command (`NR`).
-pub fn set_noise_reduction(on: bool) -> &'static str {
-    if on {
-        "NR1;"
-    } else {
-        "NR0;"
-    }
+/// Build a "noise reduction on/off" command (`NR` P1=0, P2).
+pub fn set_noise_reduction(on: bool) -> String {
+    format!("NR0{};", on as u8)
 }
 
 /// Build a "read noise reduction state" command.
 pub fn read_noise_reduction() -> &'static str {
-    "NR;"
+    "NR0;"
 }
 
-/// Parse the noise reduction state from an `NR` response.
+/// Parse the noise reduction state from an `NR0P2;` response.
 pub fn parse_noise_reduction(frame: &str) -> Option<bool> {
-    parse_on_off(frame, "NR")
+    parse_indexed_on_off(frame, "NR")
 }
 
-/// Build an "auto notch on/off" command (`BC`).
-pub fn set_auto_notch(on: bool) -> &'static str {
-    if on {
-        "BC1;"
-    } else {
-        "BC0;"
-    }
+/// Build an "auto notch on/off" command (`BC` P1=0, P2).
+pub fn set_auto_notch(on: bool) -> String {
+    format!("BC0{};", on as u8)
 }
 
 /// Build a "read auto notch state" command.
 pub fn read_auto_notch() -> &'static str {
-    "BC;"
+    "BC0;"
 }
 
-/// Parse the auto notch state from a `BC` response.
+/// Parse the auto notch state from a `BC0P2;` response.
 pub fn parse_auto_notch(frame: &str) -> Option<bool> {
-    parse_on_off(frame, "BC")
+    parse_indexed_on_off(frame, "BC")
 }
 
-/// Build a "narrow filter on/off" command (`NA`).
-pub fn set_narrow(on: bool) -> &'static str {
-    if on {
-        "NA1;"
-    } else {
-        "NA0;"
-    }
+/// Build a "narrow filter on/off" command (`NA` P1=0, P2).
+pub fn set_narrow(on: bool) -> String {
+    format!("NA0{};", on as u8)
 }
 
 /// Build a "read narrow filter state" command (`NA0;`, MAIN).
@@ -260,12 +253,17 @@ pub fn read_narrow() -> &'static str {
     "NA0;"
 }
 
-/// Parse the narrow filter state from an `NA` response.
+/// Parse the narrow filter state from an `NA0P2;` response.
 pub fn parse_narrow(frame: &str) -> Option<bool> {
-    parse_on_off(frame, "NA")
+    parse_indexed_on_off(frame, "NA")
 }
 
 /// AGC time constant (`GT` P2).
+///
+/// The FTDX10 `GT` *set* command accepts only `0`-`4`; the radio resolves an
+/// `AUTO` request to one of its auto sub-modes, which it reports back as
+/// `4`/`5`/`6` (AUTO-FAST / AUTO-MID / AUTO-SLOW). Those are collapsed to
+/// [`Agc::Auto`] here, matching the settable front-panel choices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Agc {
     Off,
@@ -273,9 +271,6 @@ pub enum Agc {
     Mid,
     Slow,
     Auto,
-    AutoFast,
-    AutoMid,
-    AutoSlow,
 }
 
 impl Agc {
@@ -286,9 +281,6 @@ impl Agc {
             Agc::Mid => '2',
             Agc::Slow => '3',
             Agc::Auto => '4',
-            Agc::AutoFast => '5',
-            Agc::AutoMid => '6',
-            Agc::AutoSlow => '7',
         }
     }
 
@@ -298,10 +290,7 @@ impl Agc {
             '1' => Agc::Fast,
             '2' => Agc::Mid,
             '3' => Agc::Slow,
-            '4' => Agc::Auto,
-            '5' => Agc::AutoFast,
-            '6' => Agc::AutoMid,
-            '7' => Agc::AutoSlow,
+            '4' | '5' | '6' => Agc::Auto,
             _ => return None,
         })
     }
@@ -313,22 +302,10 @@ impl Agc {
             Agc::Mid => "MID",
             Agc::Slow => "SLOW",
             Agc::Auto => "AUTO",
-            Agc::AutoFast => "A-FAST",
-            Agc::AutoMid => "A-MID",
-            Agc::AutoSlow => "A-SLOW",
         }
     }
 
-    pub const ALL: [Agc; 8] = [
-        Agc::Off,
-        Agc::Fast,
-        Agc::Mid,
-        Agc::Slow,
-        Agc::Auto,
-        Agc::AutoFast,
-        Agc::AutoMid,
-        Agc::AutoSlow,
-    ];
+    pub const ALL: [Agc; 5] = [Agc::Off, Agc::Fast, Agc::Mid, Agc::Slow, Agc::Auto];
 }
 
 /// Build a "set AGC" command (`GT0` + code).
@@ -408,6 +385,19 @@ fn parse_on_off(frame: &str, command: &str) -> Option<bool> {
     match parsed.payload.chars().next()? {
         '0' => Some(false),
         '1' | '2' => Some(true),
+        _ => None,
+    }
+}
+
+/// Parse a `<CMD><index><digit>;` on/off response (e.g. `NB01;`, `BC00;`).
+fn parse_indexed_on_off(frame: &str, command: &str) -> Option<bool> {
+    let parsed = split(frame)?;
+    if parsed.command != command {
+        return None;
+    }
+    match parsed.payload.chars().nth(1)? {
+        '0' => Some(false),
+        '1' => Some(true),
         _ => None,
     }
 }
@@ -707,12 +697,15 @@ pub fn parse_frequency(frame: &str) -> Option<u64> {
 }
 
 /// Parse the 4-digit radio ID from an `ID` response.
+///
+/// The `ID` answer is a four-digit decimal number (e.g. `ID0761;` for the
+/// FTDX10), not hexadecimal.
 pub fn parse_id(frame: &str) -> Option<u32> {
     let parsed = split(frame)?;
     if parsed.command != "ID" {
         return None;
     }
-    u32::from_str_radix(parsed.payload, 16).ok()
+    parsed.payload.parse().ok()
 }
 
 /// Parse an S-meter reading from an `SM0` response (0-255 decimal).
@@ -903,21 +896,21 @@ pub enum RadioModel {
 impl RadioModel {
     pub fn from_id(id: u32) -> Self {
         match id {
-            0x0670 => RadioModel::Ftdx10,
-            0x0681 => RadioModel::Ftdx101D,
-            0x0682 => RadioModel::Ftdx101Mp,
-            0x0800 => RadioModel::Ft710,
+            761 => RadioModel::Ftdx10,
+            681 => RadioModel::Ftdx101D,
+            682 => RadioModel::Ftdx101Mp,
+            800 => RadioModel::Ft710,
             other => RadioModel::Other(other),
         }
     }
 
-    /// The 4-digit hexadecimal `ID;` value for this model.
+    /// The 4-digit decimal `ID;` value for this model.
     pub fn id(&self) -> u32 {
         match self {
-            RadioModel::Ftdx10 => 0x0670,
-            RadioModel::Ftdx101D => 0x0681,
-            RadioModel::Ftdx101Mp => 0x0682,
-            RadioModel::Ft710 => 0x0800,
+            RadioModel::Ftdx10 => 761,
+            RadioModel::Ftdx101D => 681,
+            RadioModel::Ftdx101Mp => 682,
+            RadioModel::Ft710 => 800,
             RadioModel::Other(id) => *id,
         }
     }
@@ -928,12 +921,17 @@ impl RadioModel {
             RadioModel::Ftdx101D => "FTDX101D".into(),
             RadioModel::Ftdx101Mp => "FTDX101MP".into(),
             RadioModel::Ft710 => "FT-710".into(),
-            RadioModel::Other(id) => format!("Unknown (0x{id:04X})"),
+            RadioModel::Other(id) => format!("Unknown (ID{id:04})"),
         }
     }
 }
 
-/// Common Yaesu operating modes.
+/// FTDX10 `MD` P2 operating modes.
+///
+/// Codes are taken verbatim from the *FTDX10 CAT Operation Reference* `MD`
+/// table: `1` LSB, `2` USB, `3` CW-U, `4` FM, `5` AM, `6` RTTY-L, `7` CW-L,
+/// `8` DATA-L, `9` RTTY-U, `A` DATA-FM, `B` FM-N, `C` DATA-U, `D` AM-N,
+/// `E` PSK, `F` DATA-FM-N.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Lsb,
@@ -945,7 +943,12 @@ pub enum Mode {
     CwL,
     DataL,
     RttyU,
+    DataFm,
+    FmN,
     DataU,
+    AmN,
+    Psk,
+    DataFmN,
 }
 
 impl Mode {
@@ -961,7 +964,12 @@ impl Mode {
             Mode::CwL => '7',
             Mode::DataL => '8',
             Mode::RttyU => '9',
-            Mode::DataU => 'B',
+            Mode::DataFm => 'A',
+            Mode::FmN => 'B',
+            Mode::DataU => 'C',
+            Mode::AmN => 'D',
+            Mode::Psk => 'E',
+            Mode::DataFmN => 'F',
         }
     }
 
@@ -976,7 +984,12 @@ impl Mode {
             '7' => Mode::CwL,
             '8' => Mode::DataL,
             '9' => Mode::RttyU,
-            'B' => Mode::DataU,
+            'A' => Mode::DataFm,
+            'B' => Mode::FmN,
+            'C' => Mode::DataU,
+            'D' => Mode::AmN,
+            'E' => Mode::Psk,
+            'F' => Mode::DataFmN,
             _ => return None,
         })
     }
@@ -992,11 +1005,16 @@ impl Mode {
             Mode::CwL => "CW-L",
             Mode::DataL => "DATA-L",
             Mode::RttyU => "RTTY-U",
+            Mode::DataFm => "DATA-FM",
+            Mode::FmN => "FM-N",
             Mode::DataU => "DATA-U",
+            Mode::AmN => "AM-N",
+            Mode::Psk => "PSK",
+            Mode::DataFmN => "DATA-FM-N",
         }
     }
 
-    pub const ALL: [Mode; 10] = [
+    pub const ALL: [Mode; 15] = [
         Mode::Lsb,
         Mode::Usb,
         Mode::CwU,
@@ -1006,7 +1024,12 @@ impl Mode {
         Mode::CwL,
         Mode::DataL,
         Mode::RttyU,
+        Mode::DataFm,
+        Mode::FmN,
         Mode::DataU,
+        Mode::AmN,
+        Mode::Psk,
+        Mode::DataFmN,
     ];
 }
 
@@ -1273,11 +1296,12 @@ mod tests {
 
     #[test]
     fn parse_radio_id() {
-        assert_eq!(parse_id("ID0670;"), Some(0x0670));
-        assert_eq!(RadioModel::from_id(0x0670), RadioModel::Ftdx10);
-        assert_eq!(RadioModel::from_id(0x0670).name(), "FTDX10");
-        assert_eq!(RadioModel::from_id(0x0670).id(), 0x0670);
-        assert_eq!(RadioModel::from_id(0x9999).id(), 0x9999);
+        assert_eq!(parse_id("ID0761;"), Some(761));
+        assert_eq!(parse_id("ID0681;"), Some(681));
+        assert_eq!(RadioModel::from_id(761), RadioModel::Ftdx10);
+        assert_eq!(RadioModel::from_id(761).name(), "FTDX10");
+        assert_eq!(RadioModel::from_id(761).id(), 761);
+        assert_eq!(RadioModel::from_id(9999).id(), 9999);
     }
 
     #[test]
@@ -1334,9 +1358,13 @@ mod tests {
         // `MD0;` read on the MAIN VFO returning USB.
         assert_eq!(parse_mode("MD02;"), Some(Mode::Usb));
         assert_eq!(parse_mode("MD01;"), Some(Mode::Lsb));
-        assert_eq!(parse_mode("MD0B;"), Some(Mode::DataU));
+        assert_eq!(parse_mode("MD0B;"), Some(Mode::FmN));
+        assert_eq!(parse_mode("MD0C;"), Some(Mode::DataU));
+        assert_eq!(parse_mode("MD0A;"), Some(Mode::DataFm));
+        assert_eq!(parse_mode("MD0E;"), Some(Mode::Psk));
         assert_eq!(set_mode_vfo(false, Mode::Usb), "MD02;");
         assert_eq!(set_mode_vfo(true, Mode::Usb), "MD12;");
+        assert_eq!(set_mode_vfo(false, Mode::DataU), "MD0C;");
         assert_eq!(read_mode_vfo(true), "MD1;");
         assert_eq!(parse_mode("MD12;"), Some(Mode::Usb));
     }
@@ -1457,14 +1485,17 @@ mod tests {
 
     #[test]
     fn build_and_parse_vfo_select() {
-        assert_eq!(select_rx_vfo(false), "FR0;");
-        assert_eq!(select_rx_vfo(true), "FR1;");
-        assert_eq!(parse_rx_vfo("FR1;"), Some(true));
-        assert_eq!(parse_rx_vfo("FR0;"), Some(false));
-        assert_eq!(parse_rx_vfo("FT1;"), None);
+        assert_eq!(select_vfo(false), "VS0;");
+        assert_eq!(select_vfo(true), "VS1;");
+        assert_eq!(read_vfo(), "VS;");
+        assert_eq!(parse_vfo("VS1;"), Some(true));
+        assert_eq!(parse_vfo("VS0;"), Some(false));
+        assert_eq!(parse_vfo("FT1;"), None);
 
-        assert_eq!(select_tx_vfo(false), "FT0;");
-        assert_eq!(select_tx_vfo(true), "FT1;");
+        assert_eq!(select_tx_vfo(false), "FT2;");
+        assert_eq!(select_tx_vfo(true), "FT3;");
+        assert_eq!(read_tx_vfo(), "FT;");
+        assert_eq!(parse_tx_vfo("FT0;"), Some(false));
         assert_eq!(parse_tx_vfo("FT1;"), Some(true));
     }
 
@@ -1494,31 +1525,40 @@ mod tests {
 
     #[test]
     fn build_and_parse_clarifier() {
-        assert_eq!(set_clarifier(false, 100), "RC0+0010;");
-        assert_eq!(set_clarifier(true, -250), "RC1-0025;");
-        assert_eq!(set_clarifier(false, 0), "RC0+0000;");
+        assert_eq!(set_clarifier_offset(false, 100), "CF001+0100;");
+        assert_eq!(set_clarifier_offset(true, -250), "CF101-0250;");
+        assert_eq!(set_clarifier_offset(false, 0), "CF001+0000;");
         // Quantize to the 10 Hz grid and clamp to the field width.
-        assert_eq!(set_clarifier(false, 104), "RC0+0010;");
-        assert_eq!(set_clarifier(false, 20_000_000), "RC0+9999;");
+        assert_eq!(set_clarifier_offset(false, 104), "CF001+0100;");
+        assert_eq!(set_clarifier_offset(false, 20_000_000), "CF001+9990;");
 
-        assert_eq!(parse_clarifier("RC0+0010;"), Some((false, 100)));
-        assert_eq!(parse_clarifier("RC1-0025;"), Some((true, -250)));
-        assert_eq!(parse_clarifier("RC0+0000;"), Some((false, 0)));
-        assert_eq!(parse_clarifier("FA;"), None);
+        assert_eq!(read_clarifier_offset(false), "CF001;");
+        assert_eq!(read_clarifier_offset(true), "CF101;");
+        assert_eq!(parse_clarifier_offset("CF001+0100;"), Some(100));
+        assert_eq!(parse_clarifier_offset("CF101-0250;"), Some(-250));
+        assert_eq!(parse_clarifier_offset("CF001+0000;"), Some(0));
+        // CLAR on/off (P3=0) is not an offset response.
+        assert_eq!(parse_clarifier_offset("CF0001000;"), None);
+        assert_eq!(parse_clarifier_offset("FA;"), None);
+        assert_eq!(clear_clarifier(), "RC;");
     }
 
     #[test]
     fn build_and_parse_dsp_toggles() {
-        assert_eq!(set_noise_blanker(true), "NB1;");
-        assert_eq!(parse_noise_blanker("NB0;"), Some(false));
-        assert_eq!(parse_noise_blanker("NB1;"), Some(true));
-        assert_eq!(set_noise_reduction(true), "NR1;");
-        assert_eq!(parse_noise_reduction("NR1;"), Some(true));
-        assert_eq!(set_auto_notch(false), "BC0;");
-        assert_eq!(parse_auto_notch("BC1;"), Some(true));
-        assert_eq!(set_narrow(true), "NA1;");
-        assert_eq!(parse_narrow("NA0;"), Some(false));
-        assert_eq!(parse_narrow("NB1;"), None);
+        assert_eq!(set_noise_blanker(true), "NB01;");
+        assert_eq!(read_noise_blanker(), "NB0;");
+        assert_eq!(parse_noise_blanker("NB00;"), Some(false));
+        assert_eq!(parse_noise_blanker("NB01;"), Some(true));
+        assert_eq!(set_noise_reduction(true), "NR01;");
+        assert_eq!(read_noise_reduction(), "NR0;");
+        assert_eq!(parse_noise_reduction("NR01;"), Some(true));
+        assert_eq!(set_auto_notch(false), "BC00;");
+        assert_eq!(read_auto_notch(), "BC0;");
+        assert_eq!(parse_auto_notch("BC01;"), Some(true));
+        assert_eq!(set_narrow(true), "NA01;");
+        assert_eq!(read_narrow(), "NA0;");
+        assert_eq!(parse_narrow("NA00;"), Some(false));
+        assert_eq!(parse_narrow("NB01;"), None);
     }
 
     #[test]
@@ -1528,6 +1568,9 @@ mod tests {
         assert_eq!(parse_agc("GT02;"), Some(Agc::Mid));
         assert_eq!(parse_agc("GT03;"), Some(Agc::Slow));
         assert_eq!(parse_agc("GT04;"), Some(Agc::Auto));
+        // The radio reports its resolved auto sub-mode; collapse to AUTO.
+        assert_eq!(parse_agc("GT05;"), Some(Agc::Auto));
+        assert_eq!(parse_agc("GT06;"), Some(Agc::Auto));
         assert_eq!(parse_agc("GT09;"), None);
         for agc in Agc::ALL {
             assert_eq!(Agc::from_code(agc.code()), Some(agc));

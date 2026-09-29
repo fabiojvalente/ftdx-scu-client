@@ -85,6 +85,9 @@ pub struct AppSettings {
     /// Enlarges control hit targets for easier pointing.
     #[serde(default)]
     pub large_targets: bool,
+    /// Console log verbosity.
+    #[serde(default)]
+    pub log_level: LogLevel,
 }
 
 impl Default for AppSettings {
@@ -106,6 +109,7 @@ impl Default for AppSettings {
             ui_scale: theme::UiScale::default(),
             high_contrast: false,
             large_targets: false,
+            log_level: LogLevel::default(),
         }
     }
 }
@@ -137,6 +141,76 @@ fn default_true() -> bool {
 /// RM meter indices offered by the FTDX10 (`RM3` ..= `RM9`).
 const METER_INDICES: [u8; 7] = [3, 4, 5, 6, 7, 8, 9];
 
+/// Console log verbosity, applied live to the tracing subscriber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum LogLevel {
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    pub const ALL: [LogLevel; 5] = [
+        LogLevel::Error,
+        LogLevel::Warn,
+        LogLevel::Info,
+        LogLevel::Debug,
+        LogLevel::Trace,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LogLevel::Error => "Error",
+            LogLevel::Warn => "Warning",
+            LogLevel::Info => "Info",
+            LogLevel::Debug => "Debug",
+            LogLevel::Trace => "Trace",
+        }
+    }
+
+    /// The string handed to `tracing_subscriber::EnvFilter`.
+    pub fn filter(self) -> &'static str {
+        match self {
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
+        }
+    }
+}
+
+/// Sections of the Settings window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SettingsTab {
+    #[default]
+    Appearance,
+    Meters,
+    Panes,
+    Logging,
+}
+
+impl SettingsTab {
+    const ALL: [SettingsTab; 4] = [
+        SettingsTab::Appearance,
+        SettingsTab::Meters,
+        SettingsTab::Panes,
+        SettingsTab::Logging,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            SettingsTab::Appearance => "Appearance",
+            SettingsTab::Meters => "Meters",
+            SettingsTab::Panes => "Panes",
+            SettingsTab::Logging => "Logging",
+        }
+    }
+}
+
 pub struct ScuApp {
     config: ConnectConfig,
 
@@ -155,8 +229,8 @@ pub struct ScuApp {
     split: bool,
     rit_on: bool,
     xit_on: bool,
-    rit_offset_hz: i32,
-    xit_offset_hz: i32,
+    /// One clarifier offset is shared by RIT and XIT on the FTDX10.
+    clarifier_offset_hz: i32,
     noise_blanker: bool,
     noise_reduction: bool,
     auto_notch: bool,
@@ -199,6 +273,8 @@ pub struct ScuApp {
 
     settings: AppSettings,
     show_settings: bool,
+    /// Active section of the Settings window.
+    settings_tab: SettingsTab,
 
     /// Active palette (source of truth; mirrored into the theme module).
     theme: theme::Theme,
@@ -271,6 +347,11 @@ impl ScuApp {
             settings.large_targets,
         );
         let layouts = LayoutsFile::load();
+        // RUST_LOG wins; otherwise apply the saved level to the subscriber.
+        #[cfg(not(target_arch = "wasm32"))]
+        if std::env::var_os("RUST_LOG").is_none() {
+            crate::logging::set_level(settings.log_level.filter());
+        }
         Self {
             config,
             handle: None,
@@ -287,8 +368,7 @@ impl ScuApp {
             split: false,
             rit_on: false,
             xit_on: false,
-            rit_offset_hz: 0,
-            xit_offset_hz: 0,
+            clarifier_offset_hz: 0,
             noise_blanker: false,
             noise_reduction: false,
             auto_notch: false,
@@ -325,6 +405,7 @@ impl ScuApp {
             mic_status: String::new(),
             settings,
             show_settings: false,
+            settings_tab: SettingsTab::default(),
             theme,
             applied_appearance: Some(appearance),
             layouts,
@@ -855,9 +936,9 @@ impl ScuApp {
     fn initial_queries(&self) {
         if let Some(handle) = &self.handle {
             for cmd in [
-                "ID;", "FA;", "FB;", "FR;", "FT;", "ST;", "MD0;", "SM0;", "PS;", "PC;", "MG;",
-                "AC;", "RT;", "XT;", "RC0;", "RC1;", "NB;", "NR;", "BC;", "NA0;", "GT0;", "RG0;",
-                "SQ0;", "TX;", "AI1;", "SS05;", "SS06;",
+                "ID;", "FA;", "FB;", "VS;", "FT;", "ST;", "MD0;", "MD1;", "SM0;", "PS;", "PC;",
+                "MG;", "AC;", "RT;", "XT;", "NB0;", "NR0;", "BC0;", "NA0;", "GT0;", "RG0;", "SQ0;",
+                "TX;", "AI1;", "SS05;", "SS06;",
             ] {
                 handle.send_cat(cmd);
             }
@@ -931,7 +1012,7 @@ impl ScuApp {
                 // `ID;` answers are surfaced as a model, not a raw CAT frame;
                 // reconstruct the frame so the bridge can satisfy rigctld.
                 #[cfg(not(target_arch = "wasm32"))]
-                self.cat_server.apply(&format!("ID{:04X};", model.id()));
+                self.cat_server.apply(&format!("ID{:04};", model.id()));
                 self.radio = Some(model);
             }
             Event::Cat(text) => self.on_cat(&text),
@@ -976,8 +1057,8 @@ impl ScuApp {
                     }
                 }
             }
-            "FR" => {
-                if let Some(sub) = scu_cat::parse_rx_vfo(text) {
+            "VS" => {
+                if let Some(sub) = scu_cat::parse_vfo(text) {
                     self.rx_sub = sub;
                 }
             }
@@ -996,13 +1077,9 @@ impl ScuApp {
                     self.xit_on = on;
                 }
             }
-            "RC" => {
-                if let Some((tx, hz)) = scu_cat::parse_clarifier(text) {
-                    if tx {
-                        self.xit_offset_hz = hz;
-                    } else {
-                        self.rit_offset_hz = hz;
-                    }
+            "CF" => {
+                if let Some(hz) = scu_cat::parse_clarifier_offset(text) {
+                    self.clarifier_offset_hz = hz;
                 }
             }
             "NB" => {
@@ -1041,8 +1118,15 @@ impl ScuApp {
                 }
             }
             "MD" => {
+                // `MD P1 P2;`: only track the active VFO's mode.
                 if let Some(mode) = scu_cat::parse_mode(text) {
-                    self.mode = Some(mode);
+                    let sub = scu_cat::split(text)
+                        .and_then(|f| f.payload.chars().next())
+                        .map(|c| c == '1')
+                        .unwrap_or(self.rx_sub);
+                    if sub == self.rx_sub {
+                        self.mode = Some(mode);
+                    }
                 }
             }
             "PC" => {
@@ -1196,6 +1280,9 @@ impl ScuApp {
     }
 
     fn set_mode(&mut self, mode: Mode) {
+        // Apply locally so the active mode highlights immediately; the radio's
+        // `MD` echo (or the next poll) confirms it.
+        self.mode = Some(mode);
         if let Some(handle) = &self.handle {
             handle.send_cat(&scu_cat::set_mode_vfo(self.rx_sub, mode));
         }
@@ -1216,7 +1303,10 @@ impl ScuApp {
         }
         self.rx_sub = sub;
         if let Some(handle) = &self.handle {
-            handle.send_cat(scu_cat::select_rx_vfo(sub));
+            handle.send_cat(scu_cat::select_vfo(sub));
+            // The radio keeps a separate mode and clarifier per VFO; refresh them.
+            handle.send_cat(&scu_cat::read_mode_vfo(sub));
+            handle.send_cat(&scu_cat::read_clarifier_offset(sub));
         }
     }
 
@@ -1275,50 +1365,49 @@ impl ScuApp {
         }
     }
 
-    fn set_rit_offset(&mut self, hz: i32) {
-        self.rit_offset_hz = scu_cat::clamp_clarifier_hz(hz);
+    /// Set the shared clarifier offset for the active VFO.
+    fn set_clarifier_offset(&mut self, hz: i32) {
+        self.clarifier_offset_hz = scu_cat::clamp_clarifier_hz(hz);
         if let Some(handle) = &self.handle {
-            handle.send_cat(&scu_cat::set_clarifier(false, self.rit_offset_hz));
-        }
-    }
-
-    fn set_xit_offset(&mut self, hz: i32) {
-        self.xit_offset_hz = scu_cat::clamp_clarifier_hz(hz);
-        if let Some(handle) = &self.handle {
-            handle.send_cat(&scu_cat::set_clarifier(true, self.xit_offset_hz));
+            handle.send_cat(&scu_cat::set_clarifier_offset(
+                self.rx_sub,
+                self.clarifier_offset_hz,
+            ));
         }
     }
 
     fn clear_clarifier(&mut self) {
-        self.set_rit_offset(0);
-        self.set_xit_offset(0);
+        self.clarifier_offset_hz = 0;
+        if let Some(handle) = &self.handle {
+            handle.send_cat(scu_cat::clear_clarifier());
+        }
     }
 
     fn set_noise_blanker(&mut self, on: bool) {
         self.noise_blanker = on;
         if let Some(handle) = &self.handle {
-            handle.send_cat(scu_cat::set_noise_blanker(on));
+            handle.send_cat(&scu_cat::set_noise_blanker(on));
         }
     }
 
     fn set_noise_reduction(&mut self, on: bool) {
         self.noise_reduction = on;
         if let Some(handle) = &self.handle {
-            handle.send_cat(scu_cat::set_noise_reduction(on));
+            handle.send_cat(&scu_cat::set_noise_reduction(on));
         }
     }
 
     fn set_auto_notch(&mut self, on: bool) {
         self.auto_notch = on;
         if let Some(handle) = &self.handle {
-            handle.send_cat(scu_cat::set_auto_notch(on));
+            handle.send_cat(&scu_cat::set_auto_notch(on));
         }
     }
 
     fn set_narrow(&mut self, on: bool) {
         self.narrow = on;
         if let Some(handle) = &self.handle {
-            handle.send_cat(scu_cat::set_narrow(on));
+            handle.send_cat(&scu_cat::set_narrow(on));
         }
     }
 
@@ -1365,16 +1454,15 @@ impl ScuApp {
         if self.last_poll.elapsed() >= Duration::from_secs(1) {
             self.last_poll = Instant::now();
             let md = if self.rx_sub { "MD1;" } else { "MD0;" };
+            let cf = if self.rx_sub { "CF101;" } else { "CF001;" };
             if let Some(handle) = &self.handle {
                 for cmd in [
-                    "FA;", "FB;", "FR;", "ST;", md, "SM0;", "PC;", "MG;", "AC;", "RT;", "XT;",
-                    "NB;", "NR;", "BC;", "NA0;", "GT0;", "RG0;", "SQ0;", "TX;", "SS05;", "RM3;",
+                    "FA;", "FB;", "VS;", "ST;", md, "SM0;", "PC;", "MG;", "AC;", "RT;", "XT;", cf,
+                    "NB0;", "NR0;", "BC0;", "NA0;", "GT0;", "RG0;", "SQ0;", "TX;", "SS05;", "RM3;",
                     "RM4;", "RM5;", "RM6;", "RM7;", "RM8;", "RM9;",
                 ] {
                     handle.send_cat(cmd);
                 }
-                handle.send_cat(&scu_cat::read_clarifier(false));
-                handle.send_cat(&scu_cat::read_clarifier(true));
             }
         }
     }
@@ -2072,19 +2160,41 @@ impl ScuApp {
     /// Mode pane.
     fn pane_mode(&mut self, ui: &mut egui::Ui) {
         theme::section(ui, "Mode");
+        ui.horizontal(|ui| {
+            let active = self.mode.map(|m| m.label()).unwrap_or("--");
+            ui.label(
+                egui::RichText::new(format!("ACTIVE  {active}"))
+                    .strong()
+                    .color(theme::accent()),
+            );
+            ui.label(
+                egui::RichText::new("(VFO-A / VFO-B shown above)")
+                    .small()
+                    .color(theme::text_faint()),
+            );
+        });
         ui.horizontal_wrapped(|ui| {
             for mode in Mode::ALL {
-                if ui
-                    .selectable_label(self.mode == Some(mode), mode.label())
-                    .clicked()
-                {
+                let selected = self.mode == Some(mode);
+                let text = egui::RichText::new(mode.label()).color(if selected {
+                    theme::on_accent()
+                } else {
+                    theme::text()
+                });
+                let button = egui::Button::new(text).min_size(egui::Vec2::new(62.0, 22.0));
+                let button = if selected {
+                    button.fill(theme::accent())
+                } else {
+                    button
+                };
+                if ui.add(button).clicked() {
                     self.set_mode(mode);
                 }
             }
         });
     }
 
-    /// Clarifier (RIT/XIT) pane.
+    /// Clarifier pane. The FTDX10 has one offset shared by RIT and XIT.
     fn pane_clarifier(&mut self, ui: &mut egui::Ui) {
         theme::section(ui, "Clarifier (RIT/XIT)");
         ui.horizontal(|ui| {
@@ -2100,29 +2210,18 @@ impl ScuApp {
                 self.clear_clarifier();
             }
         });
-        let mut rit_offset = self.rit_offset_hz;
+        let mut offset = self.clarifier_offset_hz;
         if ui
             .add(
-                egui::Slider::new(&mut rit_offset, -9990..=9990)
+                egui::Slider::new(&mut offset, -9990..=9990)
                     .step_by(10.0)
-                    .text("RIT offset")
+                    .text("Clarifier offset")
                     .suffix(" Hz"),
             )
+            .on_hover_text("One offset, shared by RIT and XIT")
             .changed()
         {
-            self.set_rit_offset(rit_offset);
-        }
-        let mut xit_offset = self.xit_offset_hz;
-        if ui
-            .add(
-                egui::Slider::new(&mut xit_offset, -9990..=9990)
-                    .step_by(10.0)
-                    .text("XIT offset")
-                    .suffix(" Hz"),
-            )
-            .changed()
-        {
-            self.set_xit_offset(xit_offset);
+            self.set_clarifier_offset(offset);
         }
     }
 
@@ -2405,7 +2504,8 @@ impl ScuApp {
             });
     }
 
-    /// Floating settings page: meter visibility and CAT console toggle.
+    /// Floating settings window, split into tabs: appearance, meters, panes and
+    /// logging.
     fn ui_settings(&mut self, ctx: &egui::Context) {
         if !self.show_settings {
             return;
@@ -2414,93 +2514,173 @@ impl ScuApp {
         egui::Window::new("Settings")
             .open(&mut open)
             .collapsible(false)
-            .resizable(false)
-            .default_width(260.0)
+            .resizable(true)
+            .default_width(340.0)
+            .default_height(400.0)
+            .min_width(300.0)
             .show(ctx, |ui| {
-                theme::section(ui, "Appearance");
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("Theme");
-                    for kind in theme::ThemeKind::ALL {
+                    for tab in SettingsTab::ALL {
                         if ui
-                            .selectable_label(self.settings.theme_kind == kind, kind.label())
+                            .selectable_label(self.settings_tab == tab, tab.label())
                             .clicked()
                         {
-                            self.settings.theme_kind = kind;
-                            save_settings(&self.settings);
+                            self.settings_tab = tab;
                         }
                     }
                 });
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Size");
-                    for scale in theme::UiScale::ALL {
-                        if ui
-                            .selectable_label(self.settings.ui_scale == scale, scale.label())
-                            .clicked()
-                        {
-                            self.settings.ui_scale = scale;
-                            save_settings(&self.settings);
-                        }
-                    }
-                });
-                let mut high_contrast = self.settings.high_contrast;
-                if ui
-                    .checkbox(&mut high_contrast, "High contrast")
-                    .on_hover_text("Boost text and border contrast")
-                    .changed()
-                {
-                    self.settings.high_contrast = high_contrast;
-                    save_settings(&self.settings);
-                }
-                let mut large_targets = self.settings.large_targets;
-                if ui
-                    .checkbox(&mut large_targets, "Large targets")
-                    .on_hover_text("Enlarge control hit areas")
-                    .changed()
-                {
-                    self.settings.large_targets = large_targets;
-                    save_settings(&self.settings);
-                }
-
-                theme::section(ui, "Meters");
-                ui.label(
-                    egui::RichText::new("Choose which meters appear in the side rail.")
-                        .small()
-                        .color(theme::text_faint()),
-                );
-                for index in METER_INDICES {
-                    let kind = MeterKind::from_rm_index(index);
-                    let mut on = self.settings.visible_meters.contains(&index);
-                    if ui.checkbox(&mut on, kind.label()).changed() {
-                        if on {
-                            if !self.settings.visible_meters.contains(&index) {
-                                self.settings.visible_meters.push(index);
-                            }
-                        } else {
-                            self.settings.visible_meters.retain(|&i| i != index);
-                        }
-                        self.settings.visible_meters.sort_unstable();
-                        save_settings(&self.settings);
-                    }
-                }
-
-                theme::section(ui, "CAT Console");
-                let mut show = layout::pane_tile(&self.layouts.draft, Pane::CatConsole).is_some();
-                if ui
-                    .checkbox(&mut show, "Show CAT console pane")
-                    .on_hover_text("Add or remove the CAT command log pane")
-                    .changed()
-                {
-                    if show {
-                        layout::add_pane(&mut self.layouts.draft, Pane::CatConsole);
-                    } else {
-                        layout::remove_pane(&mut self.layouts.draft, Pane::CatConsole);
-                    }
-                    self.settings.show_cat_console = show;
-                    save_settings(&self.settings);
-                    self.mark_layout_dirty();
-                }
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| match self.settings_tab {
+                        SettingsTab::Appearance => self.settings_appearance(ui),
+                        SettingsTab::Meters => self.settings_meters(ui),
+                        SettingsTab::Panes => self.settings_panes(ui),
+                        SettingsTab::Logging => self.settings_logging(ui),
+                    });
             });
         self.show_settings = open;
+    }
+
+    /// Appearance tab: palette, UI size and accessibility options.
+    fn settings_appearance(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "Theme");
+        ui.horizontal_wrapped(|ui| {
+            for kind in theme::ThemeKind::ALL {
+                if ui
+                    .selectable_label(self.settings.theme_kind == kind, kind.label())
+                    .clicked()
+                {
+                    self.settings.theme_kind = kind;
+                    save_settings(&self.settings);
+                }
+            }
+        });
+
+        theme::section(ui, "UI size");
+        ui.horizontal_wrapped(|ui| {
+            for scale in theme::UiScale::ALL {
+                if ui
+                    .selectable_label(self.settings.ui_scale == scale, scale.label())
+                    .clicked()
+                {
+                    self.settings.ui_scale = scale;
+                    save_settings(&self.settings);
+                }
+            }
+        });
+
+        theme::section(ui, "Accessibility");
+        let mut high_contrast = self.settings.high_contrast;
+        if ui
+            .checkbox(&mut high_contrast, "High contrast")
+            .on_hover_text("Boost text and border contrast")
+            .changed()
+        {
+            self.settings.high_contrast = high_contrast;
+            save_settings(&self.settings);
+        }
+        let mut large_targets = self.settings.large_targets;
+        if ui
+            .checkbox(&mut large_targets, "Large targets")
+            .on_hover_text("Enlarge control hit areas")
+            .changed()
+        {
+            self.settings.large_targets = large_targets;
+            save_settings(&self.settings);
+        }
+    }
+
+    /// Meters tab: which `RM` meters are shown.
+    fn settings_meters(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "Visible meters");
+        ui.label(
+            egui::RichText::new("Choose which meters appear in the Meters pane.")
+                .small()
+                .color(theme::text_faint()),
+        );
+        for index in METER_INDICES {
+            let kind = MeterKind::from_rm_index(index);
+            let mut on = self.settings.visible_meters.contains(&index);
+            if ui.checkbox(&mut on, kind.label()).changed() {
+                if on {
+                    if !self.settings.visible_meters.contains(&index) {
+                        self.settings.visible_meters.push(index);
+                    }
+                } else {
+                    self.settings.visible_meters.retain(|&i| i != index);
+                }
+                self.settings.visible_meters.sort_unstable();
+                save_settings(&self.settings);
+            }
+        }
+    }
+
+    /// Panes tab: add/remove optional panels and reset the arrangement.
+    fn settings_panes(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "Optional panes");
+        let mut show = layout::pane_tile(&self.layouts.draft, Pane::CatConsole).is_some();
+        if ui
+            .checkbox(&mut show, "CAT console")
+            .on_hover_text("Add or remove the CAT command log pane")
+            .changed()
+        {
+            if show {
+                layout::add_pane(&mut self.layouts.draft, Pane::CatConsole);
+            } else {
+                layout::remove_pane(&mut self.layouts.draft, Pane::CatConsole);
+            }
+            self.settings.show_cat_console = show;
+            save_settings(&self.settings);
+            self.mark_layout_dirty();
+        }
+        ui.label(
+            egui::RichText::new("Use the Panels menu in the toolbar for every other pane.")
+                .small()
+                .color(theme::text_faint()),
+        );
+
+        theme::section(ui, "Layout");
+        if ui
+            .button("Reset arrangement to default")
+            .on_hover_text("Discard the current arrangement and relayout the panes")
+            .clicked()
+        {
+            self.reset_layout();
+        }
+    }
+
+    /// Logging tab: console verbosity, applied to the tracing subscriber.
+    fn settings_logging(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "Console log level");
+        let before = self.settings.log_level;
+        egui::ComboBox::from_id_salt("log-level")
+            .selected_text(self.settings.log_level.label())
+            .width(160.0)
+            .show_ui(ui, |ui| {
+                for level in LogLevel::ALL {
+                    ui.selectable_value(&mut self.settings.log_level, level, level.label());
+                }
+            });
+        if self.settings.log_level != before {
+            crate::logging::set_level(self.settings.log_level.filter());
+            save_settings(&self.settings);
+        }
+
+        ui.label(
+            egui::RichText::new(
+                "Controls how much the app writes to the console. Debug and Trace \
+                 are useful when diagnosing a connection or protocol issue.",
+            )
+            .small()
+            .color(theme::text_faint()),
+        );
+        #[cfg(target_arch = "wasm32")]
+        ui.label(
+            egui::RichText::new("The browser build keeps its console logger at its default level.")
+                .small()
+                .color(theme::text_faint()),
+        );
     }
 
     /// Click-to-tune plus a hover frequency readout over a spectrum/waterfall area.
