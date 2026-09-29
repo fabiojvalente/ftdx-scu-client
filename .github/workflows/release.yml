@@ -25,18 +25,19 @@ jobs:
           - platform: linux-x86_64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            targets: x86_64-unknown-linux-gnu
             rustflags: ""
-          - platform: macos-aarch64
+          # Build a universal (Intel + Apple Silicon) binary on the arm64
+          # runner; GitHub no longer allocates the Intel macOS runners.
+          - platform: macos-universal
             os: macos-latest
-            target: aarch64-apple-darwin
-            rustflags: ""
-          - platform: macos-x86_64
-            os: macos-13
-            target: x86_64-apple-darwin
+            target: universal
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
             rustflags: ""
           - platform: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
+            targets: x86_64-pc-windows-msvc
             # Statically link the MSVC CRT so the .exe is self-contained.
             rustflags: "-C target-feature=+crt-static"
 
@@ -61,7 +62,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.targets }}
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -69,9 +70,16 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build
+        if: runner.os != 'macOS'
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release --locked -p scu-app --target ${{ matrix.target }}
+
+      - name: Build universal (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --locked -p scu-app --target aarch64-apple-darwin
+          cargo build --release --locked -p scu-app --target x86_64-apple-darwin
 
       - name: Package AppImage (Linux)
         if: runner.os == 'Linux'
@@ -141,7 +149,10 @@ jobs:
           APP="SCU-LAN10 Client.app"
 
           mkdir -p "$APP/Contents/MacOS" dist
-          cp "target/${{ matrix.target }}/release/scu-app" "$APP/Contents/MacOS/scu-app"
+          lipo -create \
+            "target/aarch64-apple-darwin/release/scu-app" \
+            "target/x86_64-apple-darwin/release/scu-app" \
+            -output "$APP/Contents/MacOS/scu-app"
 
           cat > "$APP/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
