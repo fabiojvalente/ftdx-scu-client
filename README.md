@@ -14,6 +14,11 @@ Operation Reference manuals).
 
 ## Features
 
+- **Dockable panel UI** — every control group is a panel you can drag, tab,
+  split, resize, close and reopen. Arrangements are saved as named presets
+  (default, dashboard, or your own) and restored on the next launch.
+- **Themes & accessibility** — Dark, Light, Yaesu and Neon palettes; five UI
+  size steps; and high-contrast / large-target options for low-vision use.
 - **Waterfall / panadapter** — decoupled decode pipeline, circular texture with
   partial uploads, colormaps, span, and follow-VFO.
 - **Full CAT rig control** — VFO-A/B, RX/TX VFO select, split, swap, RIT/XIT,
@@ -28,6 +33,29 @@ Operation Reference manuals).
 - **Headless probe** (`scu-probe`), a headless rigctld server (`scu-rigctld`)
   and a reusable protocol core for building external bridges.
 
+## User interface
+
+The window is a thin connection/command bar over a dockable panel workspace
+(built on [`egui_tiles`](https://github.com/rerun-io/egui_tiles)). Drag a tab to
+move or split a panel, drag the gaps to resize, and use the tab close button or
+the **Panels** menu to show and hide panels.
+
+- **Layouts** menu — switch between the built-in **Default** and **Dashboard**
+  arrangements, save the current one as a named preset, rename or delete
+  presets, and reset to the default. The working arrangement and presets are
+  stored in `~/.config/scu-client/layouts.json` (native) or browser
+  `localStorage` (wasm) and restored on launch.
+- **Pop-out** — the **Pop** button in any tab bar moves that panel into its own
+  OS window (native builds). Use **Dock** in the panel's title bar (or close the
+  window) to return it; floating panels are remembered across launches. On the
+  web build a pop-out falls back to an embedded floating window.
+- **Theme** menu — Dark, Light, Yaesu and Neon. The active palette is also
+  selectable in Settings.
+- **Scale** menu — Extra small … Extra large. Scaling changes fonts, spacing and
+  hit targets together; it never moves panels.
+- **Settings** — high-contrast and large-target accessibility options, meter
+  visibility, and the CAT console pane toggle.
+
 ## Workspace layout
 
 ```
@@ -40,7 +68,7 @@ ftdx10-scu-client/
 │   ├── scu-client/     # executor-agnostic session state machine + channel tasks
 │   ├── scu-rigctld/    # native rigctld-protocol TCP server (Hamlib clients)
 │   └── scu-bridge/     # WebSocket ⇄ UDP relay for the browser build
-└── app/                # egui/eframe GUI (native + wasm)
+└── app/                # egui/eframe GUI (dockable flex panels, native + wasm)
 ```
 
 The SCU-LAN10 exposes four UDP ports that share one framing + XOR scheme:

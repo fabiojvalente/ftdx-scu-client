@@ -18,10 +18,8 @@ use scu_client::{ConnectConfig, Event, ScuClient, ScuHandle};
 use scu_scope::{BinInterleave, Colormap, FrequencyAxis};
 use serde::{Deserialize, Serialize};
 
-use crate::theme::{
-    self, ACCENT, FREQ_CYAN, ON_ACCENT, OUTLINE, RX_GREEN, SPECTRUM_GREEN, TEXT, TEXT_DIM,
-    TEXT_FAINT, TX_RED,
-};
+use crate::layout::{self, LayoutsFile, Pane};
+use crate::theme;
 use crate::waterfall::Waterfall;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -33,6 +31,14 @@ enum EngineMsg {
     Event(Event),
     Failed(String),
     Stopped,
+}
+
+/// A modal prompt for naming a layout: either saving the current tree as a new
+/// preset, or renaming an existing one (by id).
+#[derive(Clone)]
+enum LayoutPrompt {
+    SaveAs(String),
+    Rename(String, String),
 }
 
 /// UI preferences, persisted separately from the connection config.
@@ -67,6 +73,18 @@ pub struct AppSettings {
     pub vox_attack_ms: u32,
     #[serde(default = "default_vox_hang")]
     pub vox_hang_ms: u32,
+    /// Active colour palette.
+    #[serde(default)]
+    pub theme_kind: theme::ThemeKind,
+    /// UI zoom step (fonts, spacing, hit targets).
+    #[serde(default)]
+    pub ui_scale: theme::UiScale,
+    /// Boosts contrast for low-vision use.
+    #[serde(default)]
+    pub high_contrast: bool,
+    /// Enlarges control hit targets for easier pointing.
+    #[serde(default)]
+    pub large_targets: bool,
 }
 
 impl Default for AppSettings {
@@ -84,6 +102,10 @@ impl Default for AppSettings {
             vox_threshold: default_vox_threshold(),
             vox_attack_ms: default_vox_attack(),
             vox_hang_ms: default_vox_hang(),
+            theme_kind: theme::ThemeKind::default(),
+            ui_scale: theme::UiScale::default(),
+            high_contrast: false,
+            large_targets: false,
         }
     }
 }
@@ -178,6 +200,24 @@ pub struct ScuApp {
     settings: AppSettings,
     show_settings: bool,
 
+    /// Active palette (source of truth; mirrored into the theme module).
+    theme: theme::Theme,
+    /// Last appearance settings pushed to egui, so changes apply once.
+    applied_appearance: Option<(theme::ThemeKind, theme::UiScale, bool, bool)>,
+
+    /// Persisted dock layout (working draft, active id and named presets).
+    layouts: LayoutsFile,
+    /// Set when the tree changes; drives debounced persistence.
+    layout_dirty: bool,
+    last_layout_save: Instant,
+    /// Pending "save/rename layout" prompt, if any.
+    layout_prompt: Option<LayoutPrompt>,
+
+    /// PTT button held this frame (set while rendering the Operate pane).
+    ptt_held: bool,
+    /// Panes asked to pop out this frame (processed after the tree render).
+    popout_requests: Vec<Pane>,
+
     /// Audio fan-out the engine writes RX frames to (local + streaming outputs).
     audio_sinks: Arc<std::sync::Mutex<Vec<AudioSink>>>,
 
@@ -205,7 +245,6 @@ pub struct ScuApp {
 
 impl ScuApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        theme::apply(&cc.egui_ctx);
         #[allow(unused_mut)]
         let mut config = load_config().unwrap_or_default();
         #[cfg(target_arch = "wasm32")]
@@ -217,6 +256,21 @@ impl ScuApp {
             freq_input_text(config_default_freq()),
         ];
         let settings = load_settings().unwrap_or_default();
+        let theme = theme::Theme::for_kind(settings.theme_kind);
+        theme::apply(
+            &cc.egui_ctx,
+            theme,
+            settings.ui_scale,
+            settings.high_contrast,
+            settings.large_targets,
+        );
+        let appearance = (
+            settings.theme_kind,
+            settings.ui_scale,
+            settings.high_contrast,
+            settings.large_targets,
+        );
+        let layouts = LayoutsFile::load();
         Self {
             config,
             handle: None,
@@ -271,6 +325,14 @@ impl ScuApp {
             mic_status: String::new(),
             settings,
             show_settings: false,
+            theme,
+            applied_appearance: Some(appearance),
+            layouts,
+            layout_dirty: false,
+            last_layout_save: Instant::now(),
+            layout_prompt: None,
+            ptt_held: false,
+            popout_requests: Vec::new(),
             audio_sinks: Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(not(target_arch = "wasm32"))]
             rx_stream: None,
@@ -443,7 +505,7 @@ impl ScuApp {
                 "Expose the radio to WSJT-X, fldigi, N1MM and other Hamlib clients over the network.",
             )
             .small()
-            .color(TEXT_FAINT),
+            .color(theme::text_faint()),
         );
 
         let mut enabled = self.settings.cat_server_enabled;
@@ -479,18 +541,18 @@ impl ScuApp {
                     if status.clients == 1 { "" } else { "s" }
                 ))
                 .strong()
-                .color(RX_GREEN),
+                .color(theme::rx_green()),
             );
             ui.label(
                 egui::RichText::new("Point clients at Hamlib NET rigctl / rigctld")
                     .small()
-                    .color(TEXT_FAINT),
+                    .color(theme::text_faint()),
             );
         } else {
-            ui.label(egui::RichText::new("Stopped").color(TEXT_DIM));
+            ui.label(egui::RichText::new("Stopped").color(theme::text_dim()));
         }
         if let Some(error) = &status.error {
-            ui.label(egui::RichText::new(error).small().color(theme::WARN_AMBER));
+            ui.label(egui::RichText::new(error).small().color(theme::warn_amber()));
         }
     }
 
@@ -504,7 +566,7 @@ impl ScuApp {
                 "Bridge RX/TX to a virtual device (BlackHole, Loopback, Common-Radio, VB-Cable).",
             )
             .small()
-            .color(TEXT_FAINT),
+            .color(theme::text_faint()),
         );
 
         // RX: radio -> loopback -> external app.
@@ -574,7 +636,7 @@ impl ScuApp {
         ui.label(
             egui::RichText::new("TX streaming replaces the local microphone while enabled.")
                 .small()
-                .color(TEXT_FAINT),
+                .color(theme::text_faint()),
         );
 
         if ui.button("Rescan audio devices").clicked() {
@@ -611,7 +673,7 @@ impl ScuApp {
         ui.add(
             egui::ProgressBar::new((level as f32 / 32767.0).clamp(0.0, 1.0))
                 .desired_height(10.0)
-                .fill(if self.tx_keyed() { TX_RED } else { RX_GREEN })
+                .fill(if self.tx_keyed() { theme::tx_red() } else { theme::rx_green() })
                 .text(if self.tx_keyed() { "TX" } else { "RX" }),
         );
         ui.label(
@@ -620,7 +682,7 @@ impl ScuApp {
                 self.settings.vox_threshold
             ))
             .small()
-            .color(TEXT_FAINT),
+            .color(theme::text_faint()),
         );
 
         let mut threshold = self.settings.vox_threshold;
@@ -650,7 +712,7 @@ impl ScuApp {
         ui.label(
             egui::RichText::new("Uses whichever TX audio source is active (mic or streaming).")
                 .small()
-                .color(TEXT_FAINT),
+                .color(theme::text_faint()),
         );
     }
 
@@ -1322,8 +1384,8 @@ impl ScuApp {
     }
 
     fn paint_spectrum(&self, painter: &egui::Painter, rect: egui::Rect) {
-        painter.rect_filled(rect, 4.0, theme::INSET_BG);
-        let midline = egui::Stroke::new(1.0, theme::OUTLINE);
+        painter.rect_filled(rect, 4.0, theme::inset_bg());
+        let midline = egui::Stroke::new(1.0, theme::outline());
         painter.line_segment(
             [
                 egui::pos2(rect.left(), rect.center().y),
@@ -1338,7 +1400,7 @@ impl ScuApp {
                 egui::Align2::CENTER_CENTER,
                 "waiting for scope data...",
                 egui::FontId::proportional(16.0),
-                TEXT_DIM,
+                theme::text_dim(),
             );
             return;
         }
@@ -1352,7 +1414,7 @@ impl ScuApp {
         }
         painter.add(egui::Shape::line(
             points,
-            egui::Stroke::new(1.2, SPECTRUM_GREEN),
+            egui::Stroke::new(1.2, theme::spectrum_green()),
         ));
     }
 
@@ -1361,7 +1423,7 @@ impl ScuApp {
             return;
         }
         let axis = self.axis();
-        let color = TEXT;
+        let color = theme::text();
         let font = egui::FontId::monospace(11.0);
         for (t, align) in [
             (0.0, egui::Align2::LEFT_BOTTOM),
@@ -1376,7 +1438,7 @@ impl ScuApp {
         }
 
         // Center-tuned marker.
-        let center = egui::Stroke::new(1.0, theme::WARN_AMBER);
+        let center = egui::Stroke::new(1.0, theme::warn_amber());
         painter.line_segment(
             [
                 egui::pos2(rect.center().x, rect.top()),
@@ -1391,12 +1453,12 @@ impl ScuApp {
             .frame(theme::top_bar_frame())
             .show(root, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("SCU-LAN10").strong().color(ACCENT));
+                    ui.label(egui::RichText::new("SCU-LAN10").strong().color(theme::accent()));
                     ui.separator();
 
-                    ui.label(egui::RichText::new("HOST").small().color(TEXT_FAINT));
+                    ui.label(egui::RichText::new("HOST").small().color(theme::text_faint()));
                     ui.add(egui::TextEdit::singleline(&mut self.config.host).desired_width(120.0));
-                    ui.label(egui::RichText::new("PORT").small().color(TEXT_FAINT));
+                    ui.label(egui::RichText::new("PORT").small().color(theme::text_faint()));
                     ui.add(
                         egui::DragValue::new(&mut self.config.base_port)
                             .range(1..=65535)
@@ -1404,7 +1466,7 @@ impl ScuApp {
                     );
                     #[cfg(target_arch = "wasm32")]
                     {
-                        ui.label(egui::RichText::new("BRIDGE").small().color(TEXT_FAINT));
+                        ui.label(egui::RichText::new("BRIDGE").small().color(theme::text_faint()));
                         let mut bridge = self.config.bridge_url.clone().unwrap_or_default();
                         if ui
                             .add(egui::TextEdit::singleline(&mut bridge).desired_width(160.0))
@@ -1413,11 +1475,11 @@ impl ScuApp {
                             self.config.bridge_url = Some(bridge);
                         }
                     }
-                    ui.label(egui::RichText::new("USER").small().color(TEXT_FAINT));
+                    ui.label(egui::RichText::new("USER").small().color(theme::text_faint()));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.config.username).desired_width(90.0),
                     );
-                    ui.label(egui::RichText::new("PASS").small().color(TEXT_FAINT));
+                    ui.label(egui::RichText::new("PASS").small().color(theme::text_faint()));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.config.password)
                             .password(true)
@@ -1428,7 +1490,7 @@ impl ScuApp {
                     if self.connected() {
                         if ui
                             .add(egui::Button::new(
-                                egui::RichText::new("Disconnect").strong().color(TX_RED),
+                                egui::RichText::new("Disconnect").strong().color(theme::tx_red()),
                             ))
                             .clicked()
                         {
@@ -1447,11 +1509,24 @@ impl ScuApp {
 
                     if ui
                         .add(egui::Button::new(egui::RichText::new("Settings")))
-                        .on_hover_text("Show meters and CAT console options")
+                        .on_hover_text("Show appearance and meter options")
                         .clicked()
                     {
                         self.show_settings = !self.show_settings;
                     }
+
+                    ui.separator();
+                    ui.menu_button("Layouts", |ui| self.layouts_menu(ui));
+                    ui.menu_button("Panels", |ui| self.panels_menu(ui));
+                    ui.menu_button(
+                        format!("Theme: {}", self.settings.theme_kind.label()),
+                        |ui| self.theme_menu(ui),
+                    );
+                    ui.menu_button(
+                        format!("Scale: {}", self.settings.ui_scale.label()),
+                        |ui| self.scale_menu(ui),
+                    );
+                    ui.separator();
 
                     ui.label(egui::RichText::new(&self.status).color(self.status_color()));
 
@@ -1460,7 +1535,7 @@ impl ScuApp {
                             ui.label(
                                 egui::RichText::new(radio.name())
                                     .monospace()
-                                    .color(TEXT_DIM),
+                                    .color(theme::text_dim()),
                             );
                         });
                     }
@@ -1471,74 +1546,172 @@ impl ScuApp {
     /// Colour-coded connection status text.
     fn status_color(&self) -> egui::Color32 {
         if self.status.starts_with("connected") {
-            RX_GREEN
+            theme::rx_green()
         } else if self.status.contains("failed")
             || self.status.contains("unavailable")
             || self.status.starts_with("disconnected:")
         {
-            TX_RED
+            theme::tx_red()
         } else {
-            TEXT_DIM
+            theme::text_dim()
         }
     }
 
-    /// The prominent dual-VFO header: transmit key, both VFO read-outs, quick
-    /// operate toggles and the S-meter, laid out like a table-top radio.
-    fn ui_vfo(&mut self, root: &mut egui::Ui) {
-        let held = egui::Panel::top(egui::Id::new("vfo"))
-            .frame(theme::header_frame())
-            .show(root, |ui| {
-                ui.add_space(8.0);
-                let mut ptt_held = false;
-                ui.horizontal(|ui| {
-                    // Transmit key cluster.
-                    ui.vertical(|ui| {
-                        ptt_held = self.ptt_button(ui);
-                        if self.tune_button(ui) {
-                            self.start_atu_tune();
-                        }
-                    });
-                    ui.separator();
+    /// Operate pane: transmit key, ATU tune and the quick operate toggles.
+    fn pane_operate(&mut self, ui: &mut egui::Ui) {
+        let mut ptt_held = false;
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ptt_held = self.ptt_button(ui);
+                if self.tune_button(ui) {
+                    self.start_atu_tune();
+                }
+            });
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.vertical(|ui| self.quick_toggles(ui));
+        });
+        self.ptt_held = ptt_held;
+    }
 
-                    // Share the remaining width between the two VFO cards so
-                    // neither ever spills past the window edge.
-                    const TOGGLES_WIDTH: f32 = 172.0;
-                    const SEPARATORS: f32 = 30.0;
-                    const FRAME_PAD: f32 = 28.0;
-                    let available = ui.available_width();
-                    let card_width = ((available - TOGGLES_WIDTH - SEPARATORS) / 2.0 - FRAME_PAD)
-                        .clamp(196.0, 420.0);
+    /// One VFO read-out pane, sized to the available width. Carries the VFO's
+    /// S-meter and the VFO swap/copy shortcuts.
+    fn pane_vfo(&mut self, ui: &mut egui::Ui, sub: bool) {
+        let width = ui.available_width().max(180.0);
+        self.vfo_card(ui, sub, width);
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(self.handle.is_some(), egui::Button::new("A<->B").small())
+                .on_hover_text("Swap VFO-A and VFO-B")
+                .clicked()
+            {
+                self.swap_vfo();
+            }
+            if ui
+                .add_enabled(self.handle.is_some(), egui::Button::new("A->B").small())
+                .on_hover_text("Copy VFO-A to VFO-B")
+                .clicked()
+            {
+                self.copy_a_to_b();
+            }
+            if ui
+                .add_enabled(self.handle.is_some(), egui::Button::new("B->A").small())
+                .on_hover_text("Copy VFO-B to VFO-A")
+                .clicked()
+            {
+                self.copy_b_to_a();
+            }
+        });
+    }
 
-                    self.vfo_card(ui, false, card_width);
-                    ui.add_space(10.0);
-                    self.vfo_card(ui, true, card_width);
-                    ui.separator();
+    /// Spectrum pane: panadapter trace plus click-to-tune.
+    fn pane_spectrum(&mut self, ui: &mut egui::Ui) {
+        let size = ui.available_size();
+        let (response, painter) =
+            ui.allocate_painter(egui::Vec2::new(size.x, size.y.max(80.0)), egui::Sense::click());
+        self.paint_spectrum(&painter, response.rect);
+        self.tune_interaction(&response, &painter, response.rect);
+    }
 
-                    ui.vertical(|ui| self.quick_toggles(ui));
-                });
-                ui.add_space(8.0);
-                self.smeter_strip(ui);
-                ui.add_space(6.0);
-                ptt_held
-            })
-            .inner;
+    /// Waterfall pane: scrolling texture plus the frequency axis.
+    fn pane_waterfall(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        self.waterfall.update_texture(&ctx);
+        let size = egui::Vec2::new(ui.available_width(), ui.available_height().max(80.0));
+        let (response, painter) = ui.allocate_painter(size, egui::Sense::click());
+        self.waterfall.paint(&painter, response.rect);
+        self.paint_frequency_axis(&painter, response.rect);
+        self.tune_interaction(&response, &painter, response.rect);
+    }
 
-        let space = self.handle.is_some()
-            && root.ctx().memory(|m| m.focused().is_none())
-            && root.ctx().input(|i| i.key_down(egui::Key::Space));
-        self.set_ptt(held || space);
+    /// Tab title for a pane, with live VFO state for the VFO panes.
+    pub(crate) fn pane_tab_title(&self, pane: Pane) -> String {
+        match pane {
+            Pane::VfoA => self.vfo_pane_title(false),
+            Pane::VfoB => self.vfo_pane_title(true),
+            _ => pane.title().to_string(),
+        }
+    }
+
+    fn vfo_pane_title(&self, sub: bool) -> String {
+        let letter = if sub { "B" } else { "A" };
+        let mut title = format!("VFO {letter}");
+        if self.rx_sub == sub {
+            title.push_str(" \u{25cf}");
+        }
+        if self.tx_on(sub) {
+            title.push_str(" TX");
+        }
+        title
+    }
+
+    /// Render one dock pane.
+    pub(crate) fn render_pane(&mut self, pane: Pane, ui: &mut egui::Ui, _theme: theme::Theme) {
+        let scrolls = !matches!(
+            pane,
+            Pane::Spectrum | Pane::Waterfall | Pane::VfoA | Pane::VfoB
+        );
+        if scrolls {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| self.render_pane_inner(pane, ui));
+        } else {
+            self.render_pane_inner(pane, ui);
+        }
+    }
+
+    fn render_pane_inner(&mut self, pane: Pane, ui: &mut egui::Ui) {
+        match pane {
+            Pane::VfoA => self.pane_vfo(ui, false),
+            Pane::VfoB => self.pane_vfo(ui, true),
+            Pane::Operate => self.pane_operate(ui),
+            Pane::Spectrum => self.pane_spectrum(ui),
+            Pane::Waterfall => self.pane_waterfall(ui),
+            Pane::Radio => self.pane_radio(ui),
+            Pane::Tuning => self.pane_tuning(ui),
+            Pane::Mode => self.pane_mode(ui),
+            Pane::Clarifier => self.pane_clarifier(ui),
+            Pane::Dsp => self.pane_dsp(ui),
+            Pane::Receiver => self.pane_receiver(ui),
+            Pane::Meters => self.pane_meters(ui),
+            Pane::Scope => self.pane_scope(ui),
+            Pane::Audio => self.pane_audio(ui),
+            Pane::Transmit => self.pane_transmit(ui),
+            Pane::CatConsole => self.pane_cat_console(ui),
+            Pane::CatServer => {
+                #[cfg(not(target_arch = "wasm32"))]
+                self.ui_cat_server(ui);
+                #[cfg(target_arch = "wasm32")]
+                ui.label("Not available in the browser build.");
+            }
+            Pane::AudioStreaming => {
+                #[cfg(not(target_arch = "wasm32"))]
+                self.ui_audio_streaming(ui);
+                #[cfg(target_arch = "wasm32")]
+                ui.label("Not available in the browser build.");
+            }
+            Pane::Vox => {
+                #[cfg(not(target_arch = "wasm32"))]
+                self.ui_vox(ui);
+                #[cfg(target_arch = "wasm32")]
+                ui.label("Not available in the browser build.");
+            }
+        }
     }
 
     /// Big red/green push-to-talk key. Returns `true` while held down.
     fn ptt_button(&self, ui: &mut egui::Ui) -> bool {
         let on = self.tx_keyed();
         let fill = if on {
-            TX_RED
+            theme::tx_red()
         } else {
             egui::Color32::from_rgb(48, 54, 64)
         };
-        let stroke = if on { TX_RED } else { OUTLINE };
-        let text_color = if on { ON_ACCENT } else { TEXT };
+        let stroke = if on { theme::tx_red() } else { theme::outline() };
+        let text_color = if on { theme::on_accent() } else { theme::text() };
         let label = if on { "TX" } else { "PTT" };
         let button = egui::Button::new(
             egui::RichText::new(label)
@@ -1570,9 +1743,9 @@ impl ScuApp {
         let button = egui::Button::new(egui::RichText::new("TUNE").strong())
             .min_size(egui::Vec2::new(84.0, 26.0))
             .fill(if self.atu_on {
-                theme::ACCENT_DEEP
+                theme::accent_deep()
             } else {
-                theme::BUTTON_BG
+                theme::button_bg()
             });
         ui.add_enabled(self.handle.is_some(), button)
             .on_hover_text("Start an ATU tuning cycle (keys a carrier)")
@@ -1582,14 +1755,14 @@ impl ScuApp {
     /// One VFO read-out card (Main = VFO-A, Sub = VFO-B).
     fn vfo_card(&mut self, ui: &mut egui::Ui, sub: bool, width: f32) {
         let active = self.rx_sub == sub;
-        let border = if active { ACCENT } else { OUTLINE };
+        let border = if active { theme::accent() } else { theme::outline() };
         let name = if sub { "SUB" } else { "MAIN" };
         let vfo = if sub { "B" } else { "A" };
         // Keep the frequency inside the card at any window width.
         let freq_size = (width / 7.5).clamp(18.0, 30.0);
 
         egui::Frame::new()
-            .fill(theme::CARD_BG)
+            .fill(theme::card_bg())
             .stroke(egui::Stroke::new(if active { 1.5 } else { 1.0 }, border))
             .corner_radius(6)
             .inner_margin(egui::Margin::symmetric(12, 8))
@@ -1600,12 +1773,12 @@ impl ScuApp {
                         egui::RichText::new(name)
                             .strong()
                             .size(14.0)
-                            .color(if active { ACCENT } else { TEXT_DIM }),
+                            .color(if active { theme::accent() } else { theme::text_dim() }),
                     );
                     ui.label(
                         egui::RichText::new(format!("VFO {vfo}"))
                             .small()
-                            .color(TEXT_FAINT),
+                            .color(theme::text_faint()),
                     );
                     // A bounded right-aligned cluster; an unbounded
                     // right-to-left layout would swallow all remaining width.
@@ -1614,9 +1787,9 @@ impl ScuApp {
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
                             let (fill, text_color) = if active {
-                                (RX_GREEN, ON_ACCENT)
+                                (theme::rx_green(), theme::on_accent())
                             } else {
-                                (theme::BUTTON_BG, TEXT_DIM)
+                                (theme::button_bg(), theme::text_dim())
                             };
                             if ui
                                 .add(
@@ -1635,7 +1808,7 @@ impl ScuApp {
                                 self.select_rx_vfo(sub);
                             }
                             if self.tx_on(sub) {
-                                ui.label(egui::RichText::new("TX").small().strong().color(TX_RED));
+                                ui.label(egui::RichText::new("TX").small().strong().color(theme::tx_red()));
                             }
                         },
                     );
@@ -1656,7 +1829,7 @@ impl ScuApp {
                             egui::TextEdit::singleline(&mut self.freq_input[idx])
                                 .id(edit_id)
                                 .font(egui::FontId::monospace(freq_size))
-                                .text_color(if active { FREQ_CYAN } else { TEXT_DIM })
+                                .text_color(if active { theme::freq_cyan() } else { theme::text_dim() })
                                 .desired_width(width)
                                 .frame(egui::Frame::NONE)
                                 .margin(egui::Margin::ZERO),
@@ -1694,7 +1867,7 @@ impl ScuApp {
                                     .monospace()
                                     .strong()
                                     .size(freq_size)
-                                    .color(if active { FREQ_CYAN } else { TEXT_DIM }),
+                                    .color(if active { theme::freq_cyan() } else { theme::text_dim() }),
                             )
                             .sense(egui::Sense::click()),
                         )
@@ -1712,15 +1885,41 @@ impl ScuApp {
                     }
                 }
 
+                // The S-meter lives with the VFO it belongs to: bright green on
+                // the active receive VFO, greyed out otherwise.
+                ui.add_space(3.0);
+                let (s_fill, s_text) = if active {
+                    (theme::rx_green(), theme::text())
+                } else {
+                    (theme::button_bg(), theme::text_faint())
+                };
+                ui.add(
+                    egui::ProgressBar::new(MeterKind::S.fraction(self.smeter))
+                        .desired_width(width)
+                        .desired_height(16.0)
+                        .fill(s_fill)
+                        .corner_radius(theme::current().radius)
+                        .text(
+                            egui::RichText::new(MeterKind::S.format(self.smeter))
+                                .strong()
+                                .color(s_text),
+                        ),
+                )
+                .on_hover_text(if active {
+                    "S-meter (active receive VFO)"
+                } else {
+                    "S-meter (this VFO is not receiving)"
+                });
+
                 ui.horizontal(|ui| {
                     let mode = self.mode.map(|m| m.label()).unwrap_or("--");
-                    ui.label(egui::RichText::new(mode).strong().color(TEXT));
+                    ui.label(egui::RichText::new(mode).strong().color(theme::text()));
                     let sub_label = if self.split {
                         "SPLIT".to_string()
                     } else {
                         span_label(self.span_hz)
                     };
-                    ui.label(egui::RichText::new(sub_label).small().color(TEXT_FAINT));
+                    ui.label(egui::RichText::new(sub_label).small().color(theme::text_faint()));
                 });
             });
     }
@@ -1744,12 +1943,12 @@ impl ScuApp {
         theme::section(ui, "Operate");
 
         let (text, fill) = if self.tx_keyed() {
-            ("TX  ON AIR", TX_RED)
+            ("TX  ON AIR", theme::tx_red())
         } else {
-            ("RX  STANDBY", RX_GREEN)
+            ("RX  STANDBY", theme::rx_green())
         };
         ui.add(
-            egui::Button::new(egui::RichText::new(text).strong().color(ON_ACCENT))
+            egui::Button::new(egui::RichText::new(text).strong().color(theme::on_accent()))
                 .fill(fill)
                 .min_size(egui::Vec2::new(148.0, 26.0)),
         );
@@ -1773,493 +1972,436 @@ impl ScuApp {
         });
     }
 
-    /// Full-width S-meter with VFO swap/copy shortcuts.
-    fn smeter_strip(&mut self, ui: &mut egui::Ui) {
+    /// Radio pane: power state and receive-VFO selection.
+    fn pane_radio(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("RIG").small().strong().color(theme::accent()));
+            let radio = self
+                .radio
+                .map(|r| r.name())
+                .unwrap_or_else(|| "unknown".to_string());
+            ui.label(egui::RichText::new(radio).color(theme::text_dim()));
+        });
+
+        theme::section(ui, "Power");
+        ui.horizontal(|ui| {
+            let (state, color) = match self.radio_power {
+                Some(true) => ("ON", theme::rx_green()),
+                Some(false) => ("STANDBY", theme::tx_red()),
+                None => ("UNKNOWN", theme::text_dim()),
+            };
+            ui.label(egui::RichText::new(state).strong().color(color));
+            let action = if self.radio_power == Some(true) {
+                "Power off"
+            } else {
+                "Power on"
+            };
+            if ui
+                .add_enabled(self.connected(), egui::Button::new(action))
+                .on_hover_text(
+                    "The SCU-LAN10 stays reachable while the radio is in \
+                     standby; use this to power it on or off remotely.",
+                )
+                .clicked()
+            {
+                self.set_radio_power(self.radio_power != Some(true));
+            }
+        });
+
+        theme::section(ui, "VFO");
+        ui.horizontal(|ui| {
+            ui.label("Receive");
+            if ui.selectable_label(!self.rx_sub, "A / Main").clicked() {
+                self.select_rx_vfo(false);
+            }
+            if ui.selectable_label(self.rx_sub, "B / Sub").clicked() {
+                self.select_rx_vfo(true);
+            }
+        });
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("S-METER")
-                    .small()
-                    .strong()
-                    .color(ACCENT),
+                egui::RichText::new(format!("A {}", scu_cat::format_hz(self.frequency)))
+                    .monospace()
+                    .color(theme::text_dim()),
             );
-            let width = (ui.available_width() - 230.0).max(140.0);
-            ui.add(
-                egui::ProgressBar::new(MeterKind::S.fraction(self.smeter))
-                    .desired_width(width)
-                    .desired_height(18.0)
-                    .fill(RX_GREEN)
-                    .corner_radius(4)
-                    .text(MeterKind::S.format(self.smeter)),
+            ui.label(
+                egui::RichText::new(format!("B {}", scu_cat::format_hz(self.frequency_b)))
+                    .monospace()
+                    .color(theme::text_dim()),
             );
+        });
+    }
+
+    /// Tuning pane: step size and up/down.
+    fn pane_tuning(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "Tuning");
+        ui.label(
+            egui::RichText::new("Type directly on either VFO card above")
+                .small()
+                .color(theme::text_faint()),
+        );
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Step").small().color(theme::text_faint()));
+            let mut step = self.freq_step_hz;
+            egui::ComboBox::from_id_salt("freq-step")
+                .selected_text(step_label(self.freq_step_hz))
+                .width(88.0)
+                .show_ui(ui, |ui| {
+                    for (value, label) in FREQ_STEPS {
+                        ui.selectable_value(&mut step, value, label);
+                    }
+                });
+            self.freq_step_hz = step;
             if ui
-                .add_enabled(self.handle.is_some(), egui::Button::new("A<->B").small())
-                .on_hover_text("Swap VFO-A and VFO-B")
+                .button("-")
+                .on_hover_text("Tune down one step")
                 .clicked()
             {
-                self.swap_vfo();
+                self.step_frequency(-1);
             }
             if ui
-                .add_enabled(self.handle.is_some(), egui::Button::new("A->B").small())
+                .button("+")
+                .on_hover_text("Tune up one step")
                 .clicked()
             {
-                self.copy_a_to_b();
-            }
-            if ui
-                .add_enabled(self.handle.is_some(), egui::Button::new("B->A").small())
-                .clicked()
-            {
-                self.copy_b_to_a();
+                self.step_frequency(1);
             }
         });
     }
 
-    fn ui_side(&mut self, root: &mut egui::Ui) {
-        egui::Panel::left(egui::Id::new("rig"))
-            .default_size(320.0)
-            .frame(theme::rail_frame())
-            .show(root, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.add_space(2.0);
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("RIG").small().strong().color(ACCENT));
-                            let radio = self
-                                .radio
-                                .map(|r| r.name())
-                                .unwrap_or_else(|| "unknown".to_string());
-                            ui.label(egui::RichText::new(radio).color(TEXT_DIM));
-                        });
+    /// Mode pane.
+    fn pane_mode(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "Mode");
+        ui.horizontal_wrapped(|ui| {
+            for mode in Mode::ALL {
+                if ui
+                    .selectable_label(self.mode == Some(mode), mode.label())
+                    .clicked()
+                {
+                    self.set_mode(mode);
+                }
+            }
+        });
+    }
 
-                        theme::section(ui, "Power");
-                        ui.horizontal(|ui| {
-                            let (state, color) = match self.radio_power {
-                                Some(true) => ("ON", RX_GREEN),
-                                Some(false) => ("STANDBY", TX_RED),
-                                None => ("UNKNOWN", TEXT_DIM),
-                            };
-                            ui.label(egui::RichText::new(state).strong().color(color));
-                            let action = if self.radio_power == Some(true) {
-                                "Power off"
-                            } else {
-                                "Power on"
-                            };
-                            if ui
-                                .add_enabled(self.connected(), egui::Button::new(action))
-                                .on_hover_text(
-                                    "The SCU-LAN10 stays reachable while the radio is in \
-                                     standby; use this to power it on or off remotely.",
-                                )
-                                .clicked()
-                            {
-                                self.set_radio_power(self.radio_power != Some(true));
-                            }
-                        });
+    /// Clarifier (RIT/XIT) pane.
+    fn pane_clarifier(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "Clarifier (RIT/XIT)");
+        ui.horizontal(|ui| {
+            let mut rit = self.rit_on;
+            if ui.checkbox(&mut rit, "RIT").changed() {
+                self.set_rit(rit);
+            }
+            let mut xit = self.xit_on;
+            if ui.checkbox(&mut xit, "XIT").changed() {
+                self.set_xit(xit);
+            }
+            if ui.button("Clear").clicked() {
+                self.clear_clarifier();
+            }
+        });
+        let mut rit_offset = self.rit_offset_hz;
+        if ui
+            .add(
+                egui::Slider::new(&mut rit_offset, -9990..=9990)
+                    .step_by(10.0)
+                    .text("RIT offset")
+                    .suffix(" Hz"),
+            )
+            .changed()
+        {
+            self.set_rit_offset(rit_offset);
+        }
+        let mut xit_offset = self.xit_offset_hz;
+        if ui
+            .add(
+                egui::Slider::new(&mut xit_offset, -9990..=9990)
+                    .step_by(10.0)
+                    .text("XIT offset")
+                    .suffix(" Hz"),
+            )
+            .changed()
+        {
+            self.set_xit_offset(xit_offset);
+        }
+    }
 
-                        theme::section(ui, "VFO");
-                        ui.horizontal(|ui| {
-                            ui.label("Receive");
-                            if ui.selectable_label(!self.rx_sub, "A / Main").clicked() {
-                                self.select_rx_vfo(false);
-                            }
-                            if ui.selectable_label(self.rx_sub, "B / Sub").clicked() {
-                                self.select_rx_vfo(true);
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "A {}",
-                                    scu_cat::format_hz(self.frequency)
-                                ))
-                                .monospace()
-                                .color(TEXT_DIM),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "B {}",
-                                    scu_cat::format_hz(self.frequency_b)
-                                ))
-                                .monospace()
-                                .color(TEXT_DIM),
-                            );
-                        });
-                        theme::section(ui, "Tuning");
-                        ui.label(
-                            egui::RichText::new("Type directly on either VFO card above")
-                                .small()
-                                .color(TEXT_FAINT),
-                        );
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Step").small().color(TEXT_FAINT));
-                            let mut step = self.freq_step_hz;
-                            egui::ComboBox::from_id_salt("freq-step")
-                                .selected_text(step_label(self.freq_step_hz))
-                                .width(88.0)
-                                .show_ui(ui, |ui| {
-                                    for (value, label) in FREQ_STEPS {
-                                        ui.selectable_value(&mut step, value, label);
-                                    }
-                                });
-                            self.freq_step_hz = step;
-                            if ui
-                                .button("-")
-                                .on_hover_text("Tune down one step")
-                                .clicked()
-                            {
-                                self.step_frequency(-1);
-                            }
-                            if ui
-                                .button("+")
-                                .on_hover_text("Tune up one step")
-                                .clicked()
-                            {
-                                self.step_frequency(1);
-                            }
-                        });
+    /// DSP pane.
+    fn pane_dsp(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "DSP");
+        let mut nb = self.noise_blanker;
+        if ui.checkbox(&mut nb, "Noise blanker").changed() {
+            self.set_noise_blanker(nb);
+        }
+        let mut nr = self.noise_reduction;
+        if ui.checkbox(&mut nr, "Noise reduction").changed() {
+            self.set_noise_reduction(nr);
+        }
+        let mut notch = self.auto_notch;
+        if ui.checkbox(&mut notch, "Auto notch").changed() {
+            self.set_auto_notch(notch);
+        }
+        let mut narrow = self.narrow;
+        if ui.checkbox(&mut narrow, "Narrow filter").changed() {
+            self.set_narrow(narrow);
+        }
+    }
 
-                        theme::section(ui, "Mode");
-                        ui.horizontal_wrapped(|ui| {
-                            for mode in Mode::ALL {
-                                if ui
-                                    .selectable_label(self.mode == Some(mode), mode.label())
-                                    .clicked()
-                                {
-                                    self.set_mode(mode);
-                                }
-                            }
-                        });
+    /// Receiver pane: AGC, RF gain and squelch.
+    fn pane_receiver(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "Receiver");
+        let current_agc = self.agc;
+        let mut selected_agc = current_agc;
+        egui::ComboBox::from_id_salt("agc")
+            .selected_text(format!(
+                "AGC {}",
+                current_agc.map(|a| a.label()).unwrap_or("--")
+            ))
+            .show_ui(ui, |ui| {
+                for agc in Agc::ALL {
+                    ui.selectable_value(&mut selected_agc, Some(agc), agc.label());
+                }
+            });
+        if selected_agc != current_agc {
+            if let Some(agc) = selected_agc {
+                self.set_agc(agc);
+            }
+        }
+        let mut rf_gain = self.rf_gain as i32;
+        if ui
+            .add(
+                egui::Slider::new(&mut rf_gain, 0..=scu_cat::RF_GAIN_MAX as i32).text("RF gain"),
+            )
+            .changed()
+        {
+            self.set_rf_gain(rf_gain as u8);
+        }
+        let mut squelch = self.squelch as i32;
+        if ui
+            .add(
+                egui::Slider::new(&mut squelch, 0..=scu_cat::SQUELCH_MAX as i32).text("Squelch"),
+            )
+            .changed()
+        {
+            self.set_squelch(squelch as u8);
+        }
+    }
 
-                        theme::section(ui, "Clarifier (RIT/XIT)");
-                        ui.horizontal(|ui| {
-                            let mut rit = self.rit_on;
-                            if ui.checkbox(&mut rit, "RIT").changed() {
-                                self.set_rit(rit);
-                            }
-                            let mut xit = self.xit_on;
-                            if ui.checkbox(&mut xit, "XIT").changed() {
-                                self.set_xit(xit);
-                            }
-                            if ui.button("Clear").clicked() {
-                                self.clear_clarifier();
-                            }
-                        });
-                        let mut rit_offset = self.rit_offset_hz;
+    /// Meters pane.
+    fn pane_meters(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "Meters");
+        for index in 0..self.meters.len() {
+            if !self.settings.visible_meters.contains(&(index as u8)) {
+                continue;
+            }
+            let Some(raw) = self.meters[index] else {
+                continue;
+            };
+            let kind = MeterKind::from_rm_index(index as u8);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(kind.label()).monospace().strong());
+                ui.add(
+                    egui::ProgressBar::new(kind.fraction(raw))
+                        .fill(theme::accent())
+                        .text(egui::RichText::new(kind.format(raw)).color(theme::text())),
+                );
+            });
+        }
+    }
+
+    /// Scope & waterfall settings pane.
+    fn pane_scope(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "Scope & Waterfall");
+        let mut selected_span: Option<usize> = None;
+        ui.horizontal(|ui| {
+            ui.label("Span");
+            egui::ComboBox::from_id_salt("span")
+                .selected_text(span_label(self.span_hz))
+                .show_ui(ui, |ui| {
+                    for (index, span) in scu_cat::SCOPE_SPANS_HZ.iter().enumerate() {
+                        let selected = (self.span_hz - span).abs() < 0.5;
                         if ui
-                            .add(
-                                egui::Slider::new(&mut rit_offset, -9990..=9990)
-                                    .step_by(10.0)
-                                    .text("RIT offset")
-                                    .suffix(" Hz"),
-                            )
-                            .changed()
+                            .selectable_label(selected, span_label(*span))
+                            .clicked()
                         {
-                            self.set_rit_offset(rit_offset);
+                            selected_span = Some(index);
                         }
-                        let mut xit_offset = self.xit_offset_hz;
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut xit_offset, -9990..=9990)
-                                    .step_by(10.0)
-                                    .text("XIT offset")
-                                    .suffix(" Hz"),
-                            )
-                            .changed()
-                        {
-                            self.set_xit_offset(xit_offset);
-                        }
+                    }
+                });
+        });
+        if let Some(index) = selected_span {
+            self.set_span(index);
+        }
 
-                        theme::section(ui, "DSP");
-                        let mut nb = self.noise_blanker;
-                        if ui.checkbox(&mut nb, "Noise blanker").changed() {
-                            self.set_noise_blanker(nb);
-                        }
-                        let mut nr = self.noise_reduction;
-                        if ui.checkbox(&mut nr, "Noise reduction").changed() {
-                            self.set_noise_reduction(nr);
-                        }
-                        let mut notch = self.auto_notch;
-                        if ui.checkbox(&mut notch, "Auto notch").changed() {
-                            self.set_auto_notch(notch);
-                        }
-                        let mut narrow = self.narrow;
-                        if ui.checkbox(&mut narrow, "Narrow filter").changed() {
-                            self.set_narrow(narrow);
-                        }
+        let mut follow = self.follow_vfo;
+        if ui
+            .checkbox(&mut follow, "Scope follows VFO")
+            .on_hover_text("Set the radio's scope to CENTER mode so the waterfall tracks tuning")
+            .changed()
+        {
+            self.set_scope_follow_vfo(follow);
+        }
 
-                        theme::section(ui, "Receiver");
-                        let current_agc = self.agc;
-                        let mut selected_agc = current_agc;
-                        egui::ComboBox::from_id_salt("agc")
-                            .selected_text(format!(
-                                "AGC {}",
-                                current_agc.map(|a| a.label()).unwrap_or("--")
-                            ))
-                            .show_ui(ui, |ui| {
-                                for agc in Agc::ALL {
-                                    ui.selectable_value(&mut selected_agc, Some(agc), agc.label());
-                                }
-                            });
-                        if selected_agc != current_agc {
-                            if let Some(agc) = selected_agc {
-                                self.set_agc(agc);
-                            }
-                        }
-                        let mut rf_gain = self.rf_gain as i32;
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut rf_gain, 0..=scu_cat::RF_GAIN_MAX as i32)
-                                    .text("RF gain"),
-                            )
-                            .changed()
-                        {
-                            self.set_rf_gain(rf_gain as u8);
-                        }
-                        let mut squelch = self.squelch as i32;
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut squelch, 0..=scu_cat::SQUELCH_MAX as i32)
-                                    .text("Squelch"),
-                            )
-                            .changed()
-                        {
-                            self.set_squelch(squelch as u8);
-                        }
+        ui.horizontal(|ui| {
+            ui.label("Colormap");
+            egui::ComboBox::from_id_salt("colormap")
+                .selected_text(self.waterfall.colormap.label())
+                .show_ui(ui, |ui| {
+                    for map in Colormap::ALL {
+                        ui.selectable_value(&mut self.waterfall.colormap, map, map.label());
+                    }
+                });
+        });
+        ui.add(egui::Slider::new(&mut self.waterfall.black_level, 0.0..=0.9).text("Black"));
+        ui.add(egui::Slider::new(&mut self.waterfall.gain, 0.2..=4.0).text("Gain"));
+        ui.horizontal(|ui| {
+            ui.label("Bins");
+            egui::ComboBox::from_id_salt("bin-mode")
+                .selected_text(self.scope_bins.label())
+                .show_ui(ui, |ui| {
+                    for mode in BinInterleave::ALL {
+                        ui.selectable_value(&mut self.scope_bins, mode, mode.label());
+                    }
+                });
+            if ui.button("Clear").clicked() {
+                self.waterfall.clear();
+            }
+        });
+    }
 
-                        theme::section(ui, "Meters");
-                        for index in 0..self.meters.len() {
-                            if !self.settings.visible_meters.contains(&(index as u8)) {
-                                continue;
-                            }
-                            let Some(raw) = self.meters[index] else {
-                                continue;
-                            };
-                            let kind = MeterKind::from_rm_index(index as u8);
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(kind.label()).monospace().strong(),
-                                );
-                                ui.add(
-                                    egui::ProgressBar::new(kind.fraction(raw))
-                                        .fill(ACCENT)
-                                        .text(kind.format(raw)),
-                                );
-                            });
-                        }
+    /// Audio pane: mute, volume and stereo.
+    fn pane_audio(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "Audio");
+        let mut muted = self.muted;
+        if ui.checkbox(&mut muted, "Mute").changed() {
+            self.muted = muted;
+            self.sync_audio_enabled();
+        }
+        if ui
+            .add(egui::Slider::new(&mut self.volume, 0.0..=1.5).text("Volume"))
+            .changed()
+        {
+            if let Some(audio) = &self.audio {
+                audio.set_volume(self.volume);
+            }
+        }
+        let mut stereo = self.stereo;
+        if ui
+            .checkbox(&mut stereo, "Stereo (ch1 -> right)")
+            .on_hover_text("Off: duplicate the receiver channel to both outputs")
+            .changed()
+        {
+            self.stereo = stereo;
+            if let Some(audio) = &self.audio {
+                audio.set_stereo(stereo);
+            }
+        }
+    }
 
-                        theme::section(ui, "Scope & Waterfall");
-                        let mut selected_span: Option<usize> = None;
-                        ui.horizontal(|ui| {
-                            ui.label("Span");
-                            egui::ComboBox::from_id_salt("span")
-                                .selected_text(span_label(self.span_hz))
-                                .show_ui(ui, |ui| {
-                                    for (index, span) in
-                                        scu_cat::SCOPE_SPANS_HZ.iter().enumerate()
-                                    {
-                                        let selected = (self.span_hz - span).abs() < 0.5;
-                                        if ui
-                                            .selectable_label(selected, span_label(*span))
-                                            .clicked()
-                                        {
-                                            selected_span = Some(index);
-                                        }
-                                    }
-                                });
-                        });
-                        if let Some(index) = selected_span {
-                            self.set_span(index);
-                        }
+    /// Transmit pane: power, microphone gain and capture device.
+    fn pane_transmit(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "Transmit");
+        let mut power = self.tx_power as i32;
+        if ui
+            .add(
+                egui::Slider::new(
+                    &mut power,
+                    scu_cat::POWER_MIN_W as i32..=scu_cat::POWER_MAX_W as i32,
+                )
+                .text("TX power")
+                .suffix(" W"),
+            )
+            .changed()
+        {
+            self.tx_power = power as u16;
+            if let Some(handle) = &self.handle {
+                handle.send_cat(&scu_cat::set_power(self.tx_power));
+            }
+        }
 
-                        let mut follow = self.follow_vfo;
-                        if ui
-                            .checkbox(&mut follow, "Scope follows VFO")
-                            .on_hover_text(
-                                "Set the radio's scope to CENTER mode so the waterfall tracks tuning",
-                            )
-                            .changed()
-                        {
-                            self.set_scope_follow_vfo(follow);
-                        }
+        let mut mic_gain = self.radio_mic_gain as i32;
+        if ui
+            .add(
+                egui::Slider::new(&mut mic_gain, 0..=scu_cat::MIC_GAIN_MAX as i32)
+                    .text("Mic gain")
+                    .suffix(" %"),
+            )
+            .changed()
+        {
+            self.radio_mic_gain = mic_gain as u8;
+            if let Some(handle) = &self.handle {
+                handle.send_cat(&scu_cat::set_mic_gain(self.radio_mic_gain));
+            }
+        }
 
-                        ui.horizontal(|ui| {
-                            ui.label("Colormap");
-                            egui::ComboBox::from_id_salt("colormap")
-                                .selected_text(self.waterfall.colormap.label())
-                                .show_ui(ui, |ui| {
-                                    for map in Colormap::ALL {
-                                        ui.selectable_value(
-                                            &mut self.waterfall.colormap,
-                                            map,
-                                            map.label(),
-                                        );
-                                    }
-                                });
-                        });
-                        ui.add(
-                            egui::Slider::new(&mut self.waterfall.black_level, 0.0..=0.9)
-                                .text("Black"),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.waterfall.gain, 0.2..=4.0).text("Gain"),
-                        );
-                        ui.horizontal(|ui| {
-                            ui.label("Bins");
-                            egui::ComboBox::from_id_salt("bin-mode")
-                                .selected_text(self.scope_bins.label())
-                                .show_ui(ui, |ui| {
-                                    for mode in BinInterleave::ALL {
-                                        ui.selectable_value(
-                                            &mut self.scope_bins,
-                                            mode,
-                                            mode.label(),
-                                        );
-                                    }
-                                });
-                            if ui.button("Clear").clicked() {
-                                self.waterfall.clear();
-                            }
-                        });
+        ui.horizontal(|ui| {
+            ui.label("Mic");
+            let current = self
+                .mic_device
+                .clone()
+                .unwrap_or_else(|| "Default".to_string());
+            let mut changed = false;
+            egui::ComboBox::from_id_salt("mic-device")
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(self.mic_device.is_none(), "Default")
+                        .clicked()
+                    {
+                        self.mic_device = None;
+                        changed = true;
+                    }
+                    let devices = self.mic_devices.clone();
+                    for name in devices {
+                        let selected = self.mic_device.as_deref() == Some(name.as_str());
+                        if ui.selectable_label(selected, &name).clicked() {
+                            self.mic_device = Some(name);
+                            changed = true;
+                        }
+                    }
+                });
+            if changed {
+                self.mic = None;
+                if let Some(handle) = self.handle.clone() {
+                    self.ensure_mic(handle);
+                }
+            }
+        });
+        if ui
+            .add(egui::Slider::new(&mut self.mic_gain, 0.0..=3.0).text("Capture gain"))
+            .changed()
+        {
+            if let Some(mic) = &self.mic {
+                mic.set_gain(self.mic_gain);
+            }
+        }
+        if !self.mic_status.is_empty() {
+            ui.label(egui::RichText::new(&self.mic_status).small().weak());
+        }
+    }
 
-                        theme::section(ui, "Audio");
-                        let mut muted = self.muted;
-                        if ui.checkbox(&mut muted, "Mute").changed() {
-                            self.muted = muted;
-                            self.sync_audio_enabled();
-                        }
-                        if ui
-                            .add(egui::Slider::new(&mut self.volume, 0.0..=1.5).text("Volume"))
-                            .changed()
-                        {
-                            if let Some(audio) = &self.audio {
-                                audio.set_volume(self.volume);
-                            }
-                        }
-                        let mut stereo = self.stereo;
-                        if ui
-                            .checkbox(&mut stereo, "Stereo (ch1 -> right)")
-                            .on_hover_text("Off: duplicate the receiver channel to both outputs")
-                            .changed()
-                        {
-                            self.stereo = stereo;
-                            if let Some(audio) = &self.audio {
-                                audio.set_stereo(stereo);
-                            }
-                        }
-
-                        theme::section(ui, "Transmit");
-                        let mut power = self.tx_power as i32;
-                        if ui
-                            .add(
-                                egui::Slider::new(
-                                    &mut power,
-                                    scu_cat::POWER_MIN_W as i32
-                                        ..=scu_cat::POWER_MAX_W as i32,
-                                )
-                                .text("TX power")
-                                .suffix(" W"),
-                            )
-                            .changed()
-                        {
-                            self.tx_power = power as u16;
-                            if let Some(handle) = &self.handle {
-                                handle.send_cat(&scu_cat::set_power(self.tx_power));
-                            }
-                        }
-
-                        let mut mic_gain = self.radio_mic_gain as i32;
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut mic_gain, 0..=scu_cat::MIC_GAIN_MAX as i32)
-                                    .text("Mic gain")
-                                    .suffix(" %"),
-                            )
-                            .changed()
-                        {
-                            self.radio_mic_gain = mic_gain as u8;
-                            if let Some(handle) = &self.handle {
-                                handle.send_cat(&scu_cat::set_mic_gain(self.radio_mic_gain));
-                            }
-                        }
-
-                        ui.horizontal(|ui| {
-                            ui.label("Mic");
-                            let current = self
-                                .mic_device
-                                .clone()
-                                .unwrap_or_else(|| "Default".to_string());
-                            let mut changed = false;
-                            egui::ComboBox::from_id_salt("mic-device")
-                                .selected_text(current)
-                                .show_ui(ui, |ui| {
-                                    if ui
-                                        .selectable_label(self.mic_device.is_none(), "Default")
-                                        .clicked()
-                                    {
-                                        self.mic_device = None;
-                                        changed = true;
-                                    }
-                                    let devices = self.mic_devices.clone();
-                                    for name in devices {
-                                        let selected =
-                                            self.mic_device.as_deref() == Some(name.as_str());
-                                        if ui.selectable_label(selected, &name).clicked() {
-                                            self.mic_device = Some(name);
-                                            changed = true;
-                                        }
-                                    }
-                                });
-                            if changed {
-                                self.mic = None;
-                                if let Some(handle) = self.handle.clone() {
-                                    self.ensure_mic(handle);
-                                }
-                            }
-                        });
-                        if ui
-                            .add(egui::Slider::new(&mut self.mic_gain, 0.0..=3.0).text("Capture gain"))
-                            .changed()
-                        {
-                            if let Some(mic) = &self.mic {
-                                mic.set_gain(self.mic_gain);
-                            }
-                        }
-                        if !self.mic_status.is_empty() {
-                            ui.label(egui::RichText::new(&self.mic_status).small().weak());
-                        }
-
-                        if self.settings.show_cat_console {
-                            theme::section(ui, "CAT Console");
-                            ui.horizontal(|ui| {
-                                let response = ui.add(
-                                    egui::TextEdit::singleline(&mut self.cat_input)
-                                        .desired_width(190.0)
-                                        .hint_text("e.g. IF;"),
-                                );
-                                if ui.button("Send").clicked()
-                                    || (response.lost_focus()
-                                        && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                                {
-                                    self.send_cat_input();
-                                }
-                            });
-                            egui::ScrollArea::vertical()
-                                .max_height(140.0)
-                                .stick_to_bottom(true)
-                                .show(ui, |ui| {
-                                    for line in &self.cat_log {
-                                        ui.label(egui::RichText::new(line).monospace().small());
-                                    }
-                                });
-                        }
-
-                        #[cfg(not(target_arch = "wasm32"))]
-                        self.ui_cat_server(ui);
-                        #[cfg(not(target_arch = "wasm32"))]
-                        self.ui_audio_streaming(ui);
-                        #[cfg(not(target_arch = "wasm32"))]
-                        self.ui_vox(ui);
-                    });
+    /// CAT console pane.
+    fn pane_cat_console(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "CAT Console");
+        ui.horizontal(|ui| {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.cat_input)
+                    .desired_width(190.0)
+                    .hint_text("e.g. IF;"),
+            );
+            if ui.button("Send").clicked()
+                || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+            {
+                self.send_cat_input();
+            }
+        });
+        egui::ScrollArea::vertical()
+            .max_height(240.0)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for line in &self.cat_log {
+                    ui.label(egui::RichText::new(line).monospace().small());
+                }
             });
     }
 
@@ -2275,11 +2417,55 @@ impl ScuApp {
             .resizable(false)
             .default_width(260.0)
             .show(ctx, |ui| {
+                theme::section(ui, "Appearance");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Theme");
+                    for kind in theme::ThemeKind::ALL {
+                        if ui
+                            .selectable_label(self.settings.theme_kind == kind, kind.label())
+                            .clicked()
+                        {
+                            self.settings.theme_kind = kind;
+                            save_settings(&self.settings);
+                        }
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Size");
+                    for scale in theme::UiScale::ALL {
+                        if ui
+                            .selectable_label(self.settings.ui_scale == scale, scale.label())
+                            .clicked()
+                        {
+                            self.settings.ui_scale = scale;
+                            save_settings(&self.settings);
+                        }
+                    }
+                });
+                let mut high_contrast = self.settings.high_contrast;
+                if ui
+                    .checkbox(&mut high_contrast, "High contrast")
+                    .on_hover_text("Boost text and border contrast")
+                    .changed()
+                {
+                    self.settings.high_contrast = high_contrast;
+                    save_settings(&self.settings);
+                }
+                let mut large_targets = self.settings.large_targets;
+                if ui
+                    .checkbox(&mut large_targets, "Large targets")
+                    .on_hover_text("Enlarge control hit areas")
+                    .changed()
+                {
+                    self.settings.large_targets = large_targets;
+                    save_settings(&self.settings);
+                }
+
                 theme::section(ui, "Meters");
                 ui.label(
                     egui::RichText::new("Choose which meters appear in the side rail.")
                         .small()
-                        .color(TEXT_FAINT),
+                        .color(theme::text_faint()),
                 );
                 for index in METER_INDICES {
                     let kind = MeterKind::from_rm_index(index);
@@ -2298,41 +2484,23 @@ impl ScuApp {
                 }
 
                 theme::section(ui, "CAT Console");
-                let mut show = self.settings.show_cat_console;
+                let mut show = layout::pane_tile(&self.layouts.draft, Pane::CatConsole).is_some();
                 if ui
-                    .checkbox(&mut show, "Show CAT console")
-                    .on_hover_text("Display the CAT command log and entry field in the side rail")
+                    .checkbox(&mut show, "Show CAT console pane")
+                    .on_hover_text("Add or remove the CAT command log pane")
                     .changed()
                 {
+                    if show {
+                        layout::add_pane(&mut self.layouts.draft, Pane::CatConsole);
+                    } else {
+                        layout::remove_pane(&mut self.layouts.draft, Pane::CatConsole);
+                    }
                     self.settings.show_cat_console = show;
                     save_settings(&self.settings);
+                    self.mark_layout_dirty();
                 }
             });
         self.show_settings = open;
-    }
-
-    fn ui_center(&mut self, root: &mut egui::Ui) {
-        let ctx = root.ctx().clone();
-        egui::CentralPanel::default().show(root, |ui| {
-            let size = ui.available_size();
-            let spectrum_height = (size.y * 0.30).clamp(120.0, 240.0);
-
-            let (response, painter) = ui.allocate_painter(
-                egui::Vec2::new(size.x, spectrum_height),
-                egui::Sense::click(),
-            );
-            self.paint_spectrum(&painter, response.rect);
-            self.tune_interaction(&response, &painter, response.rect);
-
-            ui.separator();
-
-            self.waterfall.update_texture(&ctx);
-            let wf_size = egui::Vec2::new(ui.available_width(), ui.available_height());
-            let (wf_response, wf_painter) = ui.allocate_painter(wf_size, egui::Sense::click());
-            self.waterfall.paint(&wf_painter, wf_response.rect);
-            self.paint_frequency_axis(&wf_painter, wf_response.rect);
-            self.tune_interaction(&wf_response, &wf_painter, wf_response.rect);
-        });
     }
 
     /// Click-to-tune plus a hover frequency readout over a spectrum/waterfall area.
@@ -2354,7 +2522,7 @@ impl ScuApp {
         let shift = response.ctx.input(|i| i.modifiers.shift);
 
         if let Some(pos) = response.hover_pos() {
-            let stroke = egui::Stroke::new(1.0, TEXT_DIM);
+            let stroke = egui::Stroke::new(1.0, theme::text_dim());
             painter.line_segment(
                 [
                     egui::pos2(pos.x, rect.top()),
@@ -2377,7 +2545,7 @@ impl ScuApp {
                 egui::Align2::LEFT_TOP,
                 label,
                 egui::FontId::monospace(12.0),
-                theme::WARN_AMBER,
+                theme::warn_amber(),
             );
         }
 
@@ -2418,15 +2586,51 @@ impl eframe::App for ScuApp {
         self.reconcile_external_ptt();
         #[cfg(not(target_arch = "wasm32"))]
         self.update_vox();
+        self.maybe_save_layout();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.apply_appearance(&ctx);
         self.ui_top(ui);
-        self.ui_vfo(ui);
-        self.ui_side(ui);
-        self.ui_center(ui);
+
+        // The Operate pane sets this while rendering; reset before the tree.
+        self.ptt_held = false;
+        egui::CentralPanel::default().show(ui, |ui| {
+            if self.layouts.draft.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    ui.label("All panels are closed.");
+                    if ui.button("Reset to default layout").clicked() {
+                        self.reset_layout();
+                    }
+                });
+                return;
+            }
+            let mut tree = std::mem::replace(
+                &mut self.layouts.draft,
+                egui_tiles::Tree::empty(layout::TREE_ID),
+            );
+            {
+                let theme = self.theme;
+                let mut behavior = layout::FlexBehavior { app: self, theme };
+                tree.ui(&mut behavior, ui);
+            }
+            self.layouts.draft = tree;
+        });
+
+        // Pop-out requests were queued while the tree was borrowed; apply them
+        // now, then draw the floating windows.
+        self.process_popouts();
+        self.render_popped(&ctx);
+
+        let space = self.handle.is_some()
+            && ctx.memory(|m| m.focused().is_none())
+            && ctx.input(|i| i.key_down(egui::Key::Space));
+        self.set_ptt(self.ptt_held || space);
+
         self.ui_settings(&ctx);
+        self.ui_layout_prompt(&ctx);
         ctx.request_repaint_after(Duration::from_millis(16));
     }
 }
@@ -2434,6 +2638,344 @@ impl eframe::App for ScuApp {
 impl ScuApp {
     fn connected(&self) -> bool {
         self.handle.is_some()
+    }
+
+    /// Push theme/scale/accessibility changes to egui when any of them change.
+    fn apply_appearance(&mut self, ctx: &egui::Context) {
+        let current = (
+            self.settings.theme_kind,
+            self.settings.ui_scale,
+            self.settings.high_contrast,
+            self.settings.large_targets,
+        );
+        if self.applied_appearance == Some(current) {
+            return;
+        }
+        self.theme = theme::Theme::for_kind(self.settings.theme_kind);
+        theme::apply(
+            ctx,
+            self.theme,
+            self.settings.ui_scale,
+            self.settings.high_contrast,
+            self.settings.large_targets,
+        );
+        self.applied_appearance = Some(current);
+    }
+
+    pub(crate) fn mark_layout_dirty(&mut self) {
+        self.layout_dirty = true;
+    }
+
+    /// When a named preset is active, keep its stored tree in step with edits.
+    fn sync_active_preset(&mut self) {
+        let id = self.layouts.active_id.clone();
+        if let Some(preset) = self.layouts.presets.iter_mut().find(|p| p.id == id) {
+            preset.tree = self.layouts.draft.clone();
+        }
+    }
+
+    /// Persist the layout once the user stops rearranging it.
+    fn maybe_save_layout(&mut self) {
+        if !self.layout_dirty {
+            return;
+        }
+        if self.last_layout_save.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        self.sync_active_preset();
+        self.layouts.save();
+        self.layout_dirty = false;
+        self.last_layout_save = Instant::now();
+    }
+
+    fn reset_layout(&mut self) {
+        self.layouts.active_id = layout::DEFAULT_ID.to_string();
+        self.layouts.draft = layout::default_tree();
+        self.mark_layout_dirty();
+    }
+
+    fn switch_layout(&mut self, id: &str) {
+        if id == layout::DEFAULT_ID {
+            self.layouts.active_id = layout::DEFAULT_ID.to_string();
+            self.layouts.draft = layout::default_tree();
+        } else if id == layout::DASHBOARD_ID {
+            self.layouts.active_id = layout::DASHBOARD_ID.to_string();
+            self.layouts.draft = layout::dashboard_tree();
+        } else if let Some(preset) = self.layouts.presets.iter().find(|p| p.id == id) {
+            self.layouts.active_id = preset.id.clone();
+            self.layouts.draft = preset.tree.clone();
+        }
+        self.mark_layout_dirty();
+    }
+
+    fn save_current_as(&mut self, name: &str) {
+        let mut n = self.layouts.presets.len() + 1;
+        let mut id = format!("layout-{n}");
+        while self.layouts.presets.iter().any(|p| p.id == id) {
+            n += 1;
+            id = format!("layout-{n}");
+        }
+        self.layouts.presets.push(layout::Preset {
+            id: id.clone(),
+            name: name.to_string(),
+            tree: self.layouts.draft.clone(),
+        });
+        self.layouts.active_id = id;
+        self.mark_layout_dirty();
+    }
+
+    fn rename_preset(&mut self, id: &str, name: &str) {
+        if let Some(preset) = self.layouts.presets.iter_mut().find(|p| p.id == id) {
+            preset.name = name.to_string();
+        }
+        self.mark_layout_dirty();
+    }
+
+    fn delete_preset(&mut self, id: &str) {
+        self.layouts.presets.retain(|p| p.id != id);
+        if self.layouts.active_id == id {
+            self.switch_layout(layout::DEFAULT_ID);
+        } else {
+            self.mark_layout_dirty();
+        }
+    }
+
+    /// Whether `pane` is currently floating in its own window.
+    pub(crate) fn is_popped(&self, pane: Pane) -> bool {
+        self.layouts.popped.contains(&pane)
+    }
+
+    /// Queue a pane to be popped out after the current tree render.
+    pub(crate) fn request_popout(&mut self, pane: Pane) {
+        if !self.popout_requests.contains(&pane) {
+            self.popout_requests.push(pane);
+        }
+    }
+
+    /// Move a pane out of the dock tree and into its own window.
+    fn process_popouts(&mut self) {
+        if self.popout_requests.is_empty() {
+            return;
+        }
+        for pane in std::mem::take(&mut self.popout_requests) {
+            layout::remove_pane(&mut self.layouts.draft, pane);
+            if !self.layouts.popped.contains(&pane) {
+                self.layouts.popped.push(pane);
+            }
+        }
+        self.mark_layout_dirty();
+    }
+
+    /// Return a floating pane to the dock tree.
+    fn dock_pane(&mut self, pane: Pane) {
+        self.layouts.popped.retain(|p| *p != pane);
+        layout::add_pane(&mut self.layouts.draft, pane);
+        self.mark_layout_dirty();
+    }
+
+    /// Draw each floating pane in its own OS window (an embedded window on the
+    /// web, where multi-viewport is unavailable).
+    fn render_popped(&mut self, ctx: &egui::Context) {
+        let popped = self.layouts.popped.clone();
+        for pane in popped {
+            let viewport_id = egui::ViewportId::from_hash_of(("scu-popout", pane));
+            let builder = egui::ViewportBuilder::default()
+                .with_title(format!("SCU-LAN10 \u{2014} {}", pane.title()))
+                .with_inner_size([420.0, 360.0])
+                .with_min_inner_size([260.0, 180.0]);
+            let theme = self.theme;
+            let mut dock = false;
+            let mut close_requested = false;
+            ctx.show_viewport_immediate(viewport_id, builder, |ui, _class| {
+                if ui.ctx().input(|i| i.viewport().close_requested()) {
+                    close_requested = true;
+                }
+                egui::Panel::top(egui::Id::new(("scu-popout-bar", pane)))
+                    .frame(theme::top_bar_frame())
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(pane.title()).strong());
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .button("Dock")
+                                        .on_hover_text("Return this panel to the main window")
+                                        .clicked()
+                                    {
+                                        dock = true;
+                                    }
+                                },
+                            );
+                        });
+                    });
+                egui::CentralPanel::default().show(ui, |ui| {
+                    self.render_pane(pane, ui, theme);
+                });
+            });
+            if dock || close_requested {
+                self.dock_pane(pane);
+            }
+        }
+    }
+
+    /// The Layouts toolbar menu.
+    fn layouts_menu(&mut self, ui: &mut egui::Ui) {
+        let active = self.layouts.active_id.clone();
+        if ui
+            .selectable_label(active == layout::DEFAULT_ID, "Default")
+            .clicked()
+        {
+            self.switch_layout(layout::DEFAULT_ID);
+            ui.close();
+        }
+        if ui
+            .selectable_label(active == layout::DASHBOARD_ID, "Dashboard")
+            .clicked()
+        {
+            self.switch_layout(layout::DASHBOARD_ID);
+            ui.close();
+        }
+        if !self.layouts.presets.is_empty() {
+            ui.separator();
+        }
+
+        let presets = self.layouts.presets.clone();
+        for preset in presets {
+            let mark = if active == preset.id { "\u{25cf} " } else { "" };
+            let label = format!("{mark}{}", preset.name);
+            ui.menu_button(label, |ui| {
+                if ui.button("Switch to").clicked() {
+                    self.switch_layout(&preset.id);
+                    ui.close();
+                }
+                if ui.button("Rename…").clicked() {
+                    self.layout_prompt =
+                        Some(LayoutPrompt::Rename(preset.id.clone(), preset.name.clone()));
+                    ui.close();
+                }
+                if ui.button("Delete").clicked() {
+                    self.delete_preset(&preset.id);
+                    ui.close();
+                }
+            });
+        }
+
+        ui.separator();
+        if ui.button("Save current as…").clicked() {
+            let suggested = format!("Layout {}", self.layouts.presets.len() + 1);
+            self.layout_prompt = Some(LayoutPrompt::SaveAs(suggested));
+            ui.close();
+        }
+        if ui.button("Reset to default").clicked() {
+            self.reset_layout();
+            ui.close();
+        }
+    }
+
+    /// The Panels toolbar menu: show/hide each available pane.
+    fn panels_menu(&mut self, ui: &mut egui::Ui) {
+        for pane in Pane::ALL {
+            if !pane.available(true) {
+                continue;
+            }
+            let popped = self.is_popped(pane);
+            let open = popped || layout::pane_tile(&self.layouts.draft, pane).is_some();
+            let label = if popped {
+                format!("{} (floating)", pane.title())
+            } else {
+                pane.title().to_string()
+            };
+            if ui.selectable_label(open, label).clicked() {
+                if popped {
+                    self.dock_pane(pane);
+                } else if open {
+                    layout::remove_pane(&mut self.layouts.draft, pane);
+                    self.mark_layout_dirty();
+                } else {
+                    layout::add_pane(&mut self.layouts.draft, pane);
+                    self.mark_layout_dirty();
+                }
+            }
+        }
+    }
+
+    /// The Theme toolbar menu.
+    fn theme_menu(&mut self, ui: &mut egui::Ui) {
+        for kind in theme::ThemeKind::ALL {
+            if ui
+                .selectable_label(self.settings.theme_kind == kind, kind.label())
+                .clicked()
+            {
+                self.settings.theme_kind = kind;
+                save_settings(&self.settings);
+                ui.close();
+            }
+        }
+    }
+
+    /// The Scale toolbar menu.
+    fn scale_menu(&mut self, ui: &mut egui::Ui) {
+        for scale in theme::UiScale::ALL {
+            if ui
+                .selectable_label(self.settings.ui_scale == scale, scale.label())
+                .clicked()
+            {
+                self.settings.ui_scale = scale;
+                save_settings(&self.settings);
+                ui.close();
+            }
+        }
+    }
+
+    /// Modal prompt for naming a layout (save-as or rename).
+    fn ui_layout_prompt(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = self.layout_prompt.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut input = match &prompt {
+            LayoutPrompt::SaveAs(name) | LayoutPrompt::Rename(_, name) => name.clone(),
+        };
+        let mut confirm = false;
+        let mut cancel = false;
+        let title = match &prompt {
+            LayoutPrompt::SaveAs(_) => "Save layout",
+            LayoutPrompt::Rename(_, _) => "Rename layout",
+        };
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("Name");
+                let response = ui.add(egui::TextEdit::singleline(&mut input).desired_width(220.0));
+                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    confirm = true;
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if confirm {
+            let name = input.trim().to_string();
+            if !name.is_empty() {
+                match prompt {
+                    LayoutPrompt::SaveAs(_) => self.save_current_as(&name),
+                    LayoutPrompt::Rename(id, _) => self.rename_preset(&id, &name),
+                }
+            }
+            self.layout_prompt = None;
+        } else if cancel || !open {
+            self.layout_prompt = None;
+        }
     }
 }
 
@@ -2541,7 +3083,7 @@ fn device_combo(
 ) -> Option<Option<String>> {
     let mut choice = None;
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).small().color(TEXT_FAINT));
+        ui.label(egui::RichText::new(label).small().color(theme::text_faint()));
         let text = current
             .clone()
             .unwrap_or_else(|| "System default".to_string());
@@ -2567,9 +3109,9 @@ fn device_combo(
 
 /// A compact toggle button that lights up with the accent colour when `on`.
 fn toggle_chip(ui: &mut egui::Ui, on: bool, label: &str) -> bool {
-    let fill = if on { ACCENT } else { theme::BUTTON_BG };
-    let stroke = if on { ACCENT } else { OUTLINE };
-    let text_color = if on { ON_ACCENT } else { TEXT_DIM };
+    let fill = if on { theme::accent() } else { theme::button_bg() };
+    let stroke = if on { theme::accent() } else { theme::outline() };
+    let text_color = if on { theme::on_accent() } else { theme::text_dim() };
     ui.add(
         egui::Button::new(
             egui::RichText::new(label)
