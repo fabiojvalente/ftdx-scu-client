@@ -99,26 +99,103 @@ pub fn set_band(code: u8) -> String {
     format!("BS{:02};", code.min(99))
 }
 
-/// Amateur bands offered for quick band select, with the calling frequency in
-/// Hz, used by the `b` / `B` keyboard shortcuts.
+/// An amateur band for quick band select.
 ///
-/// The frequencies follow Yaesu Web Control's band table. The FTDX10 covers
+/// `calling_hz` is where `b` / `B` land; `lo_hz` / `hi_hz` bound the band so an
+/// arbitrary frequency can be classified. The ranges span the common IARU
+/// allocations rather than one region's exact plan. The FTDX10 covers
 /// 160 m - 6 m; 4 m is included for FTDX101 parity and may be rejected by the
 /// radio.
-pub const HF_BANDS: [(&str, u64); 12] = [
-    ("160m", 1_840_000),
-    ("80m", 3_700_000),
-    ("60m", 5_357_000),
-    ("40m", 7_100_000),
-    ("30m", 10_136_000),
-    ("20m", 14_074_000),
-    ("17m", 18_110_000),
-    ("15m", 21_074_000),
-    ("12m", 24_915_000),
-    ("10m", 28_074_000),
-    ("6m", 50_313_000),
-    ("4m", 70_100_000),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Band {
+    pub name: &'static str,
+    pub calling_hz: u64,
+    pub lo_hz: u64,
+    pub hi_hz: u64,
+}
+
+/// Bands offered for quick band select, in ascending frequency order.
+pub const HF_BANDS: [Band; 12] = [
+    Band {
+        name: "160m",
+        calling_hz: 1_840_000,
+        lo_hz: 1_800_000,
+        hi_hz: 2_000_000,
+    },
+    Band {
+        name: "80m",
+        calling_hz: 3_700_000,
+        lo_hz: 3_500_000,
+        hi_hz: 4_000_000,
+    },
+    Band {
+        name: "60m",
+        calling_hz: 5_357_000,
+        lo_hz: 5_250_000,
+        hi_hz: 5_450_000,
+    },
+    Band {
+        name: "40m",
+        calling_hz: 7_100_000,
+        lo_hz: 7_000_000,
+        hi_hz: 7_300_000,
+    },
+    Band {
+        name: "30m",
+        calling_hz: 10_136_000,
+        lo_hz: 10_100_000,
+        hi_hz: 10_150_000,
+    },
+    Band {
+        name: "20m",
+        calling_hz: 14_074_000,
+        lo_hz: 14_000_000,
+        hi_hz: 14_350_000,
+    },
+    Band {
+        name: "17m",
+        calling_hz: 18_110_000,
+        lo_hz: 18_068_000,
+        hi_hz: 18_168_000,
+    },
+    Band {
+        name: "15m",
+        calling_hz: 21_074_000,
+        lo_hz: 21_000_000,
+        hi_hz: 21_450_000,
+    },
+    Band {
+        name: "12m",
+        calling_hz: 24_915_000,
+        lo_hz: 24_890_000,
+        hi_hz: 24_990_000,
+    },
+    Band {
+        name: "10m",
+        calling_hz: 28_074_000,
+        lo_hz: 28_000_000,
+        hi_hz: 29_700_000,
+    },
+    Band {
+        name: "6m",
+        calling_hz: 50_313_000,
+        lo_hz: 50_000_000,
+        hi_hz: 54_000_000,
+    },
+    Band {
+        name: "4m",
+        calling_hz: 70_100_000,
+        lo_hz: 70_000_000,
+        hi_hz: 70_500_000,
+    },
 ];
+
+/// The band containing `hz`, if any.
+pub fn band_for_hz(hz: u64) -> Option<&'static Band> {
+    HF_BANDS
+        .iter()
+        .find(|band| hz >= band.lo_hz && hz <= band.hi_hz)
+}
 
 /// Index into [`HF_BANDS`] of the band whose calling frequency is nearest to
 /// `hz`, or `None` when `hz` is zero.
@@ -129,7 +206,7 @@ pub fn nearest_band_index(hz: u64) -> Option<usize> {
     HF_BANDS
         .iter()
         .enumerate()
-        .min_by_key(|(_, (_, freq))| hz.abs_diff(*freq))
+        .min_by_key(|(_, band)| hz.abs_diff(band.calling_hz))
         .map(|(index, _)| index)
 }
 
@@ -1230,12 +1307,20 @@ pub fn set_mode(mode: Mode) -> String {
     format!("MD0{};", mode.code())
 }
 
-/// Build a "set mode" command for a specific VFO (`sub = true` -> VFO-B).
+/// Build a `MD P1 P2;` mode-set command.
+///
+/// `sub` is the raw P1 digit (`0`/`1`). On dual-receiver radios it selects the
+/// receiver (0 = MAIN/VFO-A, 1 = SUB/VFO-B). On the single-receiver FTDX10 it is
+/// instead **relative to the operating VFO**: `0` addresses the active VFO and
+/// `1` the inactive one (unlike `FA`/`FB`, which are fixed to VFO-A/VFO-B).
+/// Callers target a physical VFO by translating first (see the app's
+/// `md_vfo_sub`).
 pub fn set_mode_vfo(sub: bool, mode: Mode) -> String {
     format!("MD{}{};", sub as u8, mode.code())
 }
 
-/// Build a "read mode" command for a specific VFO (`sub = true` -> VFO-B).
+/// Build a `MD P1;` mode-read command. See [`set_mode_vfo`] for the meaning of
+/// the P1 digit.
 pub fn read_mode_vfo(sub: bool) -> String {
     format!("MD{};", sub as u8)
 }
@@ -1377,7 +1462,11 @@ pub fn parse_radio_power(frame: &str) -> Option<bool> {
     }
 }
 
-/// Parse the mode from an `MD0` response.
+/// Parse the mode digit from an `MD P1 P2;` response.
+///
+/// The P1 digit is returned separately by the caller via `split`; on the
+/// single-receiver FTDX10 it is relative to the operating VFO (see
+/// [`set_mode_vfo`]).
 pub fn parse_mode(frame: &str) -> Option<Mode> {
     let parsed = split(frame)?;
     if parsed.command != "MD" {
@@ -1837,6 +1926,16 @@ mod tests {
         assert_eq!(nearest_band_index(14_250_000), Some(5)); // 20m
         assert_eq!(nearest_band_index(7_005_000), Some(3)); // 40m
         assert_eq!(nearest_band_index(50_200_000), Some(10)); // 6m
-        assert_eq!(HF_BANDS[5].1, 14_074_000);
+        assert_eq!(HF_BANDS[5].calling_hz, 14_074_000);
+    }
+
+    #[test]
+    fn band_classification_respects_edges() {
+        assert_eq!(band_for_hz(14_074_000).map(|b| b.name), Some("20m"));
+        assert_eq!(band_for_hz(7_000_000).map(|b| b.name), Some("40m"));
+        assert_eq!(band_for_hz(1_800_000).map(|b| b.name), Some("160m"));
+        // Between bands: no label.
+        assert_eq!(band_for_hz(5_000_000), None);
+        assert_eq!(band_for_hz(0), None);
     }
 }

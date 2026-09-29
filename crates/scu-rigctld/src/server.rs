@@ -481,10 +481,9 @@ fn set_mode(ctx: &Context, value: &str) -> String {
     let Some(mode) = mode_from_hamlib(value) else {
         return "RPRT -1 // E_MODE: Unsupported mode for this rig.".to_string();
     };
-    let command = {
-        let state = ctx.state.lock().unwrap();
-        scu_cat::set_mode_vfo(state.sub_vfo, mode)
-    };
+    // Hamlib's `set_mode` targets the current (active) VFO. The FTDX10's `MD`
+    // P1 is relative to the active VFO, so the active VFO is always `MD0`.
+    let command = scu_cat::set_mode_vfo(false, mode);
     ctx.link.send(&command);
     ctx.state.lock().unwrap().set_mode(mode);
     "RPRT 0".to_string()

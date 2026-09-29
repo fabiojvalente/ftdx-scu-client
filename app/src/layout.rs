@@ -35,7 +35,6 @@ pub enum Pane {
     Waterfall,
     Radio,
     Tuning,
-    Mode,
     Clarifier,
     Dsp,
     Receiver,
@@ -51,7 +50,7 @@ pub enum Pane {
 
 impl Pane {
     /// Catalogue, in menu order.
-    pub const ALL: [Pane; 19] = [
+    pub const ALL: [Pane; 18] = [
         Pane::VfoA,
         Pane::VfoB,
         Pane::Operate,
@@ -59,7 +58,6 @@ impl Pane {
         Pane::Waterfall,
         Pane::Radio,
         Pane::Tuning,
-        Pane::Mode,
         Pane::Clarifier,
         Pane::Dsp,
         Pane::Receiver,
@@ -82,7 +80,6 @@ impl Pane {
             Pane::Waterfall => "Waterfall",
             Pane::Radio => "Radio",
             Pane::Tuning => "Tuning",
-            Pane::Mode => "Mode",
             Pane::Clarifier => "Clarifier",
             Pane::Dsp => "DSP",
             Pane::Receiver => "Receiver",
@@ -139,7 +136,7 @@ fn linear(tiles: &mut Tiles<Pane>, dir: LinearDir, children: &[(TileId, f32)]) -
 pub fn default_tree() -> Tree<Pane> {
     let mut t = Tiles::default();
 
-    let radio = tabs(&mut t, &[Pane::Radio, Pane::Tuning, Pane::Mode, Pane::Clarifier]);
+    let radio = tabs(&mut t, &[Pane::Radio, Pane::Tuning, Pane::Clarifier]);
     let dsp = tabs(
         &mut t,
         &[Pane::Dsp, Pane::Receiver, Pane::Meters, Pane::Scope],
@@ -190,7 +187,7 @@ pub fn default_tree() -> Tree<Pane> {
 pub fn dashboard_tree() -> Tree<Pane> {
     let mut t = Tiles::default();
 
-    let actions = tabs(&mut t, &[Pane::Operate, Pane::Tuning, Pane::Mode]);
+    let actions = tabs(&mut t, &[Pane::Operate, Pane::Tuning]);
     let meters = tabs(&mut t, &[Pane::Meters, Pane::Receiver]);
     let top = linear(
         &mut t,

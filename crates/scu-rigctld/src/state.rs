@@ -95,7 +95,11 @@ impl RadioState {
                 }
             }
             "MD" => {
-                let sub = parsed.payload.starts_with('1');
+                // The FTDX10's `MD P1` is relative to the operating VFO (`0` =
+                // active, `1` = inactive), so map it through the known active
+                // VFO. (`FA`/`FB` are absolute; `MD` is not.)
+                let p1 = parsed.payload.starts_with('1');
+                let sub = self.sub_vfo ^ p1;
                 if let Some(mode) = scu_cat::parse_mode(frame) {
                     if sub {
                         self.mode_b = Some(mode);
@@ -244,6 +248,26 @@ mod tests {
         // Active VFO is B.
         assert_eq!(state.frequency(), 7_074_000);
         assert_eq!(state.mode(), Some(Mode::DataU));
+    }
+
+    #[test]
+    fn md_p1_is_relative_to_active_vfo() {
+        // VFO-B active: MD0 = active (B), MD1 = inactive (A).
+        let mut state = RadioState {
+            sub_vfo: true,
+            ..Default::default()
+        };
+        state.apply("MD0C;");
+        state.apply("MD15;");
+        assert_eq!(state.mode_b, Some(Mode::DataU));
+        assert_eq!(state.mode_a, Some(Mode::Am));
+
+        // VFO-A active: the mapping flips.
+        state.sub_vfo = false;
+        state.apply("MD05;");
+        state.apply("MD1C;");
+        assert_eq!(state.mode_a, Some(Mode::Am));
+        assert_eq!(state.mode_b, Some(Mode::DataU));
     }
 
     #[test]

@@ -38,8 +38,8 @@ enum EngineMsg {
 /// preset, or renaming an existing one (by id).
 #[derive(Clone)]
 enum LayoutPrompt {
-    SaveAs(String),
-    Rename(String, String),
+    SaveAs,
+    Rename(String),
 }
 
 /// UI preferences, persisted separately from the connection config.
@@ -142,6 +142,10 @@ fn default_true() -> bool {
 /// RM meter indices offered by the FTDX10 (`RM3` ..= `RM9`).
 const METER_INDICES: [u8; 7] = [3, 4, 5, 6, 7, 8, 9];
 
+/// Settle time allowed after a VFO switch before the per-VFO state is re-read.
+/// The radio broadcasts crossed pre/post-switch values during this window.
+const VFO_SWITCH_SETTLE: Duration = Duration::from_millis(300);
+
 /// Console log verbosity, applied live to the tracing subscriber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum LogLevel {
@@ -239,7 +243,8 @@ pub struct ScuApp {
     agc: Option<Agc>,
     rf_gain: u8,
     squelch: u8,
-    mode: Option<Mode>,
+    /// Operating mode per VFO (0 = A/Main, 1 = B/Sub).
+    mode: [Option<Mode>; 2],
     smeter: u8,
     meters: [Option<u8>; 10],
     span_hz: f64,
@@ -257,6 +262,11 @@ pub struct ScuApp {
     freq_step_hz: u64,
     cat_input: String,
     cat_log: Vec<String>,
+    /// Case-insensitive substring filter for the CAT console; empty shows all.
+    cat_filter: String,
+    /// When set, incoming CAT frames are not appended to the console log, so a
+    /// busy stream can be frozen while reading or copying it.
+    cat_paused: bool,
 
     volume: f32,
     muted: bool,
@@ -283,10 +293,17 @@ pub struct ScuApp {
     notice: Option<(String, Instant)>,
     /// VFO frequency editors asked to take focus on the next frame.
     focus_freq: [bool; 2],
-    /// Active IF width (`SH`) code; 0 is the radio's mode default.
-    if_width: u8,
-    /// Active IF shift (`IS`) in Hz.
-    if_shift_hz: i32,
+    /// IF width (`SH`) code per VFO; 0 is the radio's mode default.
+    if_width: [u8; 2],
+    /// IF shift (`IS`) in Hz per VFO.
+    if_shift_hz: [i32; 2],
+    /// While set and in the future, crossed per-VFO width/shift frames from the
+    /// radio are ignored. Around a `VS` switch the radio emits the outgoing
+    /// VFO's values for the P1=0-fixed `SH`/`IS` commands; the per-VFO state is
+    /// re-read once the window closes. `MD` is per-VFO and not affected.
+    vfo_switch_ignore_until: Option<Instant>,
+    /// A post-switch per-VFO re-read is pending once the settle window closes.
+    vfo_switch_refresh: bool,
 
     /// Active palette (source of truth; mirrored into the theme module).
     theme: theme::Theme,
@@ -300,6 +317,10 @@ pub struct ScuApp {
     last_layout_save: Instant,
     /// Pending "save/rename layout" prompt, if any.
     layout_prompt: Option<LayoutPrompt>,
+    /// Editable name buffer for the pending layout prompt, kept across frames.
+    layout_prompt_input: String,
+    /// Whether the layout prompt's name field still needs initial focus.
+    layout_prompt_focus: bool,
 
     /// PTT button held this frame (set while rendering the Operate pane).
     ptt_held: bool,
@@ -388,7 +409,7 @@ impl ScuApp {
             agc: None,
             rf_gain: 128,
             squelch: 0,
-            mode: None,
+            mode: [None, None],
             smeter: 0,
             meters: [None; 10],
             span_hz: 200_000.0,
@@ -403,6 +424,8 @@ impl ScuApp {
             freq_step_hz: 1_000,
             cat_input: String::new(),
             cat_log: Vec::new(),
+            cat_filter: String::new(),
+            cat_paused: false,
             volume: 1.0,
             muted: false,
             stereo: false,
@@ -421,14 +444,18 @@ impl ScuApp {
             show_shortcuts: false,
             notice: None,
             focus_freq: [false, false],
-            if_width: 0,
-            if_shift_hz: 0,
+            if_width: [0, 0],
+            if_shift_hz: [0, 0],
+            vfo_switch_ignore_until: None,
+            vfo_switch_refresh: false,
             theme,
             applied_appearance: Some(appearance),
             layouts,
             layout_dirty: false,
             last_layout_save: Instant::now(),
             layout_prompt: None,
+            layout_prompt_input: String::new(),
+            layout_prompt_focus: false,
             ptt_held: false,
             popout_requests: Vec::new(),
             audio_sinks: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -953,9 +980,12 @@ impl ScuApp {
     fn initial_queries(&self) {
         if let Some(handle) = &self.handle {
             for cmd in [
-                "ID;", "FA;", "FB;", "VS;", "FT;", "ST;", "MD0;", "MD1;", "SM0;", "PS;", "PC;",
-                "MG;", "AC;", "RT;", "XT;", "NB0;", "NR0;", "BC0;", "NA0;", "GT0;", "RG0;", "SQ0;",
-                "TX;", "AI1;", "SS05;", "SS06;",
+                // `VS;` first, then `MD0;`/`MD1;`: on the FTDX10 the `MD` P1
+                // digit is relative to the operating VFO, so the active VFO
+                // needs to be known to route the two answers.
+                "ID;", "FA;", "FB;", "VS;", "MD0;", "MD1;", "FT;", "ST;", "SH0;", "SH1;", "IS0;",
+                "IS1;", "SM0;", "PS;", "PC;", "MG;", "AC;", "RT;", "XT;", "NB0;", "NR0;", "BC0;",
+                "NA0;", "GT0;", "RG0;", "SQ0;", "TX;", "AI1;", "SS05;", "SS06;",
             ] {
                 handle.send_cat(cmd);
             }
@@ -1050,9 +1080,24 @@ impl ScuApp {
     }
 
     fn on_cat(&mut self, text: &str) {
+        // The radio streams meters continuously; let the user freeze the
+        // console so the frames they care about aren't pushed out.
+        if !self.cat_paused {
+            self.push_log(text.to_string());
+        }
+        let settling = self
+            .vfo_switch_ignore_until
+            .is_some_and(|until| Instant::now() < until);
+        let command = scu_cat::split(text).map(|frame| frame.command);
+        // Drop the crossed pre/post-switch `SH`/`IS` frames (those commands are
+        // P1=0-fixed on the FTDX10 and get broadcast for whichever VFO is
+        // operating). `MD` is per-VFO and tagged with the VFO it describes, so
+        // its answers are never ambiguous and are applied normally.
+        if settling && matches!(command, Some("SH" | "IS")) {
+            return;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         self.cat_server.apply(text);
-        self.push_log(text.to_string());
         let Some(frame) = scu_cat::split(text) else {
             return;
         };
@@ -1076,7 +1121,9 @@ impl ScuApp {
             }
             "VS" => {
                 if let Some(sub) = scu_cat::parse_vfo(text) {
-                    self.rx_sub = sub;
+                    if sub != self.rx_sub {
+                        self.begin_vfo_switch(sub);
+                    }
                 }
             }
             "ST" => {
@@ -1121,12 +1168,14 @@ impl ScuApp {
             }
             "SH" => {
                 if let Some(code) = scu_cat::parse_if_width(text) {
-                    self.if_width = code;
+                    let sub = frame_vfo_sub(text, self.rx_sub);
+                    self.if_width[sub as usize] = code;
                 }
             }
             "IS" => {
                 if let Some(hz) = scu_cat::parse_if_shift(text) {
-                    self.if_shift_hz = hz;
+                    let sub = frame_vfo_sub(text, self.rx_sub);
+                    self.if_shift_hz[sub as usize] = hz;
                 }
             }
             "GT" => {
@@ -1145,15 +1194,14 @@ impl ScuApp {
                 }
             }
             "MD" => {
-                // `MD P1 P2;`: only track the active VFO's mode.
+                // FTDX10 quirk: `MD P1` is relative to the *operating* VFO
+                // (`MD0` = the active VFO, `MD1` = the other one), not fixed to
+                // VFO-A/VFO-B like `FA`/`FB`. Translate the digit through the
+                // known active VFO so each VFO gets its own mode.
                 if let Some(mode) = scu_cat::parse_mode(text) {
-                    let sub = scu_cat::split(text)
-                        .and_then(|f| f.payload.chars().next())
-                        .map(|c| c == '1')
-                        .unwrap_or(self.rx_sub);
-                    if sub == self.rx_sub {
-                        self.mode = Some(mode);
-                    }
+                    let p1 = frame_vfo_sub(text, false);
+                    let sub = md_vfo_sub(p1, self.rx_sub);
+                    self.mode[sub as usize] = Some(mode);
                 }
             }
             "PC" => {
@@ -1235,8 +1283,8 @@ impl ScuApp {
 
     fn push_log(&mut self, line: String) {
         self.cat_log.push(line);
-        if self.cat_log.len() > 200 {
-            let excess = self.cat_log.len() - 200;
+        if self.cat_log.len() > 2000 {
+            let excess = self.cat_log.len() - 2000;
             self.cat_log.drain(0..excess);
         }
     }
@@ -1306,13 +1354,39 @@ impl ScuApp {
         self.freq_editing[sub as usize] = false;
     }
 
+    /// Set the active receive VFO's mode (keyboard shortcuts).
     fn set_mode(&mut self, mode: Mode) {
-        // Apply locally so the active mode highlights immediately; the radio's
-        // `MD` echo (or the next poll) confirms it.
-        self.mode = Some(mode);
+        self.set_mode_for(self.rx_sub, mode);
+    }
+
+    /// Set `sub`'s mode, apply it locally and send it to the radio.
+    ///
+    /// The FTDX10's `MD` P1 selects the active (`0`) or inactive (`1`) VFO
+    /// rather than a fixed VFO-A/VFO-B, so the target is translated against the
+    /// currently-active VFO. This still lets the inactive VFO's mode be changed.
+    fn set_mode_for(&mut self, sub: bool, mode: Mode) {
+        // Apply locally so the dropdown updates immediately; the radio's `MD`
+        // echo (or the next poll) confirms it.
+        self.mode[sub as usize] = Some(mode);
         if let Some(handle) = &self.handle {
-            handle.send_cat(&scu_cat::set_mode_vfo(self.rx_sub, mode));
+            let p1 = md_vfo_sub(sub, self.rx_sub);
+            handle.send_cat(&scu_cat::set_mode_vfo(p1, mode));
         }
+    }
+
+    /// Operating mode of the active receive VFO.
+    fn active_mode(&self) -> Option<Mode> {
+        self.mode[self.rx_sub as usize]
+    }
+
+    /// IF width code of the active receive VFO.
+    fn active_if_width(&self) -> u8 {
+        self.if_width[self.rx_sub as usize]
+    }
+
+    /// IF shift (Hz) of the active receive VFO.
+    fn active_if_shift_hz(&self) -> i32 {
+        self.if_shift_hz[self.rx_sub as usize]
     }
 
     /// Frequency of the VFO currently selected for receive.
@@ -1328,12 +1402,43 @@ impl ScuApp {
         if self.rx_sub == sub {
             return;
         }
-        self.rx_sub = sub;
         if let Some(handle) = &self.handle {
             handle.send_cat(scu_cat::select_vfo(sub));
-            // The radio keeps a separate mode and clarifier per VFO; refresh them.
-            handle.send_cat(&scu_cat::read_mode_vfo(sub));
-            handle.send_cat(&scu_cat::read_clarifier_offset(sub));
+        }
+        self.begin_vfo_switch(sub);
+    }
+
+    /// Record that the operating VFO changed. `SH`/`IS` are P1=0-fixed on the
+    /// FTDX10 and the radio broadcasts crossed values around the switch, so
+    /// those frames are ignored for a short settle window and the per-VFO state
+    /// is re-read afterwards (see [`Self::maybe_refresh_vfo`]).
+    fn begin_vfo_switch(&mut self, sub: bool) {
+        self.rx_sub = sub;
+        self.vfo_switch_ignore_until = Some(Instant::now() + VFO_SWITCH_SETTLE);
+        self.vfo_switch_refresh = true;
+    }
+
+    /// Once the settle window after a VFO switch closes, re-read the per-VFO
+    /// state. Modes are read for both VFOs (`MD0`/`MD1` each address one VFO),
+    /// so the radio is the source of truth for whichever mode each VFO holds
+    /// and no app-side mode memory or re-apply is needed.
+    fn maybe_refresh_vfo(&mut self) {
+        if !self.vfo_switch_refresh {
+            return;
+        }
+        if self
+            .vfo_switch_ignore_until
+            .is_some_and(|until| Instant::now() < until)
+        {
+            return;
+        }
+        self.vfo_switch_refresh = false;
+        self.vfo_switch_ignore_until = None;
+        let cf = if self.rx_sub { "CF101;" } else { "CF001;" };
+        if let Some(handle) = &self.handle {
+            for command in ["MD0;", "MD1;", "SH0;", "SH1;", "IS0;", "IS1;", cf] {
+                handle.send_cat(command);
+            }
         }
     }
 
@@ -1361,6 +1466,13 @@ impl ScuApp {
         std::mem::swap(&mut self.frequency, &mut self.frequency_b);
         self.freq_input.swap(0, 1);
         self.freq_editing.swap(0, 1);
+        // `SV` exchanges the whole VFO contents, mode and IF settings included.
+        self.mode.swap(0, 1);
+        self.if_width.swap(0, 1);
+        self.if_shift_hz.swap(0, 1);
+        // Ignore the radio's crossed swap frames, then re-read to confirm.
+        self.vfo_switch_ignore_until = Some(Instant::now() + VFO_SWITCH_SETTLE);
+        self.vfo_switch_refresh = true;
         if let Some(handle) = &self.handle {
             handle.send_cat(scu_cat::swap_vfo());
         }
@@ -1480,15 +1592,15 @@ impl ScuApp {
         }
         if self.last_poll.elapsed() >= Duration::from_secs(1) {
             self.last_poll = Instant::now();
-            let md = if self.rx_sub { "MD1;" } else { "MD0;" };
+            // `MD0;`/`MD1;` are relative to the operating VFO, so `VS;` is
+            // polled first to keep that association current.
             let cf = if self.rx_sub { "CF101;" } else { "CF001;" };
-            let sh = if self.rx_sub { "SH1;" } else { "SH0;" };
-            let is = if self.rx_sub { "IS1;" } else { "IS0;" };
             if let Some(handle) = &self.handle {
                 for cmd in [
-                    "FA;", "FB;", "VS;", "ST;", md, "SM0;", "PC;", "MG;", "AC;", "RT;", "XT;", cf,
-                    sh, is, "NB0;", "NR0;", "BC0;", "NA0;", "GT0;", "RG0;", "SQ0;", "TX;", "SS05;",
-                    "RM3;", "RM4;", "RM5;", "RM6;", "RM7;", "RM8;", "RM9;",
+                    "FA;", "FB;", "VS;", "MD0;", "MD1;", "ST;", "SH0;", "SH1;", "IS0;", "IS1;", cf,
+                    "SM0;", "PC;", "MG;", "AC;", "RT;", "XT;", "NB0;", "NR0;", "BC0;", "NA0;",
+                    "GT0;", "RG0;", "SQ0;", "TX;", "SS05;", "RM3;", "RM4;", "RM5;", "RM6;", "RM7;",
+                    "RM8;", "RM9;",
                 ] {
                     handle.send_cat(cmd);
                 }
@@ -1570,38 +1682,76 @@ impl ScuApp {
             .frame(theme::top_bar_frame())
             .show(root, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("SCU-LAN10").strong().color(theme::accent()));
+                    ui.label(
+                        egui::RichText::new("SCU-LAN10")
+                            .strong()
+                            .color(theme::accent()),
+                    );
                     ui.separator();
 
-                    ui.label(egui::RichText::new("HOST").small().color(theme::text_faint()));
-                    ui.add(egui::TextEdit::singleline(&mut self.config.host).desired_width(120.0));
-                    ui.label(egui::RichText::new("PORT").small().color(theme::text_faint()));
-                    ui.add(
-                        egui::DragValue::new(&mut self.config.base_port)
-                            .range(1..=65535)
-                            .speed(1.0),
+                    let mut config_changed = false;
+                    ui.label(
+                        egui::RichText::new("HOST")
+                            .small()
+                            .color(theme::text_faint()),
                     );
+                    config_changed |= ui
+                        .add(egui::TextEdit::singleline(&mut self.config.host).desired_width(120.0))
+                        .changed();
+                    ui.label(
+                        egui::RichText::new("PORT")
+                            .small()
+                            .color(theme::text_faint()),
+                    );
+                    config_changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut self.config.base_port)
+                                .range(1..=65535)
+                                .speed(1.0),
+                        )
+                        .changed();
                     #[cfg(target_arch = "wasm32")]
                     {
-                        ui.label(egui::RichText::new("BRIDGE").small().color(theme::text_faint()));
+                        ui.label(
+                            egui::RichText::new("BRIDGE")
+                                .small()
+                                .color(theme::text_faint()),
+                        );
                         let mut bridge = self.config.bridge_url.clone().unwrap_or_default();
                         if ui
                             .add(egui::TextEdit::singleline(&mut bridge).desired_width(160.0))
                             .changed()
                         {
                             self.config.bridge_url = Some(bridge);
+                            config_changed = true;
                         }
                     }
-                    ui.label(egui::RichText::new("USER").small().color(theme::text_faint()));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.config.username).desired_width(90.0),
+                    ui.label(
+                        egui::RichText::new("USER")
+                            .small()
+                            .color(theme::text_faint()),
                     );
-                    ui.label(egui::RichText::new("PASS").small().color(theme::text_faint()));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.config.password)
-                            .password(true)
-                            .desired_width(90.0),
+                    config_changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.config.username)
+                                .desired_width(90.0),
+                        )
+                        .changed();
+                    ui.label(
+                        egui::RichText::new("PASS")
+                            .small()
+                            .color(theme::text_faint()),
                     );
+                    config_changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.config.password)
+                                .password(true)
+                                .desired_width(90.0),
+                        )
+                        .changed();
+                    if config_changed {
+                        save_config(&self.config);
+                    }
 
                     ui.separator();
                     if self.connected() {
@@ -1793,7 +1943,6 @@ impl ScuApp {
             Pane::Waterfall => self.pane_waterfall(ui),
             Pane::Radio => self.pane_radio(ui),
             Pane::Tuning => self.pane_tuning(ui),
-            Pane::Mode => self.pane_mode(ui),
             Pane::Clarifier => self.pane_clarifier(ui),
             Pane::Dsp => self.pane_dsp(ui),
             Pane::Receiver => self.pane_receiver(ui),
@@ -2037,14 +2186,43 @@ impl ScuApp {
                 });
 
                 ui.horizontal(|ui| {
-                    let mode = self.mode.map(|m| m.label()).unwrap_or("--");
-                    ui.label(egui::RichText::new(mode).strong().color(theme::text()));
-                    let sub_label = if self.split {
-                        "SPLIT".to_string()
+                    // Mode selector for *this* VFO. `MD` addresses the VFO
+                    // directly, so the inactive VFO can be changed too.
+                    let current = self.mode[sub as usize];
+                    let mut selected = current;
+                    ui.add_enabled_ui(self.handle.is_some(), |ui| {
+                        egui::ComboBox::from_id_salt(("vfo-mode", idx))
+                            .selected_text(current.map(|m| m.label()).unwrap_or("--"))
+                            .width(92.0)
+                            .show_ui(ui, |ui| {
+                                for mode in Mode::ALL {
+                                    ui.selectable_value(&mut selected, Some(mode), mode.label());
+                                }
+                            });
+                    });
+                    if selected != current {
+                        if let Some(mode) = selected {
+                            self.set_mode_for(sub, mode);
+                        }
+                    }
+                    let band = if sub {
+                        self.frequency_b
                     } else {
-                        span_label(self.span_hz)
+                        self.frequency
                     };
-                    ui.label(egui::RichText::new(sub_label).small().color(theme::text_faint()));
+                    let band = scu_cat::band_for_hz(band)
+                        .map(|band| band.name)
+                        .unwrap_or("--");
+                    let sub_label = if self.split {
+                        format!("SPLIT \u{00b7} {band}")
+                    } else {
+                        format!("{band} \u{00b7} {}", span_label(self.span_hz))
+                    };
+                    ui.label(
+                        egui::RichText::new(sub_label)
+                            .small()
+                            .color(theme::text_faint()),
+                    );
                 });
             });
     }
@@ -2194,43 +2372,6 @@ impl ScuApp {
         });
     }
 
-    /// Mode pane.
-    fn pane_mode(&mut self, ui: &mut egui::Ui) {
-        theme::section(ui, "Mode");
-        ui.horizontal(|ui| {
-            let active = self.mode.map(|m| m.label()).unwrap_or("--");
-            ui.label(
-                egui::RichText::new(format!("ACTIVE  {active}"))
-                    .strong()
-                    .color(theme::accent()),
-            );
-            ui.label(
-                egui::RichText::new("(VFO-A / VFO-B shown above)")
-                    .small()
-                    .color(theme::text_faint()),
-            );
-        });
-        ui.horizontal_wrapped(|ui| {
-            for mode in Mode::ALL {
-                let selected = self.mode == Some(mode);
-                let text = egui::RichText::new(mode.label()).color(if selected {
-                    theme::on_accent()
-                } else {
-                    theme::text()
-                });
-                let button = egui::Button::new(text).min_size(egui::Vec2::new(62.0, 22.0));
-                let button = if selected {
-                    button.fill(theme::accent())
-                } else {
-                    button
-                };
-                if ui.add(button).clicked() {
-                    self.set_mode(mode);
-                }
-            }
-        });
-    }
-
     /// Clarifier pane. The FTDX10 has one offset shared by RIT and XIT.
     fn pane_clarifier(&mut self, ui: &mut egui::Ui) {
         theme::section(ui, "Clarifier (RIT/XIT)");
@@ -2324,12 +2465,13 @@ impl ScuApp {
 
         theme::section(ui, "Filter");
         let options = self.current_if_width_options();
-        let width_label = self.if_width_label(self.if_width);
+        let current_width = self.active_if_width();
+        let width_label = self.if_width_label(current_width);
         ui.horizontal(|ui| {
             ui.label("IF width");
             match &options {
                 Some(options) => {
-                    let mut choice = self.if_width;
+                    let mut choice = current_width;
                     egui::ComboBox::from_id_salt("if-width")
                         .selected_text(width_label.clone())
                         .show_ui(ui, |ui| {
@@ -2344,7 +2486,7 @@ impl ScuApp {
                                 ui.selectable_value(&mut choice, *code, label);
                             }
                         });
-                    if choice != self.if_width {
+                    if choice != current_width {
                         self.set_if_width(choice);
                     }
                 }
@@ -2358,7 +2500,8 @@ impl ScuApp {
             }
         });
 
-        let mut shift = self.if_shift_hz;
+        let current_shift = self.active_if_shift_hz();
+        let mut shift = current_shift;
         if ui
             .add(
                 egui::Slider::new(
@@ -2372,11 +2515,8 @@ impl ScuApp {
             .changed()
         {
             let next = scu_cat::clamp_if_shift_hz(shift);
-            if next != self.if_shift_hz {
-                self.if_shift_hz = next;
-                if let Some(handle) = &self.handle {
-                    handle.send_cat(&scu_cat::set_if_shift(self.rx_sub, next));
-                }
+            if next != current_shift {
+                self.set_if_shift_hz(next);
             }
         }
     }
@@ -2580,7 +2720,7 @@ impl ScuApp {
         ui.horizontal(|ui| {
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.cat_input)
-                    .desired_width(190.0)
+                    .desired_width(180.0)
                     .hint_text("e.g. IF;"),
             );
             if ui.button("Send").clicked()
@@ -2589,12 +2729,64 @@ impl ScuApp {
                 self.send_cat_input();
             }
         });
+        ui.horizontal(|ui| {
+            ui.label("Filter");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.cat_filter)
+                    .desired_width(100.0)
+                    .hint_text("e.g. MD"),
+            )
+            .on_hover_text("Show only lines containing this text (case-insensitive)");
+            if ui.button("Clear").clicked() {
+                self.cat_log.clear();
+            }
+            ui.checkbox(&mut self.cat_paused, "Pause")
+                .on_hover_text("Freeze the console so incoming frames don't push lines out");
+            if ui.button("Copy").clicked() {
+                let filter = self.cat_filter.trim().to_ascii_lowercase();
+                let lines: Vec<&str> = self
+                    .cat_log
+                    .iter()
+                    .filter(|line| {
+                        filter.is_empty() || line.to_ascii_lowercase().contains(&filter)
+                    })
+                    .map(String::as_str)
+                    .collect();
+                let count = lines.len();
+                ui.ctx().copy_text(lines.join("\n"));
+                self.notice =
+                    Some((format!("Copied {count} CAT line(s) to clipboard"), Instant::now()));
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if ui.button("Save").clicked() {
+                let filter = self.cat_filter.trim().to_ascii_lowercase();
+                let text: String = self
+                    .cat_log
+                    .iter()
+                    .filter(|line| {
+                        filter.is_empty() || line.to_ascii_lowercase().contains(&filter)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let path = std::env::current_dir()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    .join("cat-log.txt");
+                self.notice = Some(match std::fs::write(&path, text) {
+                    Ok(()) => (format!("Saved CAT log to {}", path.display()), Instant::now()),
+                    Err(e) => (format!("Could not save CAT log: {e}"), Instant::now()),
+                });
+            }
+        });
+        let filter = self.cat_filter.trim().to_ascii_lowercase();
         egui::ScrollArea::vertical()
             .max_height(240.0)
-            .stick_to_bottom(true)
+            .stick_to_bottom(!self.cat_paused)
             .show(ui, |ui| {
                 for line in &self.cat_log {
-                    ui.label(egui::RichText::new(line).monospace().small());
+                    if filter.is_empty() || line.to_ascii_lowercase().contains(&filter) {
+                        ui.label(egui::RichText::new(line).monospace().small());
+                    }
                 }
             });
     }
@@ -2856,6 +3048,7 @@ impl eframe::App for ScuApp {
     /// session keeps polling and the UI keeps receiving engine messages.
     fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_engine();
+        self.maybe_refresh_vfo();
         self.poll();
         #[cfg(not(target_arch = "wasm32"))]
         self.reconcile_external_ptt();
@@ -2959,6 +3152,12 @@ impl ScuApp {
         if self.last_layout_save.elapsed() < Duration::from_millis(500) {
             return;
         }
+        self.persist_layout_now();
+    }
+
+    /// Persist the layout right away (used when presets are added, renamed or
+    /// deleted, where waiting for the debounce risks losing the change).
+    fn persist_layout_now(&mut self) {
         self.sync_active_preset();
         self.layouts.save();
         self.layout_dirty = false;
@@ -2998,23 +3197,22 @@ impl ScuApp {
             tree: self.layouts.draft.clone(),
         });
         self.layouts.active_id = id;
-        self.mark_layout_dirty();
+        self.persist_layout_now();
     }
 
     fn rename_preset(&mut self, id: &str, name: &str) {
         if let Some(preset) = self.layouts.presets.iter_mut().find(|p| p.id == id) {
             preset.name = name.to_string();
         }
-        self.mark_layout_dirty();
+        self.persist_layout_now();
     }
 
     fn delete_preset(&mut self, id: &str) {
         self.layouts.presets.retain(|p| p.id != id);
         if self.layouts.active_id == id {
             self.switch_layout(layout::DEFAULT_ID);
-        } else {
-            self.mark_layout_dirty();
         }
+        self.persist_layout_now();
     }
 
     /// Whether `pane` is currently floating in its own window.
@@ -3127,8 +3325,9 @@ impl ScuApp {
                     ui.close();
                 }
                 if ui.button("Rename…").clicked() {
-                    self.layout_prompt =
-                        Some(LayoutPrompt::Rename(preset.id.clone(), preset.name.clone()));
+                    self.layout_prompt_input = preset.name.clone();
+                    self.layout_prompt_focus = true;
+                    self.layout_prompt = Some(LayoutPrompt::Rename(preset.id.clone()));
                     ui.close();
                 }
                 if ui.button("Delete").clicked() {
@@ -3141,7 +3340,9 @@ impl ScuApp {
         ui.separator();
         if ui.button("Save current as…").clicked() {
             let suggested = format!("Layout {}", self.layouts.presets.len() + 1);
-            self.layout_prompt = Some(LayoutPrompt::SaveAs(suggested));
+            self.layout_prompt_input = suggested.clone();
+            self.layout_prompt_focus = true;
+            self.layout_prompt = Some(LayoutPrompt::SaveAs);
             ui.close();
         }
         if ui.button("Reset to default").clicked() {
@@ -3211,14 +3412,11 @@ impl ScuApp {
             return;
         };
         let mut open = true;
-        let mut input = match &prompt {
-            LayoutPrompt::SaveAs(name) | LayoutPrompt::Rename(_, name) => name.clone(),
-        };
         let mut confirm = false;
         let mut cancel = false;
         let title = match &prompt {
-            LayoutPrompt::SaveAs(_) => "Save layout",
-            LayoutPrompt::Rename(_, _) => "Rename layout",
+            LayoutPrompt::SaveAs => "Save layout",
+            LayoutPrompt::Rename(_) => "Rename layout",
         };
         egui::Window::new(title)
             .collapsible(false)
@@ -3226,9 +3424,19 @@ impl ScuApp {
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.label("Name");
-                let response = ui.add(egui::TextEdit::singleline(&mut input).desired_width(220.0));
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.layout_prompt_input).desired_width(220.0),
+                );
+                // Focus the field once when the prompt opens, so the user can
+                // start typing immediately.
+                if self.layout_prompt_focus {
+                    response.request_focus();
+                }
                 if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     confirm = true;
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
                 }
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -3240,13 +3448,14 @@ impl ScuApp {
                     }
                 });
             });
+        self.layout_prompt_focus = false;
 
         if confirm {
-            let name = input.trim().to_string();
+            let name = self.layout_prompt_input.trim().to_string();
             if !name.is_empty() {
                 match prompt {
-                    LayoutPrompt::SaveAs(_) => self.save_current_as(&name),
-                    LayoutPrompt::Rename(id, _) => self.rename_preset(&id, &name),
+                    LayoutPrompt::SaveAs => self.save_current_as(&name),
+                    LayoutPrompt::Rename(id) => self.rename_preset(&id, &name),
                 }
             }
             self.layout_prompt = None;
@@ -3318,6 +3527,11 @@ impl ScuApp {
             {
                 self.show_shortcuts = false;
             }
+            return;
+        }
+
+        // The layout name prompt owns the keyboard until it closes.
+        if self.layout_prompt.is_some() {
             return;
         }
 
@@ -3401,9 +3615,9 @@ impl ScuApp {
             None if up => 0,
             None => count - 1,
         };
-        let (name, hz) = scu_cat::HF_BANDS[next];
-        self.send_frequency(self.rx_sub, hz);
-        self.show_notice(format!("Band {name}"));
+        let band = scu_cat::HF_BANDS[next];
+        self.send_frequency(self.rx_sub, band.calling_hz);
+        self.show_notice(format!("Band {}", band.name));
     }
 
     /// Put the active VFO's frequency editor into text-edit mode and focus it.
@@ -3422,7 +3636,7 @@ impl ScuApp {
     /// Mode-aware `(code, Hz)` table for the active VFO, if it has one.
     fn current_if_width_options(&self) -> Option<Vec<(u8, u16)>> {
         let model = self.radio.unwrap_or(RadioModel::Ftdx10);
-        scu_cat::if_width_options(model, self.mode?)
+        scu_cat::if_width_options(model, self.active_mode()?)
     }
 
     /// Human label for an `SH` code on the active mode.
@@ -3442,7 +3656,7 @@ impl ScuApp {
     }
 
     fn set_if_width(&mut self, code: u8) {
-        self.if_width = code;
+        self.if_width[self.rx_sub as usize] = code;
         if let Some(handle) = &self.handle {
             handle.send_cat(&scu_cat::set_if_width(self.rx_sub, code));
         }
@@ -3464,7 +3678,8 @@ impl ScuApp {
         if codes.is_empty() {
             return;
         }
-        let next = match codes.iter().position(|code| *code == self.if_width) {
+        let current = self.active_if_width();
+        let next = match codes.iter().position(|code| *code == current) {
             Some(index) => (index as i32 + delta).clamp(0, codes.len() as i32 - 1) as usize,
             None if delta < 0 => 0,
             None => codes.len() - 1,
@@ -3480,16 +3695,21 @@ impl ScuApp {
         self.set_if_width(0);
     }
 
-    fn nudge_if_shift(&mut self, delta_hz: i32) {
-        let next = scu_cat::clamp_if_shift_hz(self.if_shift_hz + delta_hz);
-        if next == self.if_shift_hz {
-            return;
-        }
-        self.if_shift_hz = next;
+    /// Store and send an IF shift for the active VFO.
+    fn set_if_shift_hz(&mut self, hz: i32) {
+        self.if_shift_hz[self.rx_sub as usize] = hz;
         if let Some(handle) = &self.handle {
-            handle.send_cat(&scu_cat::set_if_shift(self.rx_sub, next));
+            handle.send_cat(&scu_cat::set_if_shift(self.rx_sub, hz));
         }
-        self.show_notice(format!("IF shift {next:+} Hz"));
+        self.show_notice(format!("IF shift {hz:+} Hz"));
+    }
+
+    fn nudge_if_shift(&mut self, delta_hz: i32) {
+        let current = self.active_if_shift_hz();
+        let next = scu_cat::clamp_if_shift_hz(current + delta_hz);
+        if next != current {
+            self.set_if_shift_hz(next);
+        }
     }
 
     fn span_index(&self) -> Option<usize> {
@@ -3687,6 +3907,26 @@ async fn engine_future(
     }
 
     let _ = tx.send(EngineMsg::Stopped);
+}
+
+/// The VFO (0 = A/Main, 1 = B/Sub) a CAT response is about, from its P1 digit.
+/// Falls back to `fallback` when the frame has no payload.
+fn frame_vfo_sub(frame: &str, fallback: bool) -> bool {
+    scu_cat::split(frame)
+        .and_then(|parsed| parsed.payload.chars().next())
+        .map(|digit| digit == '1')
+        .unwrap_or(fallback)
+}
+
+/// Translate an `MD` P1 digit into the physical VFO it describes (0 = A, 1 = B).
+///
+/// On the FTDX10 `MD P1` is relative to the operating VFO: `0` addresses the
+/// active VFO and `1` the inactive one (unlike `FA`/`FB`, which are fixed to
+/// VFO-A/VFO-B). `active_sub` is the current `rx_sub`; XOR-ing the relative
+/// digit with it recovers the physical VFO, and symmetrically maps a target VFO
+/// back to the digit to send.
+fn md_vfo_sub(p1_is_one: bool, active_sub: bool) -> bool {
+    active_sub ^ p1_is_one
 }
 
 fn span_label(span: f64) -> String {
@@ -3974,7 +4214,39 @@ fn save_settings(settings: &AppSettings) {
 #[cfg(test)]
 mod tests {
     use super::parse_frequency_text as parse;
-    use super::{format_hz_label, snap_hz};
+    use super::{format_hz_label, frame_vfo_sub, md_vfo_sub, snap_hz};
+
+    #[test]
+    fn cat_frames_route_to_their_vfo() {
+        assert!(!frame_vfo_sub("MD01;", true));
+        assert!(frame_vfo_sub("MD12;", false));
+        assert!(!frame_vfo_sub("SH0008;", true));
+        assert!(frame_vfo_sub("SH1021;", false));
+        assert!(frame_vfo_sub("IS10+0600;", false));
+        assert!(!frame_vfo_sub("IS00+0600;", true));
+        // No payload falls back to the caller's active VFO.
+        assert!(frame_vfo_sub("IS;", true));
+    }
+
+    #[test]
+    fn md_p1_is_relative_to_the_operating_vfo() {
+        // FTDX10: `MD0` addresses the active VFO, `MD1` the inactive one. So
+        // with VFO-B active, `MD0` is VFO-B and `MD1` is VFO-A...
+        assert!(md_vfo_sub(false, true)); // MD0, B active -> VFO-B
+        assert!(!md_vfo_sub(true, true)); // MD1, B active -> VFO-A
+        // ...and with VFO-A active the mapping flips.
+        assert!(!md_vfo_sub(false, false)); // MD0, A active -> VFO-A
+        assert!(md_vfo_sub(true, false)); // MD1, A active -> VFO-B
+
+        // The transform is its own inverse: mapping a target VFO to a digit
+        // round-trips back to that VFO.
+        for active in [false, true] {
+            for target in [false, true] {
+                let p1 = md_vfo_sub(target, active);
+                assert_eq!(md_vfo_sub(p1, active), target);
+            }
+        }
+    }
 
     #[test]
     fn snap_hz_rounds_to_step() {
