@@ -1962,12 +1962,6 @@ impl ScuApp {
                 #[cfg(target_arch = "wasm32")]
                 ui.label("Not available in the browser build.");
             }
-            Pane::AudioStreaming => {
-                #[cfg(not(target_arch = "wasm32"))]
-                self.ui_audio_streaming(ui);
-                #[cfg(target_arch = "wasm32")]
-                ui.label("Not available in the browser build.");
-            }
             Pane::Vox => {
                 #[cfg(not(target_arch = "wasm32"))]
                 self.ui_vox(ui);
@@ -2634,6 +2628,13 @@ impl ScuApp {
             if let Some(audio) = &self.audio {
                 audio.set_stereo(stereo);
             }
+        }
+
+        // Loopback streaming shares this panel with local playback.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            ui.add_space(6.0);
+            self.ui_audio_streaming(ui);
         }
     }
 

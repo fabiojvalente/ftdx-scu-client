@@ -44,13 +44,12 @@ pub enum Pane {
     Transmit,
     CatConsole,
     CatServer,
-    AudioStreaming,
     Vox,
 }
 
 impl Pane {
     /// Catalogue, in menu order.
-    pub const ALL: [Pane; 18] = [
+    pub const ALL: [Pane; 17] = [
         Pane::VfoA,
         Pane::VfoB,
         Pane::Operate,
@@ -67,7 +66,6 @@ impl Pane {
         Pane::Transmit,
         Pane::CatConsole,
         Pane::CatServer,
-        Pane::AudioStreaming,
         Pane::Vox,
     ];
 
@@ -89,14 +87,13 @@ impl Pane {
             Pane::Transmit => "Transmit",
             Pane::CatConsole => "CAT Console",
             Pane::CatServer => "Radio Server (CAT)",
-            Pane::AudioStreaming => "Audio Streaming",
             Pane::Vox => "VOX",
         }
     }
 
     /// Panels that only exist in the native build.
     pub fn native_only(self) -> bool {
-        matches!(self, Pane::CatServer | Pane::AudioStreaming | Pane::Vox)
+        matches!(self, Pane::CatServer | Pane::Vox)
     }
 
     /// Whether this panel can be shown on the current host.
@@ -148,7 +145,6 @@ pub fn default_tree() -> Tree<Pane> {
             Pane::Transmit,
             Pane::CatConsole,
             Pane::CatServer,
-            Pane::AudioStreaming,
             Pane::Vox,
         ],
     );
