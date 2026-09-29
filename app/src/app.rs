@@ -19,6 +19,7 @@ use scu_scope::{BinInterleave, Colormap, FrequencyAxis};
 use serde::{Deserialize, Serialize};
 
 use crate::layout::{self, LayoutsFile, Pane};
+use crate::shortcuts;
 use crate::theme;
 use crate::waterfall::Waterfall;
 
@@ -276,6 +277,17 @@ pub struct ScuApp {
     /// Active section of the Settings window.
     settings_tab: SettingsTab,
 
+    /// Keyboard-shortcuts help overlay.
+    show_shortcuts: bool,
+    /// Transient message from a shortcut (text, shown-since).
+    notice: Option<(String, Instant)>,
+    /// VFO frequency editors asked to take focus on the next frame.
+    focus_freq: [bool; 2],
+    /// Active IF width (`SH`) code; 0 is the radio's mode default.
+    if_width: u8,
+    /// Active IF shift (`IS`) in Hz.
+    if_shift_hz: i32,
+
     /// Active palette (source of truth; mirrored into the theme module).
     theme: theme::Theme,
     /// Last appearance settings pushed to egui, so changes apply once.
@@ -406,6 +418,11 @@ impl ScuApp {
             settings,
             show_settings: false,
             settings_tab: SettingsTab::default(),
+            show_shortcuts: false,
+            notice: None,
+            focus_freq: [false, false],
+            if_width: 0,
+            if_shift_hz: 0,
             theme,
             applied_appearance: Some(appearance),
             layouts,
@@ -1102,6 +1119,16 @@ impl ScuApp {
                     self.narrow = on;
                 }
             }
+            "SH" => {
+                if let Some(code) = scu_cat::parse_if_width(text) {
+                    self.if_width = code;
+                }
+            }
+            "IS" => {
+                if let Some(hz) = scu_cat::parse_if_shift(text) {
+                    self.if_shift_hz = hz;
+                }
+            }
             "GT" => {
                 if let Some(agc) = scu_cat::parse_agc(text) {
                     self.agc = Some(agc);
@@ -1455,11 +1482,13 @@ impl ScuApp {
             self.last_poll = Instant::now();
             let md = if self.rx_sub { "MD1;" } else { "MD0;" };
             let cf = if self.rx_sub { "CF101;" } else { "CF001;" };
+            let sh = if self.rx_sub { "SH1;" } else { "SH0;" };
+            let is = if self.rx_sub { "IS1;" } else { "IS0;" };
             if let Some(handle) = &self.handle {
                 for cmd in [
                     "FA;", "FB;", "VS;", "ST;", md, "SM0;", "PC;", "MG;", "AC;", "RT;", "XT;", cf,
-                    "NB0;", "NR0;", "BC0;", "NA0;", "GT0;", "RG0;", "SQ0;", "TX;", "SS05;", "RM3;",
-                    "RM4;", "RM5;", "RM6;", "RM7;", "RM8;", "RM9;",
+                    sh, is, "NB0;", "NR0;", "BC0;", "NA0;", "GT0;", "RG0;", "SQ0;", "TX;", "SS05;",
+                    "RM3;", "RM4;", "RM5;", "RM6;", "RM7;", "RM8;", "RM9;",
                 ] {
                     handle.send_cat(cmd);
                 }
@@ -1617,6 +1646,10 @@ impl ScuApp {
                     ui.separator();
 
                     ui.label(egui::RichText::new(&self.status).color(self.status_color()));
+                    if let Some(note) = self.active_notice() {
+                        ui.separator();
+                        ui.label(egui::RichText::new(note).small().color(theme::warn_amber()));
+                    }
 
                     if let Some(radio) = self.radio {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1924,6 +1957,10 @@ impl ScuApp {
                         )
                         .on_hover_text("Enter to apply, Esc to cancel, scroll to tune");
 
+                    if std::mem::take(&mut self.focus_freq[idx]) {
+                        ui.memory_mut(|m| m.request_focus(response.id));
+                        select_all_text(ui.ctx(), response.id, self.freq_input[idx].chars().count());
+                    }
                     if response.gained_focus() {
                         select_all_text(
                             ui.ctx(),
@@ -2283,6 +2320,64 @@ impl ScuApp {
             .changed()
         {
             self.set_squelch(squelch as u8);
+        }
+
+        theme::section(ui, "Filter");
+        let options = self.current_if_width_options();
+        let width_label = self.if_width_label(self.if_width);
+        ui.horizontal(|ui| {
+            ui.label("IF width");
+            match &options {
+                Some(options) => {
+                    let mut choice = self.if_width;
+                    egui::ComboBox::from_id_salt("if-width")
+                        .selected_text(width_label.clone())
+                        .show_ui(ui, |ui| {
+                            for (code, hz) in options {
+                                let label = if *code == 0 {
+                                    "Default".to_string()
+                                } else if *hz >= 1000 {
+                                    format!("{:.1} kHz", *hz as f64 / 1000.0)
+                                } else {
+                                    format!("{hz} Hz")
+                                };
+                                ui.selectable_value(&mut choice, *code, label);
+                            }
+                        });
+                    if choice != self.if_width {
+                        self.set_if_width(choice);
+                    }
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new("not available in this mode")
+                            .small()
+                            .color(theme::text_faint()),
+                    );
+                }
+            }
+        });
+
+        let mut shift = self.if_shift_hz;
+        if ui
+            .add(
+                egui::Slider::new(
+                    &mut shift,
+                    scu_cat::IF_SHIFT_MIN_HZ..=scu_cat::IF_SHIFT_MAX_HZ,
+                )
+                .step_by(scu_cat::IF_SHIFT_STEP_HZ as f64)
+                .text("IF shift")
+                .suffix(" Hz"),
+            )
+            .changed()
+        {
+            let next = scu_cat::clamp_if_shift_hz(shift);
+            if next != self.if_shift_hz {
+                self.if_shift_hz = next;
+                if let Some(handle) = &self.handle {
+                    handle.send_cat(&scu_cat::set_if_shift(self.rx_sub, next));
+                }
+            }
         }
     }
 
@@ -2772,6 +2867,7 @@ impl eframe::App for ScuApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.apply_appearance(&ctx);
+        self.handle_shortcuts(&ctx);
         self.ui_top(ui);
 
         // The Operate pane sets this while rendering; reset before the tree.
@@ -2811,6 +2907,7 @@ impl eframe::App for ScuApp {
 
         self.ui_settings(&ctx);
         self.ui_layout_prompt(&ctx);
+        self.ui_shortcuts_help(&ctx);
         ctx.request_repaint_after(Duration::from_millis(16));
     }
 }
@@ -3155,6 +3252,355 @@ impl ScuApp {
             self.layout_prompt = None;
         } else if cancel || !open {
             self.layout_prompt = None;
+        }
+    }
+
+    // ---- Keyboard shortcuts -------------------------------------------------
+
+    /// A fresh transient shortcut message, if one is still within its window.
+    fn active_notice(&self) -> Option<String> {
+        self.notice.as_ref().and_then(|(message, at)| {
+            (at.elapsed() < Duration::from_secs(4)).then(|| message.clone())
+        })
+    }
+
+    fn show_notice(&mut self, message: impl Into<String>) {
+        self.notice = Some((message.into(), Instant::now()));
+    }
+
+    /// This frame's key presses that resolve to a shortcut.
+    fn collect_shortcuts(ctx: &egui::Context) -> Vec<(shortcuts::Chord, shortcuts::Action)> {
+        ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|event| {
+                    let egui::Event::Key {
+                        key,
+                        physical_key,
+                        pressed,
+                        repeat,
+                        modifiers,
+                    } = event
+                    else {
+                        return None;
+                    };
+                    if !pressed {
+                        return None;
+                    }
+                    let chord = shortcuts::Chord {
+                        key: *key,
+                        physical: *physical_key,
+                        shift: modifiers.shift,
+                        alt: modifiers.alt,
+                        ctrl: modifiers.ctrl,
+                        command: modifiers.command,
+                        repeat: *repeat,
+                    };
+                    shortcuts::resolve(&chord).map(|action| (chord, action))
+                })
+                .collect()
+        })
+    }
+
+    /// Dispatch keyboard shortcuts. Runs before the panels so that a frequency
+    /// editor can take focus in the same frame.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let presses = Self::collect_shortcuts(ctx);
+
+        // While the help overlay is open it owns the keyboard: Esc or the help
+        // chord closes it, and everything else is swallowed.
+        if self.show_shortcuts {
+            if escape
+                || presses
+                    .iter()
+                    .any(|(_, a)| *a == shortcuts::Action::ToggleHelp)
+            {
+                self.show_shortcuts = false;
+            }
+            return;
+        }
+
+        // Never steal keys while a text widget has focus (host, credentials,
+        // the frequency editor, the CAT console, ...).
+        if ctx.memory(|m| m.focused().is_some()) {
+            return;
+        }
+
+        if escape && ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        }
+
+        for (chord, action) in presses {
+            if chord.repeat && !action.is_repeatable() {
+                continue;
+            }
+            match action {
+                shortcuts::Action::ToggleHelp => self.show_shortcuts = true,
+                other => self.apply_shortcut(ctx, other),
+            }
+        }
+    }
+
+    /// Apply a resolved shortcut action.
+    fn apply_shortcut(&mut self, ctx: &egui::Context, action: shortcuts::Action) {
+        use shortcuts::Action;
+        match action {
+            Action::TuneUp => self.step_frequency(1),
+            Action::TuneDown => self.step_frequency(-1),
+            Action::TuneUp10 => self.step_frequency(10),
+            Action::TuneDown10 => self.step_frequency(-10),
+            Action::TuneUp100 => self.step_frequency(100),
+            Action::TuneDown100 => self.step_frequency(-100),
+            Action::FineTuneUp => self.nudge_active_hz(1),
+            Action::FineTuneDown => self.nudge_active_hz(-1),
+            Action::FineTuneUp50 => self.nudge_active_hz(50),
+            Action::FineTuneDown50 => self.nudge_active_hz(-50),
+            Action::SwitchVfo => self.select_rx_vfo(!self.rx_sub),
+            Action::CopyAToB => self.copy_a_to_b(),
+            Action::BandDown => self.cycle_band(false),
+            Action::BandUp => self.cycle_band(true),
+            Action::FocusFrequency => self.focus_frequency_entry(),
+            Action::Mode(mode) => self.set_mode(mode),
+            Action::IfWidthNarrower => self.cycle_if_width(-1),
+            Action::IfWidthWider => self.cycle_if_width(1),
+            Action::IfWidthDefault => self.restore_default_if_width(),
+            Action::IfShiftUp => self.nudge_if_shift(20),
+            Action::IfShiftDown => self.nudge_if_shift(-20),
+            Action::IfShiftUpFast => self.nudge_if_shift(100),
+            Action::IfShiftDownFast => self.nudge_if_shift(-100),
+            Action::ScopeZoomIn | Action::ScopeNarrower => self.cycle_span(-1, false),
+            Action::ScopeZoomOut | Action::ScopeWider => self.cycle_span(1, false),
+            Action::ScopeZoomInExtreme => self.cycle_span(-1, true),
+            Action::ScopeZoomOutExtreme => self.cycle_span(1, true),
+            Action::ToggleVfoB => self.toggle_pane(Pane::VfoB),
+            Action::ToggleFullscreen => self.toggle_fullscreen(ctx),
+            Action::VolumeDown => self.nudge_volume(-0.05),
+            Action::VolumeUp => self.nudge_volume(0.05),
+            Action::ToggleMute => self.toggle_mute(),
+            Action::ToggleHelp => self.show_shortcuts = true,
+            Action::Unavailable(message) => self.show_notice(message),
+        }
+    }
+
+    /// Nudge a VFO by an absolute number of Hz (fine tune).
+    fn nudge_active_hz(&mut self, delta_hz: i64) {
+        let current = self.active_frequency();
+        let next = (current as i64 + delta_hz).clamp(0, 999_999_990) as u64;
+        if next != current {
+            self.send_frequency(self.rx_sub, next);
+        }
+    }
+
+    /// Move the active VFO to the previous (`up = false`) or next band.
+    fn cycle_band(&mut self, up: bool) {
+        let count = scu_cat::HF_BANDS.len();
+        let next = match scu_cat::nearest_band_index(self.active_frequency()) {
+            Some(index) if up => (index + 1) % count,
+            Some(index) => (index + count - 1) % count,
+            None if up => 0,
+            None => count - 1,
+        };
+        let (name, hz) = scu_cat::HF_BANDS[next];
+        self.send_frequency(self.rx_sub, hz);
+        self.show_notice(format!("Band {name}"));
+    }
+
+    /// Put the active VFO's frequency editor into text-edit mode and focus it.
+    fn focus_frequency_entry(&mut self) {
+        let index = self.rx_sub as usize;
+        let hz = if self.rx_sub {
+            self.frequency_b
+        } else {
+            self.frequency
+        };
+        self.freq_input[index] = freq_input_text(hz);
+        self.freq_editing[index] = true;
+        self.focus_freq[index] = true;
+    }
+
+    /// Mode-aware `(code, Hz)` table for the active VFO, if it has one.
+    fn current_if_width_options(&self) -> Option<Vec<(u8, u16)>> {
+        let model = self.radio.unwrap_or(RadioModel::Ftdx10);
+        scu_cat::if_width_options(model, self.mode?)
+    }
+
+    /// Human label for an `SH` code on the active mode.
+    fn if_width_label(&self, code: u8) -> String {
+        if code == 0 {
+            return "Default".to_string();
+        }
+        match self
+            .current_if_width_options()
+            .and_then(|options| options.into_iter().find(|(c, _)| *c == code))
+            .map(|(_, hz)| hz)
+        {
+            Some(hz) if hz >= 1000 => format!("{:.1} kHz", hz as f64 / 1000.0),
+            Some(hz) if hz > 0 => format!("{hz} Hz"),
+            _ => format!("Code {code}"),
+        }
+    }
+
+    fn set_if_width(&mut self, code: u8) {
+        self.if_width = code;
+        if let Some(handle) = &self.handle {
+            handle.send_cat(&scu_cat::set_if_width(self.rx_sub, code));
+        }
+        self.show_notice(format!("IF width {}", self.if_width_label(code)));
+    }
+
+    /// Step through the non-default IF widths for the current mode.
+    fn cycle_if_width(&mut self, delta: i32) {
+        let Some(codes) = self.current_if_width_options().map(|options| {
+            options
+                .into_iter()
+                .map(|(code, _)| code)
+                .filter(|code| *code != 0)
+                .collect::<Vec<_>>()
+        }) else {
+            self.show_notice("IF width not available in this mode");
+            return;
+        };
+        if codes.is_empty() {
+            return;
+        }
+        let next = match codes.iter().position(|code| *code == self.if_width) {
+            Some(index) => (index as i32 + delta).clamp(0, codes.len() as i32 - 1) as usize,
+            None if delta < 0 => 0,
+            None => codes.len() - 1,
+        };
+        self.set_if_width(codes[next]);
+    }
+
+    fn restore_default_if_width(&mut self) {
+        if self.current_if_width_options().is_none() {
+            self.show_notice("IF width not available in this mode");
+            return;
+        }
+        self.set_if_width(0);
+    }
+
+    fn nudge_if_shift(&mut self, delta_hz: i32) {
+        let next = scu_cat::clamp_if_shift_hz(self.if_shift_hz + delta_hz);
+        if next == self.if_shift_hz {
+            return;
+        }
+        self.if_shift_hz = next;
+        if let Some(handle) = &self.handle {
+            handle.send_cat(&scu_cat::set_if_shift(self.rx_sub, next));
+        }
+        self.show_notice(format!("IF shift {next:+} Hz"));
+    }
+
+    fn span_index(&self) -> Option<usize> {
+        scu_cat::SCOPE_SPANS_HZ
+            .iter()
+            .position(|span| (self.span_hz - span).abs() < 0.5)
+    }
+
+    /// Step the scope span. `extreme` jumps to the narrowest / widest span.
+    fn cycle_span(&mut self, delta: i32, extreme: bool) {
+        let count = scu_cat::SCOPE_SPANS_HZ.len() as i32;
+        let current = self.span_index().unwrap_or(7) as i32;
+        let next = if extreme {
+            if delta < 0 {
+                0
+            } else {
+                count - 1
+            }
+        } else {
+            (current + delta).clamp(0, count - 1)
+        };
+        self.set_span(next as usize);
+        self.show_notice(format!("Span {}", span_label(self.span_hz)));
+    }
+
+    /// Show or hide one dock pane (also docks it if it is floating).
+    fn toggle_pane(&mut self, pane: Pane) {
+        if self.is_popped(pane) {
+            self.dock_pane(pane);
+            return;
+        }
+        if layout::pane_tile(&self.layouts.draft, pane).is_some() {
+            layout::remove_pane(&mut self.layouts.draft, pane);
+        } else {
+            layout::add_pane(&mut self.layouts.draft, pane);
+        }
+        self.mark_layout_dirty();
+    }
+
+    fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
+        let full = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!full));
+    }
+
+    fn nudge_volume(&mut self, delta: f32) {
+        let next = (self.volume + delta).clamp(0.0, 1.5);
+        if (next - self.volume).abs() < f32::EPSILON {
+            return;
+        }
+        self.volume = next;
+        if let Some(audio) = &self.audio {
+            audio.set_volume(next);
+        }
+        self.show_notice(format!("Volume {:.0}%", next * 100.0));
+    }
+
+    fn toggle_mute(&mut self) {
+        self.muted = !self.muted;
+        self.sync_audio_enabled();
+        self.show_notice(if self.muted { "Muted" } else { "Unmuted" });
+    }
+
+    /// The `?` / `h` keyboard-shortcuts overlay.
+    fn ui_shortcuts_help(&mut self, ctx: &egui::Context) {
+        if !self.show_shortcuts {
+            return;
+        }
+        let response = egui::Modal::new(egui::Id::new("shortcuts-help")).show(ctx, |ui| {
+            ui.set_max_width(560.0);
+            ui.heading("Keyboard shortcuts");
+            ui.label(
+                egui::RichText::new(
+                    "Shortcuts are ignored while typing in a text field. Esc closes this dialog.",
+                )
+                .small()
+                .color(theme::text_faint()),
+            );
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(460.0)
+                .show(ui, |ui| {
+                    let mut group = "";
+                    for row in shortcuts::HELP_ROWS {
+                        if row.group != group {
+                            group = row.group;
+                            theme::section(ui, group);
+                        }
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                [150.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new(row.keys)
+                                        .monospace()
+                                        .strong()
+                                        .color(theme::accent()),
+                                ),
+                            );
+                            ui.label(row.action);
+                            if let Some(note) = row.note {
+                                ui.label(
+                                    egui::RichText::new(format!("({note})"))
+                                        .small()
+                                        .color(theme::text_dim()),
+                                );
+                            }
+                        });
+                    }
+                });
+        });
+        if response.should_close() {
+            self.show_shortcuts = false;
         }
     }
 }

@@ -56,6 +56,13 @@ the **Panels** menu to show and hide panels.
 - **Settings** — a tabbed window: appearance (theme, UI size, high-contrast and
   large-target options), visible meters, optional panes, and the console log
   level. The log level is applied live to the running app (native builds).
+- **Keyboard shortcuts** — a Yaesu-style single-key control layer. Press `?`
+  (or `h`) for the built-in cheat sheet; `Esc` closes it. Tune with `j`/`i` or
+  the arrow keys (`Shift` ×10, `Alt` ×100; `[`/`]` are 1 Hz/50 Hz), switch mode
+  with `l`/`u`/`c`/`a`/`q`/`d` (Shift- or Alt-modified for the narrow variants),
+  cycle bands with `b`/`B`, adjust IF width (`p`/`P`/`/`) and IF shift
+  (`↑`/`↓`), zoom the scope with `z`/`Z`, and use `n`/`N` to switch the active
+  VFO / copy A→B. Shortcuts are ignored while typing in a text field.
 
 ## Workspace layout
 

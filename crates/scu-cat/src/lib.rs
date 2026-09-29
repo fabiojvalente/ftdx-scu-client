@@ -99,6 +99,40 @@ pub fn set_band(code: u8) -> String {
     format!("BS{:02};", code.min(99))
 }
 
+/// Amateur bands offered for quick band select, with the calling frequency in
+/// Hz, used by the `b` / `B` keyboard shortcuts.
+///
+/// The frequencies follow Yaesu Web Control's band table. The FTDX10 covers
+/// 160 m - 6 m; 4 m is included for FTDX101 parity and may be rejected by the
+/// radio.
+pub const HF_BANDS: [(&str, u64); 12] = [
+    ("160m", 1_840_000),
+    ("80m", 3_700_000),
+    ("60m", 5_357_000),
+    ("40m", 7_100_000),
+    ("30m", 10_136_000),
+    ("20m", 14_074_000),
+    ("17m", 18_110_000),
+    ("15m", 21_074_000),
+    ("12m", 24_915_000),
+    ("10m", 28_074_000),
+    ("6m", 50_313_000),
+    ("4m", 70_100_000),
+];
+
+/// Index into [`HF_BANDS`] of the band whose calling frequency is nearest to
+/// `hz`, or `None` when `hz` is zero.
+pub fn nearest_band_index(hz: u64) -> Option<usize> {
+    if hz == 0 {
+        return None;
+    }
+    HF_BANDS
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, (_, freq))| hz.abs_diff(*freq))
+        .map(|(index, _)| index)
+}
+
 /// Build a "copy VFO-A to VFO-B" command (`AB;`, write-only).
 pub fn copy_a_to_b() -> &'static str {
     "AB;"
@@ -256,6 +290,164 @@ pub fn read_narrow() -> &'static str {
 /// Parse the narrow filter state from an `NA0P2;` response.
 pub fn parse_narrow(frame: &str) -> Option<bool> {
     parse_indexed_on_off(frame, "NA")
+}
+
+// ---- IF width (`SH`) and IF shift (`IS`) -----------------------------------
+
+/// Which `SH` bandwidth table a mode uses.
+///
+/// `SH` codes are shared across modes but map to different bandwidths per
+/// group. AM, FM and the DATA-FM variants have no IF width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IfWidthGroup {
+    /// LSB / USB: the wide SSB table.
+    Ssb,
+    /// CW / RTTY / PSK / DATA: the narrow table.
+    Cw,
+}
+
+/// Classify a mode into the `SH` bandwidth table it uses.
+pub fn if_width_group(mode: Mode) -> Option<IfWidthGroup> {
+    Some(match mode {
+        Mode::Lsb | Mode::Usb => IfWidthGroup::Ssb,
+        Mode::CwU
+        | Mode::CwL
+        | Mode::RttyL
+        | Mode::RttyU
+        | Mode::Psk
+        | Mode::DataL
+        | Mode::DataU => IfWidthGroup::Cw,
+        Mode::Am | Mode::AmN | Mode::Fm | Mode::FmN | Mode::DataFm | Mode::DataFmN => return None,
+    })
+}
+
+/// FTDX10 SSB IF-width table: index = `SH` code, value = bandwidth in Hz.
+/// Index 0 is the radio's mode-dependent default.
+pub const IF_WIDTH_SSB_HZ: [u16; 24] = [
+    0, 300, 400, 600, 850, 1100, 1200, 1500, 1650, 1800, 1950, 2100, 2250, 2400, 2450, 2500, 2600,
+    2700, 2800, 2900, 3000, 3200, 3500, 4000,
+];
+
+/// FTDX10 CW / RTTY / PSK / DATA IF-width table: index = `SH` code.
+pub const IF_WIDTH_CW_HZ: [u16; 22] = [
+    0, 50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 600, 800, 1200, 1400, 1700, 2000, 2400,
+    3000, 3200, 3500, 4000,
+];
+
+/// FT-710 `SH` codes, which are non-contiguous (only these codes are exposed).
+const FT710_IF_WIDTH_SSB: &[(u8, u16)] = &[
+    (0, 0),
+    (1, 300),
+    (3, 850),
+    (5, 1100),
+    (7, 1500),
+    (9, 1800),
+    (12, 2250),
+    (16, 2600),
+    (19, 2900),
+    (20, 3200),
+    (21, 3500),
+    (22, 4000),
+];
+const FT710_IF_WIDTH_CW: &[(u8, u16)] = &[
+    (0, 0),
+    (1, 50),
+    (3, 150),
+    (5, 250),
+    (7, 350),
+    (9, 450),
+    (12, 800),
+    (16, 2000),
+    (19, 3200),
+    (20, 3500),
+    (21, 4000),
+];
+
+/// `(code, bandwidth_hz)` pairs valid for `mode` on `model`, ascending by code.
+/// Returns `None` when the mode has no IF width (AM / FM).
+///
+/// FTDX101D / FTDX101MP share the FTDX10 tables; their firmware differs by at
+/// most one SSB step, which is close enough for key-cycle purposes.
+pub fn if_width_options(model: RadioModel, mode: Mode) -> Option<Vec<(u8, u16)>> {
+    let group = if_width_group(mode)?;
+    let options = match model {
+        RadioModel::Ft710 => match group {
+            IfWidthGroup::Ssb => FT710_IF_WIDTH_SSB,
+            IfWidthGroup::Cw => FT710_IF_WIDTH_CW,
+        },
+        _ => {
+            let table: &[u16] = match group {
+                IfWidthGroup::Ssb => &IF_WIDTH_SSB_HZ,
+                IfWidthGroup::Cw => &IF_WIDTH_CW_HZ,
+            };
+            return Some(
+                table
+                    .iter()
+                    .enumerate()
+                    .map(|(code, &hz)| (code as u8, hz))
+                    .collect(),
+            );
+        }
+    };
+    Some(options.to_vec())
+}
+
+/// Build a "set IF width" command (`SH` P1=0/1 + three-digit code).
+pub fn set_if_width(sub: bool, code: u8) -> String {
+    format!("SH{}{:03};", sub as u8, code)
+}
+
+/// Build a "read IF width" command for `sub`'s VFO.
+pub fn read_if_width(sub: bool) -> String {
+    format!("SH{};", sub as u8)
+}
+
+/// Parse the `SH` code from an `SH0xxx;` response.
+pub fn parse_if_width(frame: &str) -> Option<u8> {
+    let parsed = split(frame)?;
+    if parsed.command != "SH" || parsed.payload.len() < 4 {
+        return None;
+    }
+    parsed.payload.get(1..)?.parse().ok()
+}
+
+/// IF shift limits and grid on the FTDX10.
+pub const IF_SHIFT_MIN_HZ: i32 = -1000;
+pub const IF_SHIFT_MAX_HZ: i32 = 1000;
+pub const IF_SHIFT_STEP_HZ: i32 = 20;
+
+/// Clamp an arbitrary IF shift to the radio's 20 Hz grid and +-1000 Hz range.
+pub fn clamp_if_shift_hz(hz: i32) -> i32 {
+    let steps = (hz as f64 / IF_SHIFT_STEP_HZ as f64).round() as i32;
+    (steps * IF_SHIFT_STEP_HZ).clamp(IF_SHIFT_MIN_HZ, IF_SHIFT_MAX_HZ)
+}
+
+/// Build a "set IF shift" command (`IS` P1=0/1 + `0` + sign + four digits).
+pub fn set_if_shift(sub: bool, hz: i32) -> String {
+    let hz = clamp_if_shift_hz(hz);
+    let sign = if hz < 0 { '-' } else { '+' };
+    format!("IS{}0{}{:04};", sub as u8, sign, hz.abs())
+}
+
+/// Build a "read IF shift" command for `sub`'s VFO.
+pub fn read_if_shift(sub: bool) -> String {
+    format!("IS{};", sub as u8)
+}
+
+/// Parse the IF shift in Hz from an `IS` response (`IS00[+-]dddd;`).
+pub fn parse_if_shift(frame: &str) -> Option<i32> {
+    let parsed = split(frame)?;
+    if parsed.command != "IS" {
+        return None;
+    }
+    let sign_at = parsed.payload.find(['+', '-'])?;
+    let sign = if parsed.payload.as_bytes()[sign_at] == b'-' {
+        -1
+    } else {
+        1
+    };
+    let digits: i32 = parsed.payload.get(sign_at + 1..sign_at + 5)?.parse().ok()?;
+    Some(clamp_if_shift_hz(sign * digits))
 }
 
 /// AGC time constant (`GT` P2).
@@ -1589,5 +1781,62 @@ mod tests {
         assert_eq!(set_squelch(200), "SQ0100;");
         assert_eq!(parse_squelch("SQ0050;"), Some(50));
         assert_eq!(parse_squelch("RG0128;"), None);
+    }
+
+    #[test]
+    fn build_and_parse_if_width() {
+        assert_eq!(set_if_width(false, 8), "SH0008;");
+        assert_eq!(set_if_width(true, 12), "SH1012;");
+        assert_eq!(read_if_width(false), "SH0;");
+        assert_eq!(read_if_width(true), "SH1;");
+        assert_eq!(parse_if_width("SH0008;"), Some(8));
+        assert_eq!(parse_if_width("SH1021;"), Some(21));
+        assert_eq!(parse_if_width("IS0;"), None);
+    }
+
+    #[test]
+    fn if_width_tables_follow_mode() {
+        assert_eq!(if_width_group(Mode::Usb), Some(IfWidthGroup::Ssb));
+        assert_eq!(if_width_group(Mode::Lsb), Some(IfWidthGroup::Ssb));
+        assert_eq!(if_width_group(Mode::CwU), Some(IfWidthGroup::Cw));
+        assert_eq!(if_width_group(Mode::DataU), Some(IfWidthGroup::Cw));
+        assert_eq!(if_width_group(Mode::Fm), None);
+        assert_eq!(if_width_group(Mode::AmN), None);
+
+        let ssb = if_width_options(RadioModel::Ftdx10, Mode::Usb).unwrap();
+        assert_eq!(ssb[0], (0, 0));
+        assert_eq!(ssb[8], (8, 1650));
+        let cw = if_width_options(RadioModel::Ftdx10, Mode::CwU).unwrap();
+        assert_eq!(cw[5], (5, 250));
+        assert_eq!(if_width_options(RadioModel::Ftdx10, Mode::Fm), None);
+
+        // FT-710 codes are non-contiguous.
+        let ft710 = if_width_options(RadioModel::Ft710, Mode::Usb).unwrap();
+        assert!(ft710.iter().all(|(code, _)| *code != 2));
+        assert!(ft710.contains(&(20, 3200)));
+    }
+
+    #[test]
+    fn build_and_parse_if_shift() {
+        assert_eq!(set_if_shift(false, 600), "IS00+0600;");
+        assert_eq!(set_if_shift(true, -240), "IS10-0240;");
+        assert_eq!(set_if_shift(false, 0), "IS00+0000;");
+        // 20 Hz grid and +-1000 Hz clamp.
+        assert_eq!(set_if_shift(false, 104), "IS00+0100;");
+        assert_eq!(set_if_shift(false, 20_000_000), "IS00+1000;");
+        assert_eq!(read_if_shift(false), "IS0;");
+        assert_eq!(read_if_shift(true), "IS1;");
+        assert_eq!(parse_if_shift("IS00+0600;"), Some(600));
+        assert_eq!(parse_if_shift("IS10-0240;"), Some(-240));
+        assert_eq!(parse_if_shift("SH0008;"), None);
+    }
+
+    #[test]
+    fn nearest_band_picks_calling_frequency() {
+        assert_eq!(nearest_band_index(0), None);
+        assert_eq!(nearest_band_index(14_250_000), Some(5)); // 20m
+        assert_eq!(nearest_band_index(7_005_000), Some(3)); // 40m
+        assert_eq!(nearest_band_index(50_200_000), Some(10)); // 6m
+        assert_eq!(HF_BANDS[5].1, 14_074_000);
     }
 }
