@@ -22,6 +22,8 @@ use crate::AudioFrame;
 pub enum OutputError {
     #[error("no default output device")]
     NoDevice,
+    #[error("output device not found: {0}")]
+    DeviceNotFound(String),
     #[error("device does not support a usable output config: {0}")]
     Config(String),
     #[error("failed to build output stream: {0}")]
@@ -76,8 +78,18 @@ pub struct AudioOutput {
 impl AudioOutput {
     /// Open the default output device and start playback.
     pub fn new() -> Result<Self, OutputError> {
+        Self::with_device(None)
+    }
+
+    /// Open a named output device (or the default when `device` is `None`) and
+    /// start playback. Used to route RX to a loopback/virtual audio device for
+    /// the external-software bridge.
+    pub fn with_device(device: Option<String>) -> Result<Self, OutputError> {
         let host = cpal::default_host();
-        let device = host.default_output_device().ok_or(OutputError::NoDevice)?;
+        let device = match &device {
+            Some(name) => find_output_device(&host, name)?,
+            None => host.default_output_device().ok_or(OutputError::NoDevice)?,
+        };
         let device_name = device.name().unwrap_or_else(|_| "unknown".into());
 
         let supported = choose_config(&device)?;
@@ -170,6 +182,27 @@ impl AudioOutput {
     pub fn volume(&self) -> f32 {
         self.control.volume()
     }
+
+    /// Names of the available output devices.
+    pub fn devices() -> Vec<String> {
+        let host = cpal::default_host();
+        match host.output_devices() {
+            Ok(devices) => devices.filter_map(|device| device.name().ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+fn find_output_device(host: &cpal::Host, name: &str) -> Result<cpal::Device, OutputError> {
+    let devices = host
+        .output_devices()
+        .map_err(|e| OutputError::Config(e.to_string()))?;
+    for device in devices {
+        if device.name().ok().as_deref() == Some(name) {
+            return Ok(device);
+        }
+    }
+    Err(OutputError::DeviceNotFound(name.to_string()))
 }
 
 fn choose_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig, OutputError> {

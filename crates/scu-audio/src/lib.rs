@@ -19,6 +19,8 @@ pub mod input;
 #[path = "web/output.rs"]
 pub mod output;
 
+pub mod vox;
+
 mod resample;
 
 use scu_protocol::{AUDIO_BODY_LEN, AUDIO_INNER_HEADER_LEN, AUDIO_PAYLOAD_LEN};

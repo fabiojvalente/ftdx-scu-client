@@ -88,6 +88,11 @@ pub fn swap_vfo() -> &'static str {
     "SV;"
 }
 
+/// Build a "band select" command (`BS` P1 P2), using the Yaesu band codes.
+pub fn set_band(code: u8) -> String {
+    format!("BS{:02};", code.min(99))
+}
+
 /// Build a "copy VFO-A to VFO-B" command (`AB;`, write-only).
 pub fn copy_a_to_b() -> &'static str {
     "AB;"
@@ -415,6 +420,76 @@ pub fn read_id() -> String {
 /// Build a "read composite status" command.
 pub fn read_status() -> String {
     "IF;".to_string()
+}
+
+/// Number of characters in the FTDX10 / FT-991 `IF;` response, including the
+/// leading `IF` and the trailing `;` (FT-450 and friends answer 27).
+pub const IF_RESPONSE_LEN: usize = 28;
+
+/// The subset of the Yaesu `IF;` composite-status response this client decodes.
+///
+/// The response is a fixed-width record whose notable field offsets (relative
+/// to the start of the `IF`) are, for the 28-character FTDX10 form:
+///
+/// | Offset | Field |
+/// |---|---|
+/// | 2  | operating frequency (9 ASCII digits, Hz) |
+/// | 14 | clarifier offset (5 chars: sign + 4 digits) |
+/// | 22 | VFO/memory indicator (`0` = VFO, non-zero = memory) |
+///
+/// These offsets match the reference Hamlib `newcat` decoder and flrig's
+/// FTDX10/FT-710 front ends. The clarifier field is reported in the radio's
+/// native unit (Hz on the FTDX10 per its `CF` command); a couple of older
+/// models express it in 10 Hz steps, so treat it as advisory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IfStatus {
+    pub frequency_hz: u64,
+    pub clarifier_hz: i32,
+    /// `true` when the radio is showing a memory channel rather than a VFO.
+    pub memory: bool,
+    /// The complete response text, including the trailing `;`.
+    pub raw: String,
+}
+
+/// Parse a Yaesu `IF;` composite-status response.
+///
+/// Returns `None` when the frame is not an `IF` answer or its frequency field
+/// is missing/malformed. Fields whose offsets fall outside a shorter (older
+/// radio) response degrade to defaults rather than failing the whole parse.
+pub fn parse_if(frame: &str) -> Option<IfStatus> {
+    let frame = frame.trim();
+    let body = frame.strip_prefix("IF")?.strip_suffix(';')?;
+    if body.len() < 11 {
+        return None;
+    }
+    let frequency = body.get(0..9)?;
+    if !frequency.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let frequency_hz = frequency.parse().ok()?;
+    let clarifier_hz = body.get(12..17).and_then(parse_signed_offset).unwrap_or(0);
+    let memory = body.as_bytes().get(20).is_some_and(|&b| b != b'0');
+    Some(IfStatus {
+        frequency_hz,
+        clarifier_hz,
+        memory,
+        raw: frame.to_string(),
+    })
+}
+
+/// Parse a `±dddd` clarifier field (sign followed by up to four digits).
+fn parse_signed_offset(field: &str) -> Option<i32> {
+    let mut chars = field.chars();
+    let sign = match chars.next()? {
+        '+' => 1,
+        '-' => -1,
+        _ => return None,
+    };
+    let digits = chars.as_str();
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(sign * digits.parse::<i32>().ok()?)
 }
 
 /// Build a "read S-meter" command.
@@ -836,6 +911,17 @@ impl RadioModel {
         }
     }
 
+    /// The 4-digit hexadecimal `ID;` value for this model.
+    pub fn id(&self) -> u32 {
+        match self {
+            RadioModel::Ftdx10 => 0x0670,
+            RadioModel::Ftdx101D => 0x0681,
+            RadioModel::Ftdx101Mp => 0x0682,
+            RadioModel::Ft710 => 0x0800,
+            RadioModel::Other(id) => *id,
+        }
+    }
+
     pub fn name(&self) -> String {
         match self {
             RadioModel::Ftdx10 => "FTDX10".into(),
@@ -1190,6 +1276,8 @@ mod tests {
         assert_eq!(parse_id("ID0670;"), Some(0x0670));
         assert_eq!(RadioModel::from_id(0x0670), RadioModel::Ftdx10);
         assert_eq!(RadioModel::from_id(0x0670).name(), "FTDX10");
+        assert_eq!(RadioModel::from_id(0x0670).id(), 0x0670);
+        assert_eq!(RadioModel::from_id(0x9999).id(), 0x9999);
     }
 
     #[test]
@@ -1204,6 +1292,34 @@ mod tests {
         let f = split("IF000007007000+000000...;").unwrap();
         assert_eq!(f.command, "IF");
         assert!(!f.payload.is_empty());
+    }
+
+    #[test]
+    fn parse_if_status() {
+        // 28-char FTDX10 form: IF + freq(9) + 3 + clarifier(5) + 3 + mem + 4 + ;
+        let status = parse_if("IF007007000000+00000000000;").unwrap();
+        assert_eq!(status.frequency_hz, 7_007_000);
+        assert_eq!(status.clarifier_hz, 0);
+        assert!(!status.memory);
+        assert_eq!(status.raw, "IF007007000000+00000000000;");
+
+        // Offset 14 clarifier (negative) and offset 22 memory indicator set.
+        let status = parse_if("IF007007000000-025000010000;").unwrap();
+        assert_eq!(status.frequency_hz, 7_007_000);
+        assert_eq!(status.clarifier_hz, -250);
+        assert!(status.memory);
+
+        // 14.250.000 with a positive clarifier.
+        let status = parse_if("IF014250000000+01000000000;").unwrap();
+        assert_eq!(status.frequency_hz, 14_250_000);
+        assert_eq!(status.clarifier_hz, 100);
+    }
+
+    #[test]
+    fn parse_if_rejects_other_frames() {
+        assert_eq!(parse_if("FA007007000;"), None);
+        assert_eq!(parse_if("IF;"), None);
+        assert_eq!(parse_if("IF00ABC7000;"), None);
     }
 
     #[test]

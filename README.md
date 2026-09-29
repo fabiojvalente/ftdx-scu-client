@@ -21,9 +21,12 @@ Operation Reference manuals).
   squelch, click-to-tune, and a raw CAT console.
 - **Meters** — S-meter plus selectable `RM` meters.
 - **RX/TX audio** — playback, volume/mute/stereo, resampling, PTT, TX audio,
-  power, mic gain, ATU.
-- **Headless probe** (`scu-probe`) and a reusable protocol core for building
-  external bridges.
+  power, mic gain, ATU, plus VOX (audio keying).
+- **External-software bridge** — a built-in rigctld-protocol server (no Hamlib
+  binary needed) lets WSJT-X / fldigi / N1MM / Log4OM drive the radio, plus
+  loopback audio routing (BlackHole, Loopback, Common-Radio).
+- **Headless probe** (`scu-probe`), a headless rigctld server (`scu-rigctld`)
+  and a reusable protocol core for building external bridges.
 
 ## Workspace layout
 
@@ -35,6 +38,7 @@ ftdx10-scu-client/
 │   ├── scu-scope/      # boundary detection, bin//2, normalize, colormaps
 │   ├── scu-audio/      # inner-header decode, ring buffer, resample, cpal/WebAudio
 │   ├── scu-client/     # executor-agnostic session state machine + channel tasks
+│   ├── scu-rigctld/    # native rigctld-protocol TCP server (Hamlib clients)
 │   └── scu-bridge/     # WebSocket ⇄ UDP relay for the browser build
 └── app/                # egui/eframe GUI (native + wasm)
 ```
@@ -85,6 +89,31 @@ cargo run -p scu-client --bin scu-probe -- --host 192.168.1.100 -c 'FA;' -v
 ```
 
 Run `scu-probe --help` for all options.
+
+### External software (CAT + audio)
+
+The app can present the radio to third-party software. In the side rail:
+
+- **Radio Server (CAT)** — a built-in, native **rigctld-protocol** server (no
+  Hamlib binary, no serial port, no GPL dependency). Configure the other program
+  as **Hamlib NET rigctl** at `127.0.0.1:4532`; several clients can share the one
+  session. Getters are answered from a cached radio state and a TX safety
+  watchdog releases PTT if a client disappears mid-transmission.
+- **Audio Streaming** — route RX to a loopback output device and take TX from a
+  loopback input device (BlackHole, Loopback, Common-Radio, VB-Cable, …), so the
+  external program's soundcard in/out is bridged to the radio.
+- **VOX** — key the transmitter from the audio level as an alternative to CAT
+  PTT.
+
+For a headless server (no GUI), use the `scu-rigctld` binary:
+
+```sh
+cargo run -p scu-rigctld -- \
+    --host 192.168.1.100 --user defaultuser --pass defaultuser
+```
+
+It serves Hamlib clients on `4532` until Ctrl-C. Run `scu-rigctld --help` for
+all options.
 
 ### Browser (WebAssembly)
 

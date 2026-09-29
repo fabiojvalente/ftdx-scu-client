@@ -1,0 +1,19 @@
+[package]
+name = "scu-rigctld"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native rigctld-protocol TCP server that exposes a SCU-LAN10 session to Hamlib clients"
+
+[[bin]]
+name = "scu-rigctld"
+path = "src/bin/scu-rigctld.rs"
+
+[dependencies]
+scu-client.workspace = true
+scu-cat.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+tracing-subscriber.workspace = true

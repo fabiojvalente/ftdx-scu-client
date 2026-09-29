@@ -11,7 +11,7 @@ PORT ?= 8080
 
 .DEFAULT_GOAL := help
 
-.PHONY: help native run bridge web web-trunk serve test fmt lint clean
+.PHONY: help native run bridge rigctld web web-trunk serve test fmt lint clean
 
 help: ## Show this help
 	@printf "SCU-LAN10 Client targets:\n\n"
@@ -26,6 +26,9 @@ run: ## Build and run the native desktop app
 
 bridge: ## Run the WebSocket/UDP bridge needed by the web app
 	$(CARGO) run --release -p scu-bridge -- --listen 0.0.0.0:9000
+
+rigctld: ## Run the headless rigctld server (needs --host/--user/--pass)
+	$(CARGO) run --release -p scu-rigctld -- $(ARGS)
 
 web: ## Build the browser (WebAssembly) bundle into app/dist
 	./scripts/build-web.sh

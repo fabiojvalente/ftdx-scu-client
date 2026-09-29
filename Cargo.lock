@@ -3194,6 +3194,7 @@ dependencies = [
  "scu-cat",
  "scu-client",
  "scu-protocol",
+ "scu-rigctld",
  "scu-scope",
  "serde",
  "tokio",
@@ -3275,6 +3276,19 @@ dependencies = [
  "getrandom 0.2.17",
  "rand",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "scu-rigctld"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "scu-cat",
+ "scu-client",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

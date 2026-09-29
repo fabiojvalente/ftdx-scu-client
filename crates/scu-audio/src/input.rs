@@ -8,7 +8,7 @@
 //! The stream callback never allocates or locks: it pushes `f32` samples into a
 //! lock-free ring buffer that a worker thread drains.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -70,6 +70,9 @@ struct Control {
     enabled: AtomicBool,
     gain_bits: AtomicU32,
     stop: AtomicBool,
+    /// Most recent input peak, scaled to 0..=32767. Updated even when capture
+    /// is disabled so VOX (or a level meter) can observe the live signal.
+    level: AtomicU16,
 }
 
 impl Control {
@@ -112,6 +115,7 @@ impl MicInput {
             enabled: AtomicBool::new(false),
             gain_bits: AtomicU32::new(config.gain.clamp(0.0, 4.0).to_bits()),
             stop: AtomicBool::new(false),
+            level: AtomicU16::new(0),
         });
 
         let err_fn = |err| tracing::error!(%err, "microphone stream error");
@@ -173,6 +177,12 @@ impl MicInput {
 
     pub fn gain(&self) -> f32 {
         self.control.gain()
+    }
+
+    /// Most recent input peak (0..=32767), available even while capture is
+    /// disabled so the caller can implement VOX.
+    pub fn level(&self) -> u16 {
+        self.control.level.load(Ordering::Relaxed)
     }
 
     /// Names of the available input devices.
@@ -262,6 +272,15 @@ fn worker_loop<C: Consumer<Item = f32>>(
             std::thread::sleep(Duration::from_millis(2));
             continue;
         }
+
+        // Publish the input peak before the enabled gate so VOX can key the
+        // transmitter while capture is otherwise idle.
+        let peak = scratch[..n]
+            .iter()
+            .fold(0.0f32, |acc, sample| acc.max(sample.abs()));
+        control
+            .level
+            .store((peak.clamp(0.0, 1.0) * 32767.0) as u16, Ordering::Relaxed);
 
         if !control.enabled.load(Ordering::Relaxed) {
             pending.clear();

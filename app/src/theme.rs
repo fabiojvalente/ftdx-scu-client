@@ -3,9 +3,7 @@
 //! Dark charcoal chassis with blue accent buttons, a bright cyan frequency readout
 //! and red/green transmit/receive cues.
 
-use eframe::egui::{
-    self, Color32, CornerRadius, Frame, Margin, RichText, Stroke, Ui,
-};
+use eframe::egui::{self, Color32, CornerRadius, Frame, Margin, RichText, Stroke, Ui};
 
 // ---- Surfaces -----------------------------------------------------------
 
@@ -138,6 +136,11 @@ pub fn rail_frame() -> Frame {
 /// A small uppercase section title in the accent colour.
 pub fn section(ui: &mut Ui, title: &str) {
     ui.add_space(2.0);
-    ui.label(RichText::new(title.to_uppercase()).small().strong().color(ACCENT));
+    ui.label(
+        RichText::new(title.to_uppercase())
+            .small()
+            .strong()
+            .color(ACCENT),
+    );
     ui.add_space(1.0);
 }

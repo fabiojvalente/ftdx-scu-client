@@ -1,4 +1,6 @@
 mod app;
+#[cfg(not(target_arch = "wasm32"))]
+mod cat_server;
 mod theme;
 mod waterfall;
 

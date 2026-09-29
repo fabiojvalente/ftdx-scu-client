@@ -24,6 +24,7 @@ web-time.workspace = true
 eframe = "0.36.2"
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "net"] }
+scu-rigctld.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 eframe = { version = "0.36.2", default-features = false, features = [

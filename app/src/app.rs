@@ -11,13 +11,21 @@ use std::path::PathBuf;
 use eframe::egui;
 use scu_audio::input::{MicConfig, MicInput, TxAudioSink};
 use scu_audio::output::{AudioOutput, AudioSink};
+#[cfg(not(target_arch = "wasm32"))]
+use scu_audio::vox::{Vox, VoxConfig};
 use scu_cat::{self, Agc, MeterKind, Mode, RadioModel, ScopeMode};
 use scu_client::{ConnectConfig, Event, ScuClient, ScuHandle};
 use scu_scope::{BinInterleave, Colormap, FrequencyAxis};
 use serde::{Deserialize, Serialize};
 
-use crate::theme::{self, ACCENT, FREQ_CYAN, ON_ACCENT, OUTLINE, RX_GREEN, SPECTRUM_GREEN, TEXT, TEXT_DIM, TEXT_FAINT, TX_RED};
+use crate::theme::{
+    self, ACCENT, FREQ_CYAN, ON_ACCENT, OUTLINE, RX_GREEN, SPECTRUM_GREEN, TEXT, TEXT_DIM,
+    TEXT_FAINT, TX_RED,
+};
 use crate::waterfall::Waterfall;
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::cat_server::CatServerState;
 
 /// Messages from the background session engine to the UI.
 enum EngineMsg {
@@ -35,6 +43,30 @@ pub struct AppSettings {
     pub visible_meters: Vec<u8>,
     #[serde(default = "default_true")]
     pub show_cat_console: bool,
+    /// Start the external CAT server (native rigctld endpoint) alongside the session.
+    #[serde(default)]
+    pub cat_server_enabled: bool,
+    #[serde(default = "default_rigctld_port")]
+    pub cat_server_port: u16,
+    /// Route RX to a loopback device for external software.
+    #[serde(default)]
+    pub rx_stream_enabled: bool,
+    #[serde(default)]
+    pub rx_stream_device: Option<String>,
+    /// Take TX audio from a loopback device instead of the local microphone.
+    #[serde(default)]
+    pub tx_stream_enabled: bool,
+    #[serde(default)]
+    pub tx_stream_device: Option<String>,
+    /// Voice-operated transmit.
+    #[serde(default)]
+    pub vox_enabled: bool,
+    #[serde(default = "default_vox_threshold")]
+    pub vox_threshold: u16,
+    #[serde(default = "default_vox_attack")]
+    pub vox_attack_ms: u32,
+    #[serde(default = "default_vox_hang")]
+    pub vox_hang_ms: u32,
 }
 
 impl Default for AppSettings {
@@ -42,8 +74,34 @@ impl Default for AppSettings {
         Self {
             visible_meters: default_visible_meters(),
             show_cat_console: true,
+            cat_server_enabled: false,
+            cat_server_port: default_rigctld_port(),
+            rx_stream_enabled: false,
+            rx_stream_device: None,
+            tx_stream_enabled: false,
+            tx_stream_device: None,
+            vox_enabled: false,
+            vox_threshold: default_vox_threshold(),
+            vox_attack_ms: default_vox_attack(),
+            vox_hang_ms: default_vox_hang(),
         }
     }
+}
+
+fn default_vox_threshold() -> u16 {
+    scu_audio::vox::VoxConfig::default().threshold
+}
+
+fn default_vox_attack() -> u32 {
+    scu_audio::vox::VoxConfig::default().attack_ms
+}
+
+fn default_vox_hang() -> u32 {
+    scu_audio::vox::VoxConfig::default().hang_ms
+}
+
+fn default_rigctld_port() -> u16 {
+    4532
 }
 
 fn default_visible_meters() -> Vec<u8> {
@@ -120,6 +178,28 @@ pub struct ScuApp {
     settings: AppSettings,
     show_settings: bool,
 
+    /// Audio fan-out the engine writes RX frames to (local + streaming outputs).
+    audio_sinks: Arc<std::sync::Mutex<Vec<AudioSink>>>,
+
+    #[cfg(not(target_arch = "wasm32"))]
+    rx_stream: Option<AudioOutput>,
+    #[cfg(not(target_arch = "wasm32"))]
+    tx_stream: Option<MicInput>,
+    #[cfg(not(target_arch = "wasm32"))]
+    rx_stream_devices: Vec<String>,
+    #[cfg(not(target_arch = "wasm32"))]
+    tx_stream_devices: Vec<String>,
+    #[cfg(not(target_arch = "wasm32"))]
+    vox: Vox,
+    #[cfg(not(target_arch = "wasm32"))]
+    vox_last: Instant,
+
+    #[cfg(not(target_arch = "wasm32"))]
+    cat_server: CatServerState,
+    /// Last observed external-PTT state, to detect rigctld key-ups.
+    #[cfg(not(target_arch = "wasm32"))]
+    external_ptt_seen: bool,
+
     last_poll: Instant,
 }
 
@@ -191,6 +271,23 @@ impl ScuApp {
             mic_status: String::new(),
             settings,
             show_settings: false,
+            audio_sinks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(not(target_arch = "wasm32"))]
+            rx_stream: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            tx_stream: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            rx_stream_devices: AudioOutput::devices(),
+            #[cfg(not(target_arch = "wasm32"))]
+            tx_stream_devices: MicInput::devices(),
+            #[cfg(not(target_arch = "wasm32"))]
+            vox: Vox::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            vox_last: Instant::now(),
+            #[cfg(not(target_arch = "wasm32"))]
+            cat_server: CatServerState::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            external_ptt_seen: false,
             last_poll: Instant::now(),
         }
     }
@@ -201,9 +298,10 @@ impl ScuApp {
         }
         save_config(&self.config);
         self.ensure_audio();
+        self.sync_audio_sinks();
 
         let config = self.config.clone();
-        let sink = self.audio.as_ref().map(|a| a.sink());
+        let sinks = Arc::clone(&self.audio_sinks);
         let (tx, rx) = std::sync::mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -212,7 +310,7 @@ impl ScuApp {
         self.connecting = true;
         self.status = "connecting...".into();
 
-        if start_engine(config, sink, tx, shutdown, ctx).is_err() {
+        if start_engine(config, sinks, tx, shutdown, ctx).is_err() {
             self.connecting = false;
             self.engine_rx = None;
             self.shutdown = None;
@@ -230,6 +328,7 @@ impl ScuApp {
         self.handle = None;
         self.connecting = false;
         self.status = "disconnected".into();
+        self.sync_cat_server();
     }
 
     /// Unkey the radio (if needed) and release the microphone.
@@ -241,6 +340,10 @@ impl ScuApp {
         }
         self.ptt = false;
         self.mic = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.tx_stream = None;
+        }
         self.mic_status.clear();
         self.sync_audio_enabled();
     }
@@ -252,7 +355,7 @@ impl ScuApp {
         match AudioOutput::new() {
             Ok(output) => {
                 output.set_volume(self.volume);
-                output.set_enabled(!self.muted && !self.ptt);
+                output.set_enabled(!self.muted && !self.tx_keyed());
                 output.set_stereo(self.stereo);
                 self.audio = Some(output);
             }
@@ -262,12 +365,293 @@ impl ScuApp {
         }
     }
 
+    /// Rebuild the fan-out list the engine writes RX frames to: the local
+    /// playback device plus, when enabled, the streaming loopback device.
+    fn sync_audio_sinks(&self) {
+        let mut sinks = self.audio_sinks.lock().unwrap();
+        sinks.clear();
+        if let Some(audio) = &self.audio {
+            sinks.push(audio.sink());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(stream) = &self.rx_stream {
+            sinks.push(stream.sink());
+        }
+    }
+
     /// RX playback is silenced while muted or transmitting (avoids the mic
     /// picking up the speakers).
     fn sync_audio_enabled(&self) {
         if let Some(audio) = &self.audio {
-            audio.set_enabled(!self.muted && !self.ptt);
+            audio.set_enabled(!self.muted && !self.tx_keyed());
         }
+    }
+
+    /// Start or stop the external CAT server to match the current settings and
+    /// connection state.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn sync_cat_server(&mut self) {
+        let enabled = self.settings.cat_server_enabled && self.handle.is_some();
+        if !enabled {
+            self.cat_server.stop();
+            return;
+        }
+        if self.cat_server.running() {
+            return;
+        }
+        let Some(handle) = self.handle.clone() else {
+            return;
+        };
+        self.cat_server.start(handle, self.settings.cat_server_port);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn sync_cat_server(&mut self) {}
+
+    /// Reconcile audio gating when an external rigctld client keys the radio:
+    /// the app must enable whichever TX audio source is active.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn reconcile_external_ptt(&mut self) {
+        let external = self.cat_server.external_ptt_active();
+        if external == self.external_ptt_seen {
+            return;
+        }
+        self.external_ptt_seen = external;
+        self.sync_tx_sources();
+        self.sync_audio_enabled();
+    }
+
+    /// `true` when the radio should be transmitting, whether keyed locally
+    /// (button/space/VOX) or by an external rigctld client.
+    fn tx_keyed(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.ptt || self.cat_server.external_ptt_active()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.ptt
+        }
+    }
+
+    /// Side-rail section for the built-in rigctld server.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn ui_cat_server(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "Radio Server (CAT)");
+        ui.label(
+            egui::RichText::new(
+                "Expose the radio to WSJT-X, fldigi, N1MM and other Hamlib clients over the network.",
+            )
+            .small()
+            .color(TEXT_FAINT),
+        );
+
+        let mut enabled = self.settings.cat_server_enabled;
+        if ui
+            .checkbox(&mut enabled, "Enable rigctld server")
+            .on_hover_text("Serve the rigctld protocol so external software can control the radio")
+            .changed()
+        {
+            self.settings.cat_server_enabled = enabled;
+            save_settings(&self.settings);
+            self.sync_cat_server();
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Port");
+            let mut port = self.settings.cat_server_port;
+            if ui
+                .add(egui::DragValue::new(&mut port).range(1..=65535).speed(1.0))
+                .changed()
+            {
+                self.settings.cat_server_port = port;
+                save_settings(&self.settings);
+            }
+        });
+
+        let status = self.cat_server.status();
+        if status.running {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Listening on 127.0.0.1:{} ({} client{})",
+                    status.port,
+                    status.clients,
+                    if status.clients == 1 { "" } else { "s" }
+                ))
+                .strong()
+                .color(RX_GREEN),
+            );
+            ui.label(
+                egui::RichText::new("Point clients at Hamlib NET rigctl / rigctld")
+                    .small()
+                    .color(TEXT_FAINT),
+            );
+        } else {
+            ui.label(egui::RichText::new("Stopped").color(TEXT_DIM));
+        }
+        if let Some(error) = &status.error {
+            ui.label(egui::RichText::new(error).small().color(theme::WARN_AMBER));
+        }
+    }
+
+    /// Side-rail section for routing RX/TX audio to a loopback device so
+    /// external software (WSJT-X, fldigi, …) can share the radio's audio.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn ui_audio_streaming(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "Audio Streaming");
+        ui.label(
+            egui::RichText::new(
+                "Bridge RX/TX to a virtual device (BlackHole, Loopback, Common-Radio, VB-Cable).",
+            )
+            .small()
+            .color(TEXT_FAINT),
+        );
+
+        // RX: radio -> loopback -> external app.
+        let mut rx_enabled = self.settings.rx_stream_enabled;
+        if ui
+            .checkbox(&mut rx_enabled, "Stream RX to a device")
+            .on_hover_text(
+                "Play decoded RX audio to a virtual device the external app records from",
+            )
+            .changed()
+        {
+            self.settings.rx_stream_enabled = rx_enabled;
+            save_settings(&self.settings);
+            self.sync_rx_stream();
+        }
+        if let Some(choice) = device_combo(
+            ui,
+            "rx-stream-device",
+            "Output",
+            &self.rx_stream_devices,
+            &self.settings.rx_stream_device,
+        ) {
+            self.settings.rx_stream_device = choice;
+            save_settings(&self.settings);
+            if self.settings.rx_stream_enabled {
+                self.sync_rx_stream();
+            }
+        }
+
+        // TX: external app -> loopback -> radio.
+        let mut tx_enabled = self.settings.tx_stream_enabled;
+        if ui
+            .checkbox(&mut tx_enabled, "Take TX from a device")
+            .on_hover_text(
+                "Send audio captured from a virtual device to the radio (replaces the mic)",
+            )
+            .changed()
+        {
+            self.settings.tx_stream_enabled = tx_enabled;
+            save_settings(&self.settings);
+            if tx_enabled {
+                if let Some(handle) = self.handle.clone() {
+                    self.ensure_tx_stream(handle);
+                }
+            } else {
+                self.tx_stream = None;
+            }
+            self.sync_tx_sources();
+        }
+        if let Some(choice) = device_combo(
+            ui,
+            "tx-stream-device",
+            "Input",
+            &self.tx_stream_devices,
+            &self.settings.tx_stream_device,
+        ) {
+            self.settings.tx_stream_device = choice;
+            save_settings(&self.settings);
+            if self.settings.tx_stream_enabled {
+                self.tx_stream = None;
+                if let Some(handle) = self.handle.clone() {
+                    self.ensure_tx_stream(handle);
+                }
+                self.sync_tx_sources();
+            }
+        }
+        ui.label(
+            egui::RichText::new("TX streaming replaces the local microphone while enabled.")
+                .small()
+                .color(TEXT_FAINT),
+        );
+
+        if ui.button("Rescan audio devices").clicked() {
+            self.rx_stream_devices = AudioOutput::devices();
+            self.tx_stream_devices = MicInput::devices();
+            self.mic_devices = MicInput::devices();
+        }
+    }
+
+    /// Side-rail section for voice-operated transmit.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn ui_vox(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "VOX (audio keying)");
+        let mut enabled = self.settings.vox_enabled;
+        if ui
+            .checkbox(&mut enabled, "Enable VOX")
+            .on_hover_text("Key the transmitter from the audio level instead of PTT")
+            .changed()
+        {
+            self.settings.vox_enabled = enabled;
+            if !enabled {
+                self.vox.reset();
+                if self.ptt {
+                    self.set_ptt(false);
+                }
+            }
+            save_settings(&self.settings);
+        }
+        if !self.settings.vox_enabled {
+            return;
+        }
+
+        let level = self.tx_level();
+        ui.add(
+            egui::ProgressBar::new((level as f32 / 32767.0).clamp(0.0, 1.0))
+                .desired_height(10.0)
+                .fill(if self.tx_keyed() { TX_RED } else { RX_GREEN })
+                .text(if self.tx_keyed() { "TX" } else { "RX" }),
+        );
+        ui.label(
+            egui::RichText::new(format!(
+                "Input {level} / threshold {}",
+                self.settings.vox_threshold
+            ))
+            .small()
+            .color(TEXT_FAINT),
+        );
+
+        let mut threshold = self.settings.vox_threshold;
+        if ui
+            .add(egui::Slider::new(&mut threshold, 0..=32767).text("Threshold"))
+            .changed()
+        {
+            self.settings.vox_threshold = threshold;
+            save_settings(&self.settings);
+        }
+        let mut attack = self.settings.vox_attack_ms as i32;
+        if ui
+            .add(egui::Slider::new(&mut attack, 0..=1000).text("Attack (ms)"))
+            .changed()
+        {
+            self.settings.vox_attack_ms = attack as u32;
+            save_settings(&self.settings);
+        }
+        let mut hang = self.settings.vox_hang_ms as i32;
+        if ui
+            .add(egui::Slider::new(&mut hang, 0..=3000).text("Hang (ms)"))
+            .changed()
+        {
+            self.settings.vox_hang_ms = hang as u32;
+            save_settings(&self.settings);
+        }
+        ui.label(
+            egui::RichText::new("Uses whichever TX audio source is active (mic or streaming).")
+                .small()
+                .color(TEXT_FAINT),
+        );
     }
 
     /// Open the configured microphone and route its encoded TX audio to the
@@ -283,7 +667,6 @@ impl ScuApp {
         };
         match MicInput::new(config, sink) {
             Ok(mic) => {
-                mic.set_enabled(self.ptt);
                 self.mic_status = format!(
                     "mic: {} ({} Hz, {} ch)",
                     mic.info().device_name,
@@ -291,20 +674,115 @@ impl ScuApp {
                     mic.info().channels
                 );
                 self.mic = Some(mic);
+                self.sync_tx_sources();
             }
             Err(e) => self.mic_status = format!("mic unavailable: {e}"),
         }
     }
 
-    /// Key (`on = true`) or unkey the transmitter and gate mic capture.
+    /// Open the streaming (external-software) TX input device, if enabled.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn ensure_tx_stream(&mut self, handle: ScuHandle) {
+        if !self.settings.tx_stream_enabled || self.tx_stream.is_some() {
+            return;
+        }
+        let sink: TxAudioSink = Box::new(move |body: &[u8]| handle.send_tx_audio(body));
+        let config = MicConfig {
+            device: self.settings.tx_stream_device.clone(),
+            gain: 1.0,
+        };
+        match MicInput::new(config, sink) {
+            Ok(mic) => {
+                self.tx_stream = Some(mic);
+                self.sync_tx_sources();
+            }
+            Err(e) => {
+                self.settings.tx_stream_enabled = false;
+                self.status = format!("TX stream unavailable: {e}");
+            }
+        }
+    }
+
+    /// Enable exactly one TX audio source (microphone or streaming device)
+    /// while transmitting.
+    fn sync_tx_sources(&mut self) {
+        let keyed = self.tx_keyed();
+        #[cfg(not(target_arch = "wasm32"))]
+        let use_stream = self.settings.tx_stream_enabled && self.tx_stream.is_some();
+        #[cfg(target_arch = "wasm32")]
+        let use_stream = false;
+
+        if let Some(mic) = &self.mic {
+            mic.set_enabled(keyed && !use_stream);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(stream) = &self.tx_stream {
+            stream.set_enabled(keyed && use_stream);
+        }
+    }
+
+    /// (Re)build the RX streaming output to match settings: open a loopback
+    /// device and add it to the engine's sink fan-out, or drop it.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn sync_rx_stream(&mut self) {
+        self.rx_stream = None;
+        if self.settings.rx_stream_enabled {
+            match AudioOutput::with_device(self.settings.rx_stream_device.clone()) {
+                Ok(output) => {
+                    output.set_enabled(true);
+                    output.set_volume(1.0);
+                    self.rx_stream = Some(output);
+                }
+                Err(e) => self.status = format!("RX stream unavailable: {e}"),
+            }
+        }
+        self.sync_audio_sinks();
+    }
+
+    /// Current peak level of the active TX audio source.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn tx_level(&self) -> u16 {
+        if self.settings.tx_stream_enabled {
+            self.tx_stream.as_ref().map(MicInput::level).unwrap_or(0)
+        } else {
+            self.mic.as_ref().map(MicInput::level).unwrap_or(0)
+        }
+    }
+
+    /// Advance the VOX state machine and key/unkey the transmitter.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn update_vox(&mut self) {
+        let now = Instant::now();
+        let dt = now.duration_since(self.vox_last).as_millis().min(500) as u32;
+        self.vox_last = now;
+
+        if !self.settings.vox_enabled || self.handle.is_none() {
+            if self.vox.keyed() {
+                self.vox.reset();
+                self.set_ptt(false);
+            }
+            return;
+        }
+
+        let config = VoxConfig {
+            threshold: self.settings.vox_threshold,
+            attack_ms: self.settings.vox_attack_ms,
+            hang_ms: self.settings.vox_hang_ms,
+        };
+        let level = self.tx_level();
+        let keyed = self.vox.update(level, &config, dt);
+        if keyed != self.ptt {
+            self.set_ptt(keyed);
+        }
+    }
+
+    /// Key (`on = true`) or unkey the transmitter and gate TX capture.
     fn set_ptt(&mut self, on: bool) {
         if self.ptt == on {
             return;
         }
         self.ptt = on;
-        if let Some(mic) = &self.mic {
-            mic.set_enabled(on);
-        }
+        self.sync_tx_sources();
         self.sync_audio_enabled();
         if let Some(handle) = &self.handle {
             handle.set_transmit(on);
@@ -317,7 +795,7 @@ impl ScuApp {
             for cmd in [
                 "ID;", "FA;", "FB;", "FR;", "FT;", "ST;", "MD0;", "SM0;", "PS;", "PC;", "MG;",
                 "AC;", "RT;", "XT;", "RC0;", "RC1;", "NB;", "NR;", "BC;", "NA0;", "GT0;", "RG0;",
-                "SQ0;", "AI1;", "SS05;", "SS06;",
+                "SQ0;", "TX;", "AI1;", "SS05;", "SS06;",
             ] {
                 handle.send_cat(cmd);
             }
@@ -343,12 +821,20 @@ impl ScuApp {
             EngineMsg::Handle(handle) => {
                 self.mic_devices = MicInput::devices();
                 self.ensure_mic(handle.clone());
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.rx_stream_devices = AudioOutput::devices();
+                    self.tx_stream_devices = MicInput::devices();
+                    self.sync_rx_stream();
+                    self.ensure_tx_stream(handle.clone());
+                }
                 self.handle = Some(handle);
                 self.connecting = false;
                 self.scope_centered_sent = false;
                 self.meters = [None; 10];
                 self.status = "connected".into();
                 self.initial_queries();
+                self.sync_cat_server();
             }
             EngineMsg::Event(event) => self.handle_event(event),
             EngineMsg::Failed(error) => {
@@ -357,6 +843,7 @@ impl ScuApp {
                 self.shutdown = None;
                 self.stop_tx();
                 self.status = format!("connect failed: {error}");
+                self.sync_cat_server();
             }
             EngineMsg::Stopped => {
                 self.connecting = false;
@@ -367,6 +854,7 @@ impl ScuApp {
                 }
                 self.handle = None;
                 self.stop_tx();
+                self.sync_cat_server();
             }
         }
     }
@@ -377,7 +865,13 @@ impl ScuApp {
                 self.status = format!("connected (session 0x{session_id:02X})");
                 self.initial_queries();
             }
-            Event::Radio(model) => self.radio = Some(model),
+            Event::Radio(model) => {
+                // `ID;` answers are surfaced as a model, not a raw CAT frame;
+                // reconstruct the frame so the bridge can satisfy rigctld.
+                #[cfg(not(target_arch = "wasm32"))]
+                self.cat_server.apply(&format!("ID{:04X};", model.id()));
+                self.radio = Some(model);
+            }
             Event::Cat(text) => self.on_cat(&text),
             Event::Audio(_) => {}
             Event::Scope(body) => {
@@ -390,11 +884,14 @@ impl ScuApp {
                 self.status = format!("disconnected: {reason}");
                 self.handle = None;
                 self.stop_tx();
+                self.sync_cat_server();
             }
         }
     }
 
     fn on_cat(&mut self, text: &str) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.cat_server.apply(text);
         self.push_log(text.to_string());
         let Some(frame) = scu_cat::split(text) else {
             return;
@@ -614,7 +1111,11 @@ impl ScuApp {
     /// each VFO card).
     fn step_frequency_on(&mut self, sub: bool, steps: i64) {
         let step = self.freq_step_hz.max(1) as i64;
-        let current = if sub { self.frequency_b } else { self.frequency };
+        let current = if sub {
+            self.frequency_b
+        } else {
+            self.frequency
+        };
         let next = (current as i64 + steps * step).clamp(0, 999_999_990) as u64;
         if next != current {
             self.send_frequency(sub, next);
@@ -623,7 +1124,11 @@ impl ScuApp {
 
     /// Restore `sub`'s entry field to the radio's current frequency.
     fn reset_frequency_input_for(&mut self, sub: bool) {
-        let hz = if sub { self.frequency_b } else { self.frequency };
+        let hz = if sub {
+            self.frequency_b
+        } else {
+            self.frequency
+        };
         self.freq_input[sub as usize] = freq_input_text(hz);
         self.freq_editing[sub as usize] = false;
     }
@@ -801,8 +1306,8 @@ impl ScuApp {
             if let Some(handle) = &self.handle {
                 for cmd in [
                     "FA;", "FB;", "FR;", "ST;", md, "SM0;", "PC;", "MG;", "AC;", "RT;", "XT;",
-                    "NB;", "NR;", "BC;", "NA0;", "GT0;", "RG0;", "SQ0;", "SS05;", "RM3;", "RM4;",
-                    "RM5;", "RM6;", "RM7;", "RM8;", "RM9;",
+                    "NB;", "NR;", "BC;", "NA0;", "GT0;", "RG0;", "SQ0;", "TX;", "SS05;", "RM3;",
+                    "RM4;", "RM5;", "RM6;", "RM7;", "RM8;", "RM9;",
                 ] {
                     handle.send_cat(cmd);
                 }
@@ -886,11 +1391,7 @@ impl ScuApp {
             .frame(theme::top_bar_frame())
             .show(root, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("SCU-LAN10")
-                            .strong()
-                            .color(ACCENT),
-                    );
+                    ui.label(egui::RichText::new("SCU-LAN10").strong().color(ACCENT));
                     ui.separator();
 
                     ui.label(egui::RichText::new("HOST").small().color(TEXT_FAINT));
@@ -955,16 +1456,13 @@ impl ScuApp {
                     ui.label(egui::RichText::new(&self.status).color(self.status_color()));
 
                     if let Some(radio) = self.radio {
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.label(
-                                    egui::RichText::new(radio.name())
-                                        .monospace()
-                                        .color(TEXT_DIM),
-                                );
-                            },
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(radio.name())
+                                    .monospace()
+                                    .color(TEXT_DIM),
+                            );
+                        });
                     }
                 });
             });
@@ -1008,8 +1506,7 @@ impl ScuApp {
                     const SEPARATORS: f32 = 30.0;
                     const FRAME_PAD: f32 = 28.0;
                     let available = ui.available_width();
-                    let card_width = ((available - TOGGLES_WIDTH - SEPARATORS) / 2.0
-                        - FRAME_PAD)
+                    let card_width = ((available - TOGGLES_WIDTH - SEPARATORS) / 2.0 - FRAME_PAD)
                         .clamp(196.0, 420.0);
 
                     self.vfo_card(ui, false, card_width);
@@ -1034,13 +1531,20 @@ impl ScuApp {
 
     /// Big red/green push-to-talk key. Returns `true` while held down.
     fn ptt_button(&self, ui: &mut egui::Ui) -> bool {
-        let on = self.ptt;
-        let fill = if on { TX_RED } else { egui::Color32::from_rgb(48, 54, 64) };
+        let on = self.tx_keyed();
+        let fill = if on {
+            TX_RED
+        } else {
+            egui::Color32::from_rgb(48, 54, 64)
+        };
         let stroke = if on { TX_RED } else { OUTLINE };
         let text_color = if on { ON_ACCENT } else { TEXT };
         let label = if on { "TX" } else { "PTT" };
         let button = egui::Button::new(
-            egui::RichText::new(label).strong().size(19.0).color(text_color),
+            egui::RichText::new(label)
+                .strong()
+                .size(19.0)
+                .color(text_color),
         )
         .min_size(egui::Vec2::new(84.0, 52.0))
         .fill(fill)
@@ -1065,7 +1569,11 @@ impl ScuApp {
     fn tune_button(&self, ui: &mut egui::Ui) -> bool {
         let button = egui::Button::new(egui::RichText::new("TUNE").strong())
             .min_size(egui::Vec2::new(84.0, 26.0))
-            .fill(if self.atu_on { theme::ACCENT_DEEP } else { theme::BUTTON_BG });
+            .fill(if self.atu_on {
+                theme::ACCENT_DEEP
+            } else {
+                theme::BUTTON_BG
+            });
         ui.add_enabled(self.handle.is_some(), button)
             .on_hover_text("Start an ATU tuning cycle (keys a carrier)")
             .clicked()
@@ -1113,7 +1621,10 @@ impl ScuApp {
                             if ui
                                 .add(
                                     egui::Button::new(
-                                        egui::RichText::new("RX").small().strong().color(text_color),
+                                        egui::RichText::new("RX")
+                                            .small()
+                                            .strong()
+                                            .color(text_color),
                                     )
                                     .fill(fill)
                                     .min_size(egui::Vec2::new(42.0, 20.0)),
@@ -1124,9 +1635,7 @@ impl ScuApp {
                                 self.select_rx_vfo(sub);
                             }
                             if self.tx_on(sub) {
-                                ui.label(
-                                    egui::RichText::new("TX").small().strong().color(TX_RED),
-                                );
+                                ui.label(egui::RichText::new("TX").small().strong().color(TX_RED));
                             }
                         },
                     );
@@ -1135,7 +1644,11 @@ impl ScuApp {
                 // The big read-out doubles as an inline editor: it shows the
                 // plain cyan digits until clicked, then becomes a text field.
                 let idx = sub as usize;
-                let freq = if sub { self.frequency_b } else { self.frequency };
+                let freq = if sub {
+                    self.frequency_b
+                } else {
+                    self.frequency
+                };
                 let edit_id = ui.make_persistent_id(("vfo-freq", idx));
                 if self.freq_editing[idx] {
                     let response = ui
@@ -1151,7 +1664,11 @@ impl ScuApp {
                         .on_hover_text("Enter to apply, Esc to cancel, scroll to tune");
 
                     if response.gained_focus() {
-                        select_all_text(ui.ctx(), response.id, self.freq_input[idx].chars().count());
+                        select_all_text(
+                            ui.ctx(),
+                            response.id,
+                            self.freq_input[idx].chars().count(),
+                        );
                     }
                     if response.lost_focus() {
                         // Enter applies; clicking away does too.
@@ -1210,10 +1727,14 @@ impl ScuApp {
 
     /// Whether VFO `sub` is currently the transmit VFO.
     fn tx_on(&self, sub: bool) -> bool {
-        if !self.ptt {
+        if !self.tx_keyed() {
             return false;
         }
-        let tx_sub = if self.split { !self.rx_sub } else { self.rx_sub };
+        let tx_sub = if self.split {
+            !self.rx_sub
+        } else {
+            self.rx_sub
+        };
         tx_sub == sub
     }
 
@@ -1222,7 +1743,7 @@ impl ScuApp {
         ui.set_min_width(148.0);
         theme::section(ui, "Operate");
 
-        let (text, fill) = if self.ptt {
+        let (text, fill) = if self.tx_keyed() {
             ("TX  ON AIR", TX_RED)
         } else {
             ("RX  STANDBY", RX_GREEN)
@@ -1731,6 +2252,13 @@ impl ScuApp {
                                     }
                                 });
                         }
+
+                        #[cfg(not(target_arch = "wasm32"))]
+                        self.ui_cat_server(ui);
+                        #[cfg(not(target_arch = "wasm32"))]
+                        self.ui_audio_streaming(ui);
+                        #[cfg(not(target_arch = "wasm32"))]
+                        self.ui_vox(ui);
                     });
             });
     }
@@ -1837,7 +2365,10 @@ impl ScuApp {
             // With shift held the readout previews the nearest kHz, matching
             // what a shift-click will tune to.
             let label = if shift {
-                format!("{} (1 kHz)", format_hz_label(snap_hz(hz_at(pos.x), 1_000) as f64))
+                format!(
+                    "{} (1 kHz)",
+                    format_hz_label(snap_hz(hz_at(pos.x), 1_000) as f64)
+                )
             } else {
                 format_hz_label(hz_at(pos.x))
             };
@@ -1883,6 +2414,10 @@ impl eframe::App for ScuApp {
     fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_engine();
         self.poll();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.reconcile_external_ptt();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.update_vox();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1910,7 +2445,7 @@ impl ScuApp {
 /// `spawn_local` in the browser.
 fn start_engine(
     config: ConnectConfig,
-    sink: Option<AudioSink>,
+    sinks: Arc<std::sync::Mutex<Vec<AudioSink>>>,
     tx: std::sync::mpsc::Sender<EngineMsg>,
     shutdown: Arc<AtomicBool>,
     ctx: egui::Context,
@@ -1930,21 +2465,21 @@ fn start_engine(
                         return;
                     }
                 };
-                runtime.block_on(engine_future(config, sink, tx, shutdown, ctx));
+                runtime.block_on(engine_future(config, sinks, tx, shutdown, ctx));
             })
             .map(|_| ())
     }
 
     #[cfg(target_arch = "wasm32")]
     {
-        wasm_bindgen_futures::spawn_local(engine_future(config, sink, tx, shutdown, ctx));
+        wasm_bindgen_futures::spawn_local(engine_future(config, sinks, tx, shutdown, ctx));
         Ok(())
     }
 }
 
 async fn engine_future(
     config: ConnectConfig,
-    sink: Option<AudioSink>,
+    sinks: Arc<std::sync::Mutex<Vec<AudioSink>>>,
     tx: std::sync::mpsc::Sender<EngineMsg>,
     shutdown: Arc<AtomicBool>,
     ctx: egui::Context,
@@ -1967,8 +2502,8 @@ async fn engine_future(
         }
         match scu_client::timeout(Duration::from_millis(250), client.recv()).await {
             Some(Some(Event::Audio(frame))) => {
-                if let Some(sink) = &sink {
-                    sink.push(*frame);
+                for sink in sinks.lock().unwrap().iter() {
+                    sink.push((*frame).clone());
                 }
             }
             Some(Some(event)) => {
@@ -1994,16 +2529,57 @@ fn span_label(span: f64) -> String {
     }
 }
 
+/// A labelled combo box for choosing an audio device (or the system default).
+/// Returns the new selection when the user changes it.
+#[cfg(not(target_arch = "wasm32"))]
+fn device_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: &str,
+    devices: &[String],
+    current: &Option<String>,
+) -> Option<Option<String>> {
+    let mut choice = None;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).small().color(TEXT_FAINT));
+        let text = current
+            .clone()
+            .unwrap_or_else(|| "System default".to_string());
+        egui::ComboBox::from_id_salt(id)
+            .selected_text(text)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(current.is_none(), "System default")
+                    .clicked()
+                {
+                    choice = Some(None);
+                }
+                for name in devices {
+                    let selected = current.as_deref() == Some(name.as_str());
+                    if ui.selectable_label(selected, name).clicked() {
+                        choice = Some(Some(name.clone()));
+                    }
+                }
+            });
+    });
+    choice
+}
+
 /// A compact toggle button that lights up with the accent colour when `on`.
 fn toggle_chip(ui: &mut egui::Ui, on: bool, label: &str) -> bool {
     let fill = if on { ACCENT } else { theme::BUTTON_BG };
     let stroke = if on { ACCENT } else { OUTLINE };
     let text_color = if on { ON_ACCENT } else { TEXT_DIM };
     ui.add(
-        egui::Button::new(egui::RichText::new(label).small().strong().color(text_color))
-            .fill(fill)
-            .stroke(egui::Stroke::new(1.0, stroke))
-            .min_size(egui::Vec2::new(44.0, 24.0)),
+        egui::Button::new(
+            egui::RichText::new(label)
+                .small()
+                .strong()
+                .color(text_color),
+        )
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, stroke))
+        .min_size(egui::Vec2::new(44.0, 24.0)),
     )
     .clicked()
 }
@@ -2083,10 +2659,12 @@ fn parse_frequency_text(text: &str) -> Option<u64> {
 /// Select the entire contents of the text field with the given id.
 fn select_all_text(ctx: &egui::Context, id: egui::Id, len: usize) {
     if let Some(mut state) = egui::widgets::text_edit::TextEditState::load(ctx, id) {
-        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
-            egui::text::CCursor::new(0),
-            egui::text::CCursor::new(len),
-        )));
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(len),
+            )));
         state.store(ctx, id);
     }
 }
