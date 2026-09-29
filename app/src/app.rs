@@ -14,6 +14,7 @@ use scu_audio::output::{AudioOutput, AudioSink};
 use scu_cat::{self, Agc, MeterKind, Mode, RadioModel, ScopeMode};
 use scu_client::{ConnectConfig, Event, ScuClient, ScuHandle};
 use scu_scope::{BinInterleave, Colormap, FrequencyAxis};
+use serde::{Deserialize, Serialize};
 
 use crate::theme::{self, ACCENT, FREQ_CYAN, ON_ACCENT, OUTLINE, RX_GREEN, SPECTRUM_GREEN, TEXT, TEXT_DIM, TEXT_FAINT, TX_RED};
 use crate::waterfall::Waterfall;
@@ -25,6 +26,36 @@ enum EngineMsg {
     Failed(String),
     Stopped,
 }
+
+/// UI preferences, persisted separately from the connection config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSettings {
+    /// RM indices (`MeterKind::from_rm_index`) shown in the side rail.
+    #[serde(default = "default_visible_meters")]
+    pub visible_meters: Vec<u8>,
+    #[serde(default = "default_true")]
+    pub show_cat_console: bool,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            visible_meters: default_visible_meters(),
+            show_cat_console: true,
+        }
+    }
+}
+
+fn default_visible_meters() -> Vec<u8> {
+    METER_INDICES.to_vec()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// RM meter indices offered by the FTDX10 (`RM3` ..= `RM9`).
+const METER_INDICES: [u8; 7] = [3, 4, 5, 6, 7, 8, 9];
 
 pub struct ScuApp {
     config: ConnectConfig,
@@ -85,6 +116,9 @@ pub struct ScuApp {
     mic_gain: f32,
     mic_status: String,
 
+    settings: AppSettings,
+    show_settings: bool,
+
     last_poll: Instant,
 }
 
@@ -101,6 +135,7 @@ impl ScuApp {
             freq_input_text(config_default_freq()),
             freq_input_text(config_default_freq()),
         ];
+        let settings = load_settings().unwrap_or_default();
         Self {
             config,
             handle: None,
@@ -152,6 +187,8 @@ impl ScuApp {
             mic_device: None,
             mic_gain: 1.0,
             mic_status: String::new(),
+            settings,
+            show_settings: false,
             last_poll: Instant::now(),
         }
     }
@@ -887,6 +924,14 @@ impl ScuApp {
                         self.connect(ctx);
                     }
 
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new("Settings")))
+                        .on_hover_text("Show meters and CAT console options")
+                        .clicked()
+                    {
+                        self.show_settings = !self.show_settings;
+                    }
+
                     ui.label(egui::RichText::new(&self.status).color(self.status_color()));
 
                     if let Some(radio) = self.radio {
@@ -1417,6 +1462,9 @@ impl ScuApp {
 
                         theme::section(ui, "Meters");
                         for index in 0..self.meters.len() {
+                            if !self.settings.visible_meters.contains(&(index as u8)) {
+                                continue;
+                            }
                             let Some(raw) = self.meters[index] else {
                                 continue;
                             };
@@ -1614,30 +1662,80 @@ impl ScuApp {
                             ui.label(egui::RichText::new(&self.mic_status).small().weak());
                         }
 
-                        theme::section(ui, "CAT Console");
-                        ui.horizontal(|ui| {
-                            let response = ui.add(
-                                egui::TextEdit::singleline(&mut self.cat_input)
-                                    .desired_width(190.0)
-                                    .hint_text("e.g. IF;"),
-                            );
-                            if ui.button("Send").clicked()
-                                || (response.lost_focus()
-                                    && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                            {
-                                self.send_cat_input();
-                            }
-                        });
-                        egui::ScrollArea::vertical()
-                            .max_height(140.0)
-                            .stick_to_bottom(true)
-                            .show(ui, |ui| {
-                                for line in &self.cat_log {
-                                    ui.label(egui::RichText::new(line).monospace().small());
+                        if self.settings.show_cat_console {
+                            theme::section(ui, "CAT Console");
+                            ui.horizontal(|ui| {
+                                let response = ui.add(
+                                    egui::TextEdit::singleline(&mut self.cat_input)
+                                        .desired_width(190.0)
+                                        .hint_text("e.g. IF;"),
+                                );
+                                if ui.button("Send").clicked()
+                                    || (response.lost_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                                {
+                                    self.send_cat_input();
                                 }
                             });
+                            egui::ScrollArea::vertical()
+                                .max_height(140.0)
+                                .stick_to_bottom(true)
+                                .show(ui, |ui| {
+                                    for line in &self.cat_log {
+                                        ui.label(egui::RichText::new(line).monospace().small());
+                                    }
+                                });
+                        }
                     });
             });
+    }
+
+    /// Floating settings page: meter visibility and CAT console toggle.
+    fn ui_settings(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+        let mut open = self.show_settings;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(260.0)
+            .show(ctx, |ui| {
+                theme::section(ui, "Meters");
+                ui.label(
+                    egui::RichText::new("Choose which meters appear in the side rail.")
+                        .small()
+                        .color(TEXT_FAINT),
+                );
+                for index in METER_INDICES {
+                    let kind = MeterKind::from_rm_index(index);
+                    let mut on = self.settings.visible_meters.contains(&index);
+                    if ui.checkbox(&mut on, kind.label()).changed() {
+                        if on {
+                            if !self.settings.visible_meters.contains(&index) {
+                                self.settings.visible_meters.push(index);
+                            }
+                        } else {
+                            self.settings.visible_meters.retain(|&i| i != index);
+                        }
+                        self.settings.visible_meters.sort_unstable();
+                        save_settings(&self.settings);
+                    }
+                }
+
+                theme::section(ui, "CAT Console");
+                let mut show = self.settings.show_cat_console;
+                if ui
+                    .checkbox(&mut show, "Show CAT console")
+                    .on_hover_text("Display the CAT command log and entry field in the side rail")
+                    .changed()
+                {
+                    self.settings.show_cat_console = show;
+                    save_settings(&self.settings);
+                }
+            });
+        self.show_settings = open;
     }
 
     fn ui_center(&mut self, root: &mut egui::Ui) {
@@ -1733,6 +1831,7 @@ impl eframe::App for ScuApp {
         self.ui_vfo(ui);
         self.ui_side(ui);
         self.ui_center(ui);
+        self.ui_settings(&ctx);
         ctx.request_repaint_after(Duration::from_millis(16));
     }
 }
@@ -1989,6 +2088,32 @@ fn save_config(config: &ConnectConfig) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn settings_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".config/scu-client/settings.toml"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_settings() -> Option<AppSettings> {
+    let path = settings_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    toml::from_str(&text).ok()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn save_settings(settings: &AppSettings) {
+    let Some(path) = settings_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(text) = toml::to_string_pretty(settings) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 const CONFIG_KEY: &str = "scu-client-config";
 
@@ -2010,6 +2135,30 @@ fn save_config(config: &ConnectConfig) {
     };
     if let Ok(text) = toml::to_string_pretty(config) {
         let _ = storage.set_item(CONFIG_KEY, &text);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+const SETTINGS_KEY: &str = "scu-client-settings";
+
+#[cfg(target_arch = "wasm32")]
+fn load_settings() -> Option<AppSettings> {
+    let window = web_sys::window()?;
+    let storage = window.local_storage().ok()??;
+    let text = storage.get_item(SETTINGS_KEY).ok()??;
+    toml::from_str(&text).ok()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn save_settings(settings: &AppSettings) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Ok(Some(storage)) = window.local_storage() else {
+        return;
+    };
+    if let Ok(text) = toml::to_string_pretty(settings) {
+        let _ = storage.set_item(SETTINGS_KEY, &text);
     }
 }
 
