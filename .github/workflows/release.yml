@@ -2,6 +2,8 @@ name: Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
@@ -94,10 +96,24 @@ jobs:
           Terminal=false
           EOF
 
-          # AppImage requires an icon; use a generated placeholder.
-          base64 -d > AppDir/scu-app.png <<'EOF'
-          iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAAE20lEQVR42u3UQQ3AIBQFQTT00GP9S6kIvJSkHkhIdg5rgM+8cd3PJ2lP451n50hSFL8BkML4DYAUxm8ApDB+AyCF8RsAKYzfAEhh/AZACuM3AFIYvwGQwvgNgBTGbwCkMH4DIIXxGwApjN8ASGH8BkAK4zcAUhi/AZDC+A2AFMZvAKQwfgMghfEbACmM3wBIYfwGQPBPAyDBbwAk+A2ABL8BkOA3ABL8BkCC3wBI8BsACX4DIMFvACT4DYAEvwGQ4DcAEvwGQILfAEjwGwAJ/mP6388nEvxN/AZA8IfxGwDBH8ZvAAR/GL8BEPxh/AZA8IfxGwDBH8ZvAAR/GL8BEPxh/AZA8IfxGwDBH8ZvAAR/GL8BEPxh/AZA8IfxGwDBH8ZvAAR/GL8BEPxh/AZA8IfxGwDBH8ZvAAR/GL8BEPxh/AZA8IfxGwDBH8ZvAAR/GL8BEPxh/AZA8IfxGwDBH8ZvAAR/GL8BEPxh/AZA8IfxGwDBH8ZvAAR/GL8BEPxh/AZA8IfxGwDBH8ZvAAR/GL8BEPxh/AZA8IfxGwDBH8ZvAAR/GL8BEPxh/AZA8IfxGwDBH8ZvAAR/GL8BEPxh/AZA8IfxGwDBH8ZvAARxGL8BgF9h/AYAfoXxGwD4FcZvAOBXGL8BgF9h/AYAfoXxGwD4FcZvAOBXGL8BgF9h/AYAfoXxGwD4FcZvAOBXGL8BgF9h/AYAfoXxGwD44a//HYDgh98ACH74DYDgh98ACH74DYDgh98ACH74DYDgh98ACH74DYDgh98ACH74DYDgh98ACH74DYDgh98ACH74DYDgh98ACH74DYDgh98ACH74DYDgh98ACH74DQD8gt8AwC/4DQD8gt8AwC/4DQD8gt8AwA+/DAD88MsAwA+/DAD88MsAwA+/DAD88MsAwA+/DAD88MsAwA+/DAD88MsAwA+/DAD88MsAwA+/DAD88BsAjwA//AZA8MNvAAQ//AZA8MNvAOAX/AYAfsFvAOAX/AYAfsFvAOAX/AYAfvk/BgB++GUA4IdfBgB++GUA4IdfBgB++GUA4IdfBgB++GUA4IdfBgB++GUA4IdfBgB++GUA4IdfBgB++GUA4IdfBgB++GUA4IdfBgB++GUA4Idf2QGAGH5FBwBi+BUdAIjhV3QAIIZf0QGAGH5FBwBi+BUdAIjhV3QAIIZf0QGAGH5FBwBi+BUdAIjhV3QAIIZf0QGAGH5FBwBi+BUdAIjhV3QAIIZf0QGAGH5FBwBi+BUdAIjhV3QAIIZf0QGAGH5FBwBi+BUdAIjhV3QAIIZf0QGAGH5FBwBi+BUdAIjhV3QAIIZf0QGAGH5FBwBi+BUdAIjhV3QAIIZf0QGAGH5FBwBi+BUdAIjhV3QAIIZf0QGAGH5FBwBi+BUdAIjhV3QAIIZf0QGAGH5FBwBi+BUdAIjhV3QAIIZf0QGAGH5FBwBi+BUdAIjhV3QAIIZfBkDwywAIfhkAwS8DIPhlAAS/DAD8kgGAXzIA8EsGAH7JAMAvGQD4JQMAv2QA4JcMAPySAYBfMgDwSwYAfskAwC8ZAPglAwC/ZADglwwA/JIBgF8yAPBLBgB+yQDALxkA+CUDAL8UHwDHlKID4JBSdAAcUYoOgANK0QFwPCk6AA4nRQfA0aToADiYFB0Ax5KiA+BQUnQAHEna1wJFy8YJHjNmMwAAAABJRU5ErkJggg==
-          EOF
+          # AppImage requires an icon; generate a placeholder PNG.
+          python3 - <<'PY'
+          import struct, zlib
+          W = H = 256
+          px = bytearray()
+          for y in range(H):
+              px.append(0)
+              for x in range(W):
+                  px += bytes((0, 200, 220, 255) if abs((x + y) - 255) < 40 else (18, 22, 30, 255))
+          def chunk(tag, data):
+              body = tag + data
+              return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xffffffff)
+          png = (b"\x89PNG\r\n\x1a\n"
+                 + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 6, 0, 0, 0))
+                 + chunk(b"IDAT", zlib.compress(bytes(px), 9))
+                 + chunk(b"IEND", b""))
+          open("AppDir/scu-app.png", "wb").write(png)
+          PY
 
           mkdir -p tools
           wget -q -O tools/linuxdeploy \
