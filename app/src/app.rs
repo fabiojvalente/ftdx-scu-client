@@ -1414,14 +1414,18 @@ impl ScuApp {
     /// is re-read afterwards (see [`Self::maybe_refresh_vfo`]).
     fn begin_vfo_switch(&mut self, sub: bool) {
         self.rx_sub = sub;
+        // The waterfall history belongs to the previous VFO's frequency; drop
+        // it so the display doesn't look stuck on the old centre.
+        self.waterfall.clear();
         self.vfo_switch_ignore_until = Some(Instant::now() + VFO_SWITCH_SETTLE);
         self.vfo_switch_refresh = true;
     }
 
     /// Once the settle window after a VFO switch closes, re-read the per-VFO
-    /// state. Modes are read for both VFOs (`MD0`/`MD1` each address one VFO),
-    /// so the radio is the source of truth for whichever mode each VFO holds
-    /// and no app-side mode memory or re-apply is needed.
+    /// state and re-assert the active frequency so the radio's native scope
+    /// recentres. Modes are read for both VFOs (`MD0`/`MD1` each address one
+    /// VFO), so the radio is the source of truth for whichever mode each VFO
+    /// holds and no app-side mode memory or re-apply is needed.
     fn maybe_refresh_vfo(&mut self) {
         if !self.vfo_switch_refresh {
             return;
@@ -1438,6 +1442,23 @@ impl ScuApp {
         if let Some(handle) = &self.handle {
             for command in ["MD0;", "MD1;", "SH0;", "SH1;", "IS0;", "IS1;", cf] {
                 handle.send_cat(command);
+            }
+            // The native scope follows a *tune*, not the CAT VFO select, so
+            // re-asserting the active VFO's frequency forces it to recentre.
+            let hz = self.active_frequency();
+            if hz != 0 {
+                let set = if self.rx_sub {
+                    scu_cat::set_frequency_b(hz)
+                } else {
+                    scu_cat::set_frequency(hz)
+                };
+                handle.send_cat(&set);
+            }
+            // Belt and braces: make sure the scope is back in CENTER/follow.
+            if self.follow_vfo {
+                if let Some(mode) = self.scope_mode {
+                    handle.send_cat(&scu_cat::set_scope_mode(mode.with_center().code()));
+                }
             }
         }
     }
