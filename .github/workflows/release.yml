@@ -23,15 +23,20 @@ jobs:
           - platform: linux-x86_64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            rustflags: ""
           - platform: macos-aarch64
             os: macos-latest
             target: aarch64-apple-darwin
+            rustflags: ""
           - platform: macos-x86_64
             os: macos-13
             target: x86_64-apple-darwin
+            rustflags: ""
           - platform: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
+            # Statically link the MSVC CRT so the .exe is self-contained.
+            rustflags: "-C target-feature=+crt-static"
 
     steps:
       - name: Checkout
@@ -42,12 +47,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
+            desktop-file-utils \
             libasound2-dev \
             libssl-dev \
             libxcb-render0-dev \
             libxcb-shape0-dev \
             libxcb-xfixes0-dev \
-            libxkbcommon-dev
+            libxkbcommon-dev \
+            patchelf
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -60,18 +67,97 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release --locked -p scu-app --target ${{ matrix.target }}
 
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      - name: Package AppImage (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          ARCH: x86_64
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME//\//-}"
+
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications dist
+          cp "target/${{ matrix.target }}/release/scu-app" AppDir/usr/bin/scu-app
+
+          cat > AppDir/usr/share/applications/scu-app.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=SCU-LAN10 Client
+          Exec=scu-app
+          Icon=scu-app
+          Categories=Network;HamRadio;
+          Terminal=false
+          EOF
+
+          # AppImage requires an icon; use a generated placeholder.
+          base64 -d > AppDir/scu-app.png <<'EOF'
+          iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAAE20lEQVR42u3UQQ3AIBQFQTT00GP9S6kIvJSkHkhIdg5rgM+8cd3PJ2lP451n50hSFL8BkML4DYAUxm8ApDB+AyCF8RsAKYzfAEhh/AZACuM3AFIYvwGQwvgNgBTGbwCkMH4DIIXxGwApjN8ASGH8BkAK4zcAUhi/AZDC+A2AFMZvAKQwfgMghfEbACmM3wBIYfwGQPBPAyDBbwAk+A2ABL8BkOA3ABL8BkCC3wBI8BsACX4DIMFvACT4DYAEvwGQ4DcAEvwGQILfAEjwGwAJ/mP6388nEvxN/AZA8IfxGwDBH8ZvAAR/GL8BEPxh/AZA8IfxGwDBH8ZvAAR/GL8BEPxh/AZA8IfxGwDBH8ZvAAR/GL8BEPxh/AZA8IfxGwDBH8ZvAAR/GL8BEPxh/AZA8IfxGwDBH8ZvAAR/GL8BEPxh/AZA8IfxGwDBH8ZvAAR/GL8BEPxh/AZA8IfxGwDBH8ZvAAR/GL8BEPxh/AZA8IfxGwDBH8ZvAAR/GL8BEPxh/AZA8IfxGwDBH8ZvAAR/GL8BEPxh/AZA8IfxGwDBH8ZvAAR/GL8BEPxh/AZA8IfxGwDBH8ZvAAR/GL8BEPxh/AZA8IfxGwDBH8ZvAARxGL8BgF9h/AYAfoXxGwD4FcZvAOBXGL8BgF9h/AYAfoXxGwD4FcZvAOBXGL8BgF9h/AYAfoXxGwD4FcZvAOBXGL8BgF9h/AYAfoXxGwD44a//HYDgh98ACH74DYDgh98ACH74DYDgh98ACH74DYDgh98ACH74DYDgh98ACH74DYDgh98ACH74DYDgh98ACH74DYDgh98ACH74DYDgh98ACH74DYDgh98ACH74DQD8gt8AwC/4DQD8gt8AwC/4DQD8gt8AwA+/DAD88MsAwA+/DAD88MsAwA+/DAD88MsAwA+/DAD88MsAwA+/DAD88MsAwA+/DAD88MsAwA+/DAD88BsAjwA//AZA8MNvAAQ//AZA8MNvAOAX/AYAfsFvAOAX/AYAfsFvAOAX/AYAfvk/BgB++GUA4IdfBgB++GUA4IdfBgB++GUA4IdfBgB++GUA4IdfBgB++GUA4IdfBgB++GUA4IdfBgB++GUA4IdfBgB++GUA4IdfBgB++GUA4Idf2QGAGH5FBwBi+BUdAIjhV3QAIIZf0QGAGH5FBwBi+BUdAIjhV3QAIIZf0QGAGH5FBwBi+BUdAIjhV3QAIIZf0QGAGH5FBwBi+BUdAIjhV3QAIIZf0QGAGH5FBwBi+BUdAIjhV3QAIIZf0QGAGH5FBwBi+BUdAIjhV3QAIIZf0QGAGH5FBwBi+BUdAIjhV3QAIIZf0QGAGH5FBwBi+BUdAIjhV3QAIIZf0QGAGH5FBwBi+BUdAIjhV3QAIIZf0QGAGH5FBwBi+BUdAIjhV3QAIIZf0QGAGH5FBwBi+BUdAIjhV3QAIIZf0QGAGH5FBwBi+BUdAIjhV3QAIIZfBkDwywAIfhkAwS8DIPhlAAS/DAD8kgGAXzIA8EsGAH7JAMAvGQD4JQMAv2QA4JcMAPySAYBfMgDwSwYAfskAwC8ZAPglAwC/ZADglwwA/JIBgF8yAPBLBgB+yQDALxkA+CUDAL8UHwDHlKID4JBSdAAcUYoOgANK0QFwPCk6AA4nRQfA0aToADiYFB0Ax5KiA+BQUnQAHEna1wJFy8YJHjNmMwAAAABJRU5ErkJggg==
+          EOF
+
+          mkdir -p tools
+          wget -q -O tools/linuxdeploy \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          wget -q -O tools/linuxdeploy-plugin-appimage \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage
+          chmod +x tools/linuxdeploy tools/linuxdeploy-plugin-appimage
+          export PATH="$PWD/tools:$PATH"
+
+          ./tools/linuxdeploy \
+            --appdir AppDir \
+            --desktop-file AppDir/usr/share/applications/scu-app.desktop \
+            --icon-file AppDir/scu-app.png \
+            --output appimage
+
+          APPIMAGE="$(find . -maxdepth 1 -name '*.AppImage' | head -n1)"
+          mv "$APPIMAGE" "dist/scu-app-${VERSION}-${{ matrix.platform }}.AppImage"
+
+      - name: Package .app bundle (macOS)
+        if: runner.os == 'macOS'
         shell: bash
         run: |
+          set -euo pipefail
           VERSION="${GITHUB_REF_NAME//\//-}"
-          mkdir -p dist
-          tar -czf "dist/scu-app-${VERSION}-${{ matrix.platform }}.tar.gz" \
-            -C "target/${{ matrix.target }}/release" scu-app
+          APP="SCU-LAN10 Client.app"
 
-      - name: Package (Windows)
+          mkdir -p "$APP/Contents/MacOS" dist
+          cp "target/${{ matrix.target }}/release/scu-app" "$APP/Contents/MacOS/scu-app"
+
+          cat > "$APP/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>SCU-LAN10 Client</string>
+            <key>CFBundleDisplayName</key>
+            <string>SCU-LAN10 Client</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.fabiojvalente.scu-app</string>
+            <key>CFBundleExecutable</key>
+            <string>scu-app</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${VERSION#v}</string>
+            <key>CFBundleVersion</key>
+            <string>${VERSION#v}</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>10.15</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+          ditto -c -k --sequesterRsrc --keepParent "$APP" \
+            "dist/scu-app-${VERSION}-${{ matrix.platform }}.zip"
+
+      - name: Package .exe (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
