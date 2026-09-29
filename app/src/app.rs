@@ -1462,22 +1462,6 @@ impl ScuApp {
         }
     }
 
-    fn swap_vfo(&mut self) {
-        std::mem::swap(&mut self.frequency, &mut self.frequency_b);
-        self.freq_input.swap(0, 1);
-        self.freq_editing.swap(0, 1);
-        // `SV` exchanges the whole VFO contents, mode and IF settings included.
-        self.mode.swap(0, 1);
-        self.if_width.swap(0, 1);
-        self.if_shift_hz.swap(0, 1);
-        // Ignore the radio's crossed swap frames, then re-read to confirm.
-        self.vfo_switch_ignore_until = Some(Instant::now() + VFO_SWITCH_SETTLE);
-        self.vfo_switch_refresh = true;
-        if let Some(handle) = &self.handle {
-            handle.send_cat(scu_cat::swap_vfo());
-        }
-    }
-
     fn copy_a_to_b(&mut self) {
         if let Some(handle) = &self.handle {
             handle.send_cat(scu_cat::copy_a_to_b());
@@ -1848,18 +1832,18 @@ impl ScuApp {
     }
 
     /// One VFO read-out pane, sized to the available width. Carries the VFO's
-    /// S-meter and the VFO swap/copy shortcuts.
+    /// S-meter and the VFO switch/copy shortcuts.
     fn pane_vfo(&mut self, ui: &mut egui::Ui, sub: bool) {
         let width = ui.available_width().max(180.0);
         self.vfo_card(ui, sub, width);
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(self.handle.is_some(), egui::Button::new("A<->B").small())
-                .on_hover_text("Swap VFO-A and VFO-B")
+                .add_enabled(self.handle.is_some(), egui::Button::new("A/B").small())
+                .on_hover_text("Switch the operating VFO (VFO-A / VFO-B)")
                 .clicked()
             {
-                self.swap_vfo();
+                self.select_rx_vfo(!self.rx_sub);
             }
             if ui
                 .add_enabled(self.handle.is_some(), egui::Button::new("A->B").small())
