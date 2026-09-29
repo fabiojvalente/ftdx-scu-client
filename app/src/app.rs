@@ -68,6 +68,7 @@ pub struct ScuApp {
 
     status: String,
     radio: Option<RadioModel>,
+    radio_power: Option<bool>,
     frequency: u64,
     frequency_b: u64,
     rx_sub: bool,
@@ -145,6 +146,7 @@ impl ScuApp {
             connecting: false,
             status: "disconnected".into(),
             radio: None,
+            radio_power: None,
             frequency: 0,
             frequency_b: 0,
             rx_sub: false,
@@ -313,9 +315,9 @@ impl ScuApp {
     fn initial_queries(&self) {
         if let Some(handle) = &self.handle {
             for cmd in [
-                "ID;", "FA;", "FB;", "FR;", "FT;", "ST;", "MD0;", "SM0;", "PC;", "MG;", "AC;",
-                "RT;", "XT;", "RC0;", "RC1;", "NB;", "NR;", "BC;", "NA0;", "GT0;", "RG0;", "SQ0;",
-                "AI1;", "SS05;", "SS06;",
+                "ID;", "FA;", "FB;", "FR;", "FT;", "ST;", "MD0;", "SM0;", "PS;", "PC;", "MG;",
+                "AC;", "RT;", "XT;", "RC0;", "RC1;", "NB;", "NR;", "BC;", "NA0;", "GT0;", "RG0;",
+                "SQ0;", "AI1;", "SS05;", "SS06;",
             ] {
                 handle.send_cat(cmd);
             }
@@ -489,6 +491,11 @@ impl ScuApp {
                     self.tx_power = watts.clamp(scu_cat::POWER_MIN_W, scu_cat::POWER_MAX_W);
                 }
             }
+            "PS" => {
+                if let Some(on) = scu_cat::parse_radio_power(text) {
+                    self.radio_power = Some(on);
+                }
+            }
             "MG" => {
                 if let Some(percent) = scu_cat::parse_mic_gain(text) {
                     self.radio_mic_gain = percent.min(scu_cat::MIC_GAIN_MAX);
@@ -643,6 +650,19 @@ impl ScuApp {
         self.rx_sub = sub;
         if let Some(handle) = &self.handle {
             handle.send_cat(scu_cat::select_rx_vfo(sub));
+        }
+    }
+
+    /// Power the transceiver up (`on = true`) or put it into standby.
+    ///
+    /// The SCU-LAN10 stays reachable while the radio is off, so this is the
+    /// only way to bring it up remotely.
+    fn set_radio_power(&mut self, on: bool) {
+        self.radio_power = Some(on);
+        let command = scu_cat::set_radio_power(on);
+        if let Some(handle) = &self.handle {
+            handle.send_cat(command);
+            self.push_log(format!("> {command}"));
         }
     }
 
@@ -1290,6 +1310,31 @@ impl ScuApp {
                             ui.label(egui::RichText::new(radio).color(TEXT_DIM));
                         });
 
+                        theme::section(ui, "Power");
+                        ui.horizontal(|ui| {
+                            let (state, color) = match self.radio_power {
+                                Some(true) => ("ON", RX_GREEN),
+                                Some(false) => ("STANDBY", TX_RED),
+                                None => ("UNKNOWN", TEXT_DIM),
+                            };
+                            ui.label(egui::RichText::new(state).strong().color(color));
+                            let action = if self.radio_power == Some(true) {
+                                "Power off"
+                            } else {
+                                "Power on"
+                            };
+                            if ui
+                                .add_enabled(self.connected(), egui::Button::new(action))
+                                .on_hover_text(
+                                    "The SCU-LAN10 stays reachable while the radio is in \
+                                     standby; use this to power it on or off remotely.",
+                                )
+                                .clicked()
+                            {
+                                self.set_radio_power(self.radio_power != Some(true));
+                            }
+                        });
+
                         theme::section(ui, "VFO");
                         ui.horizontal(|ui| {
                             ui.label("Receive");
@@ -1778,6 +1823,8 @@ impl ScuApp {
             axis.hz_at(t)
         };
 
+        let shift = response.ctx.input(|i| i.modifiers.shift);
+
         if let Some(pos) = response.hover_pos() {
             let stroke = egui::Stroke::new(1.0, TEXT_DIM);
             painter.line_segment(
@@ -1787,29 +1834,42 @@ impl ScuApp {
                 ],
                 stroke,
             );
+            // With shift held the readout previews the nearest kHz, matching
+            // what a shift-click will tune to.
+            let label = if shift {
+                format!("{} (1 kHz)", format_hz_label(snap_hz(hz_at(pos.x), 1_000) as f64))
+            } else {
+                format_hz_label(hz_at(pos.x))
+            };
             painter.text(
-                egui::pos2((pos.x + 4.0).min(rect.right() - 70.0), rect.top() + 3.0),
+                egui::pos2((pos.x + 4.0).min(rect.right() - 140.0), rect.top() + 3.0),
                 egui::Align2::LEFT_TOP,
-                format_hz_label(hz_at(pos.x)),
+                label,
                 egui::FontId::monospace(12.0),
                 theme::WARN_AMBER,
             );
         }
 
+        response.clone().on_hover_text(
+            "Click to tune • Shift-click to snap to the nearest kHz • Scroll the VFO to step",
+        );
+
         if response.clicked() {
             if let Some(pos) = response.interact_pointer_pos() {
                 let hz = hz_at(pos.x);
-                self.tune_to_hz(hz);
+                self.tune_to_hz(hz, shift);
             }
         }
     }
 
-    fn tune_to_hz(&mut self, hz: f64) {
+    fn tune_to_hz(&mut self, hz: f64, snap_khz: bool) {
         if hz <= 0.0 {
             return;
         }
-        // Round to the nearest 10 Hz; the scope bin resolution is coarser than that.
-        let hz = (hz / 10.0).round() as u64 * 10;
+        // A plain click keeps 10 Hz resolution (the scope bin resolution is
+        // coarser than that); shift-click snaps to a whole kHz.
+        let step = if snap_khz { 1_000 } else { 10 };
+        let hz = snap_hz(hz, step);
         if hz == self.active_frequency() {
             return;
         }
@@ -2050,12 +2110,15 @@ fn scroll_steps(ui: &egui::Ui) -> i64 {
     })
 }
 
+/// Round a frequency to the nearest multiple of `step` Hz.
+fn snap_hz(hz: f64, step: u64) -> u64 {
+    (hz / step as f64).round().max(0.0) as u64 * step
+}
+
+/// Full-frequency readout (`MHz.kHz.Hz`, e.g. `14.270.005`), so the scope shows
+/// the exact Hz the radio will tune to rather than a rounded MHz value.
 fn format_hz_label(hz: f64) -> String {
-    if hz >= 1_000_000.0 {
-        format!("{:.4}", hz / 1_000_000.0)
-    } else {
-        format!("{:.1}", hz / 1_000.0)
-    }
+    scu_cat::format_hz(snap_hz(hz, 1))
 }
 
 fn config_default_freq() -> u64 {
@@ -2165,6 +2228,22 @@ fn save_settings(settings: &AppSettings) {
 #[cfg(test)]
 mod tests {
     use super::parse_frequency_text as parse;
+    use super::{format_hz_label, snap_hz};
+
+    #[test]
+    fn snap_hz_rounds_to_step() {
+        assert_eq!(snap_hz(14_270_005.4, 1_000), 14_270_000);
+        assert_eq!(snap_hz(14_270_540.0, 1_000), 14_271_000);
+        assert_eq!(snap_hz(14_270_004.9, 10), 14_270_000);
+        assert_eq!(snap_hz(-5.0, 10), 0);
+    }
+
+    #[test]
+    fn hz_label_shows_full_frequency() {
+        assert_eq!(format_hz_label(14_270_004.6), "14.270.005");
+        assert_eq!(format_hz_label(7_074_000.0), "7.074.000");
+        assert_eq!(format_hz_label(531_000.0), "0.531.000");
+    }
 
     #[test]
     fn dotted_triplet_reads_as_hz() {

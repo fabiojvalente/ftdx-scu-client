@@ -55,6 +55,16 @@ one multiplexed WebSocket through `scu-bridge`.
 
 Requires a recent stable Rust toolchain.
 
+A `Makefile` wraps the common tasks (run `make` to list them):
+
+```sh
+make run        # build and run the native desktop app
+make web        # build the browser (WebAssembly) bundle into app/dist/
+make serve      # build the web bundle and serve it on :8080
+make bridge     # run the WebSocket <-> UDP bridge the browser build needs
+make test       # run the workspace test suite
+```
+
 ### Native desktop app
 
 ```sh

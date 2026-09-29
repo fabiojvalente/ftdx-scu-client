@@ -1046,6 +1046,36 @@ pub fn parse_transmit(frame: &str) -> Option<bool> {
     }
 }
 
+/// Build a "radio power switch" command (`PS`): `PS1;` on, `PS0;` off.
+///
+/// The SCU-LAN10 stays reachable while the transceiver is powered down, so
+/// this can be used to bring the radio up (or put it into standby) remotely.
+pub fn set_radio_power(on: bool) -> &'static str {
+    if on {
+        "PS1;"
+    } else {
+        "PS0;"
+    }
+}
+
+/// Build a "read radio power state" command (`PS;`).
+pub fn read_radio_power() -> &'static str {
+    "PS;"
+}
+
+/// Parse the radio power state from a `PS` response (`PS0;` = off, `PS1;` = on).
+pub fn parse_radio_power(frame: &str) -> Option<bool> {
+    let parsed = split(frame)?;
+    if parsed.command != "PS" {
+        return None;
+    }
+    match parsed.payload.chars().next()? {
+        '0' => Some(false),
+        '1' => Some(true),
+        _ => None,
+    }
+}
+
 /// Parse the mode from an `MD0` response.
 pub fn parse_mode(frame: &str) -> Option<Mode> {
     let parsed = split(frame)?;
@@ -1109,6 +1139,17 @@ mod tests {
         assert_eq!(parse_power("PC100;"), Some(100));
         assert_eq!(parse_power("PC;"), None);
         assert_eq!(parse_power("FA;"), None);
+    }
+
+    #[test]
+    fn build_and_parse_radio_power() {
+        assert_eq!(read_radio_power(), "PS;");
+        assert_eq!(set_radio_power(true), "PS1;");
+        assert_eq!(set_radio_power(false), "PS0;");
+        assert_eq!(parse_radio_power("PS1;"), Some(true));
+        assert_eq!(parse_radio_power("PS0;"), Some(false));
+        assert_eq!(parse_radio_power("PS;"), None);
+        assert_eq!(parse_radio_power("PC050;"), None);
     }
 
     #[test]
