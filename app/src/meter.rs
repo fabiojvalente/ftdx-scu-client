@@ -45,23 +45,23 @@ pub struct Scale {
 
 static S_TICKS: &[Tick] = &[
     Tick {
-        frac: 0.051,
+        frac: 0.016,
         label: "S1",
     },
     Tick {
-        frac: 0.149,
+        frac: 0.118,
         label: "S3",
     },
     Tick {
-        frac: 0.251,
+        frac: 0.255,
         label: "S5",
     },
     Tick {
-        frac: 0.357,
+        frac: 0.373,
         label: "S7",
     },
     Tick {
-        frac: 0.510,
+        frac: 0.514,
         label: "S9",
     },
     Tick {
@@ -69,7 +69,7 @@ static S_TICKS: &[Tick] = &[
         label: "+20",
     },
     Tick {
-        frac: 0.812,
+        frac: 0.835,
         label: "+40",
     },
     Tick {
@@ -77,7 +77,7 @@ static S_TICKS: &[Tick] = &[
         label: "+60",
     },
 ];
-static S_ZONES: &[(f32, Zone)] = &[(0.510, Zone::Good), (0.812, Zone::Warn), (1.0, Zone::Bad)];
+static S_ZONES: &[(f32, Zone)] = &[(0.514, Zone::Good), (0.835, Zone::Warn), (1.0, Zone::Bad)];
 
 static COMP_TICKS: &[Tick] = &[
     Tick {
@@ -173,23 +173,23 @@ static ID_TICKS: &[Tick] = &[
         label: "0",
     },
     Tick {
-        frac: 0.196,
+        frac: 0.2,
         label: "5",
     },
     Tick {
-        frac: 0.392,
+        frac: 0.4,
         label: "10",
     },
     Tick {
-        frac: 0.588,
+        frac: 0.6,
         label: "15",
     },
     Tick {
-        frac: 0.784,
+        frac: 0.8,
         label: "20",
     },
     Tick {
-        frac: 0.980,
+        frac: 1.0,
         label: "25",
     },
 ];
@@ -199,19 +199,45 @@ static VDD_TICKS: &[Tick] = &[
         label: "0",
     },
     Tick {
-        frac: 0.278,
-        label: "5",
+        frac: 0.25,
+        label: "4",
     },
     Tick {
-        frac: 0.556,
-        label: "10",
+        frac: 0.5,
+        label: "8",
     },
     Tick {
-        frac: 0.833,
-        label: "15",
+        frac: 0.75,
+        label: "12",
+    },
+    Tick {
+        frac: 1.0,
+        label: "16",
     },
 ];
 static TEMP_TICKS: &[Tick] = &[
+    Tick {
+        frac: 0.0,
+        label: "0",
+    },
+    Tick {
+        frac: 0.25,
+        label: "25",
+    },
+    Tick {
+        frac: 0.5,
+        label: "50",
+    },
+    Tick {
+        frac: 0.75,
+        label: "75",
+    },
+    Tick {
+        frac: 1.0,
+        label: "100",
+    },
+];
+static GENERIC_TICKS: &[Tick] = &[
     Tick {
         frac: 0.0,
         label: "",
@@ -281,7 +307,7 @@ static TEMP_SCALE: Scale = Scale {
     minor_divisions: 10,
 };
 static GENERIC_SCALE: Scale = Scale {
-    ticks: TEMP_TICKS,
+    ticks: GENERIC_TICKS,
     zones: ALL_GOOD,
     minor_divisions: 10,
 };

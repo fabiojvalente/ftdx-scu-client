@@ -987,8 +987,14 @@ pub fn parse_smeter(frame: &str) -> Option<u8> {
     Some(value.min(255) as u8)
 }
 
-/// Parse a meter reading from an `RM` unsolicited response.
+/// Parse a meter reading from an `RM` response.
 /// Returns `(meter_index, value)`.
+///
+/// The FTdx10/FTdx101 answer `RMP1LLLRRR;` — the meter index followed by *two*
+/// 3-digit slots (left/right). Only the left slot is meaningful for a direct
+/// read, so the first three digits are taken; older rigs answer a single
+/// `RMP1LLL;`, which parses identically. Concatenating both slots (the bug this
+/// fixes) overflowed the 0-255 range and pinned every meter to full scale.
 pub fn parse_meter(frame: &str) -> Option<(u8, u32)> {
     let parsed = split(frame)?;
     if parsed.command != "RM" {
@@ -996,7 +1002,8 @@ pub fn parse_meter(frame: &str) -> Option<(u8, u32)> {
     }
     let mut chars = parsed.payload.chars();
     let index = chars.next()?.to_digit(10)? as u8;
-    let value: u32 = chars.as_str().parse().ok()?;
+    let digits: String = chars.as_str().chars().take(3).collect();
+    let value: u32 = digits.parse().ok()?;
     Some((index, value))
 }
 
@@ -1041,43 +1048,75 @@ fn interp(points: &[(u8, f64)], raw: u8) -> f64 {
     points.last().map(|p| p.1).unwrap_or(raw)
 }
 
-/// S-meter raw → dB relative to S9 (Yaesu default, W6HN data).
-const S_CAL: [(u8, f64); 11] = [
+/// S-meter raw → dB relative to S9. Measured on an FTdx10 and shipped as the
+/// per-model default in Yaesu Web Control (`calibration.default.FTdx10.json`):
+/// S0=0, S1=4, S3=30, S5=65, S7=95, S9=131, +20=171, +40=213, +60=255.
+const S_CAL: [(u8, f64); 9] = [
     (0, -54.0),
-    (26, -42.0),
-    (51, -30.0),
-    (81, -18.0),
-    (105, -9.0),
-    (130, 0.0),
-    (157, 12.0),
-    (186, 25.0),
-    (203, 35.0),
-    (237, 50.0),
+    (4, -48.0),
+    (30, -36.0),
+    (65, -24.0),
+    (95, -12.0),
+    (131, 0.0),
+    (171, 20.0),
+    (213, 40.0),
     (255, 60.0),
 ];
-const SWR_CAL: [(u8, f64); 5] = [(12, 1.0), (39, 1.35), (65, 1.5), (89, 2.0), (242, 5.0)];
-const COMP_CAL: [(u8, f64); 9] = [
-    (0, 0.0),
-    (40, 2.5),
-    (60, 5.0),
-    (85, 7.5),
-    (135, 10.0),
-    (150, 12.5),
-    (175, 15.0),
-    (195, 17.5),
-    (220, 20.0),
+/// SWR raw → ratio (Yaesu Web Control FTdx10 default).
+const SWR_CAL: [(u8, f64); 6] = [
+    (0, 1.0),
+    (51, 1.5),
+    (77, 2.0),
+    (128, 3.0),
+    (173, 5.0),
+    (242, 9.9),
 ];
-const ID_CAL: [(u8, f64); 3] = [(0, 0.0), (100, 10.0), (255, 25.5)];
-const VDD_CAL: [(u8, f64); 3] = [(0, 0.0), (196, 13.8), (255, 17.95)];
-/// FTDX10 RF power output (flrig). Max 100 W.
-const POWER_CAL: [(u8, f64); 6] = [
+/// Speech-compression raw → dB (Yaesu Web Control FTdx10 default).
+const COMP_CAL: [(u8, f64); 5] = [(0, 0.0), (56, 5.0), (102, 10.0), (140, 15.0), (204, 20.0)];
+/// Final-amp drain current raw → amps (Yaesu Web Control FTdx10 default).
+const ID_CAL: [(u8, f64); 6] = [
     (0, 0.0),
-    (35, 5.0),
-    (94, 25.0),
-    (147, 50.0),
-    (176, 75.0),
-    (205, 100.0),
+    (51, 5.0),
+    (102, 10.0),
+    (153, 15.0),
+    (204, 20.0),
+    (242, 25.0),
 ];
+/// Final-amp supply voltage raw → volts. The 13.8 V radios (FTdx10/FTdx101D)
+/// read 10–16 V; the FTdx101MP's 50 V final uses a different scale.
+const VDD_CAL: [(u8, f64); 8] = [
+    (0, 0.0),
+    (170, 11.0),
+    (182, 12.1),
+    (194, 13.2),
+    (206, 14.1),
+    (218, 14.9),
+    (235, 15.2),
+    (255, 16.0),
+];
+/// PA temperature raw → °C (Yaesu Web Control `TPA`).
+const TEMP_CAL: [(u8, f64); 7] = [
+    (0, -6.0),
+    (14, 0.0),
+    (60, 20.0),
+    (106, 40.0),
+    (152, 60.0),
+    (198, 80.0),
+    (244, 100.0),
+];
+/// RF power output raw → watts (Yaesu Web Control FTdx10 default). The FTdx10
+/// is a 100 W radio, so the table is capped there even though the upstream
+/// table continues to the FTdx101MP's 200 W.
+const POWER_CAL: [(u8, f64); 5] = [(0, 0.0), (30, 5.0), (76, 25.0), (112, 50.0), (157, 100.0)];
+
+/// Full-scale values used to normalise each bar to 0.0..=1.0.
+const POWER_FULL_W: f64 = 100.0;
+const COMP_FULL_DB: f64 = 20.0;
+const SWR_MIN: f64 = 1.0;
+const SWR_FULL_SPAN: f64 = 4.0;
+const ID_FULL_A: f64 = 25.0;
+const VDD_FULL_V: f64 = 16.0;
+const TEMP_FULL_C: f64 = 100.0;
 
 impl MeterKind {
     /// Map an `RM` P1 index to a meter.
@@ -1120,13 +1159,20 @@ impl MeterKind {
                     format!("S9+{db:.0}dB")
                 }
             }
-            MeterKind::Comp => format!("{:.1} dB", interp(&COMP_CAL, raw)),
+            MeterKind::Comp => {
+                format!("{:.1} dB", interp(&COMP_CAL, raw).clamp(0.0, COMP_FULL_DB))
+            }
             MeterKind::Alc => format!("{:.0} %", raw as f32 / 2.55),
-            MeterKind::Power => format!("{:.0} W", interp(&POWER_CAL, raw)),
-            MeterKind::Swr => format!("{:.1}", interp(&SWR_CAL, raw)),
-            MeterKind::Id => format!("{:.1} A", interp(&ID_CAL, raw)),
-            MeterKind::Vdd => format!("{:.1} V", interp(&VDD_CAL, raw)),
-            MeterKind::Temp | MeterKind::Unknown(_) => format!("{raw}"),
+            MeterKind::Power => {
+                format!("{:.0} W", interp(&POWER_CAL, raw).clamp(0.0, POWER_FULL_W))
+            }
+            MeterKind::Swr => format!("{:.1}", interp(&SWR_CAL, raw).clamp(SWR_MIN, 10.0)),
+            MeterKind::Id => format!("{:.1} A", interp(&ID_CAL, raw).clamp(0.0, ID_FULL_A)),
+            MeterKind::Vdd => format!("{:.1} V", interp(&VDD_CAL, raw).clamp(0.0, VDD_FULL_V)),
+            MeterKind::Temp => {
+                format!("{:.0} °C", interp(&TEMP_CAL, raw).clamp(0.0, TEMP_FULL_C))
+            }
+            MeterKind::Unknown(_) => format!("{raw}"),
         }
     }
 
@@ -1134,13 +1180,14 @@ impl MeterKind {
     pub fn fraction(&self, raw: u8) -> f32 {
         let value = match self {
             MeterKind::S => raw as f64 / 255.0,
-            MeterKind::Comp => interp(&COMP_CAL, raw) / 20.0,
+            MeterKind::Comp => interp(&COMP_CAL, raw) / COMP_FULL_DB,
             MeterKind::Alc => raw as f64 / 255.0,
-            MeterKind::Power => interp(&POWER_CAL, raw) / 100.0,
-            MeterKind::Swr => (interp(&SWR_CAL, raw) - 1.0) / 4.0,
-            MeterKind::Id => interp(&ID_CAL, raw) / 25.5,
-            MeterKind::Vdd => interp(&VDD_CAL, raw) / 18.0,
-            MeterKind::Temp | MeterKind::Unknown(_) => raw as f64 / 255.0,
+            MeterKind::Power => interp(&POWER_CAL, raw) / POWER_FULL_W,
+            MeterKind::Swr => (interp(&SWR_CAL, raw) - SWR_MIN) / SWR_FULL_SPAN,
+            MeterKind::Id => interp(&ID_CAL, raw) / ID_FULL_A,
+            MeterKind::Vdd => interp(&VDD_CAL, raw) / VDD_FULL_V,
+            MeterKind::Temp => interp(&TEMP_CAL, raw) / TEMP_FULL_C,
+            MeterKind::Unknown(_) => raw as f64 / 255.0,
         };
         value.clamp(0.0, 1.0) as f32
     }
@@ -1590,6 +1637,10 @@ mod tests {
         assert_eq!(parse_smeter("SM0123;"), Some(123));
         assert_eq!(parse_meter("RM1123;"), Some((1, 123)));
         assert_eq!(parse_meter("SM0123;"), None);
+        // FTdx10 answers two 3-digit slots; only the left one is the reading.
+        assert_eq!(parse_meter("RM5072000;"), Some((5, 72)));
+        assert_eq!(parse_meter("RM8206000;"), Some((8, 206)));
+        assert_eq!(parse_meter_kind("RM8206000;"), Some((MeterKind::Vdd, 206)));
     }
 
     #[test]
@@ -1707,21 +1758,28 @@ mod tests {
     #[test]
     fn smeter_true_scale() {
         assert_eq!(MeterKind::S.format(0), "S0");
-        assert_eq!(MeterKind::S.format(51), "S4");
-        assert_eq!(MeterKind::S.format(81), "S6");
-        assert_eq!(MeterKind::S.format(130), "S9");
-        assert_eq!(MeterKind::S.format(157), "S9+12dB");
+        assert_eq!(MeterKind::S.format(4), "S1");
+        assert_eq!(MeterKind::S.format(30), "S3");
+        assert_eq!(MeterKind::S.format(65), "S5");
+        assert_eq!(MeterKind::S.format(95), "S7");
+        assert_eq!(MeterKind::S.format(131), "S9");
+        assert_eq!(MeterKind::S.format(171), "S9+20dB");
+        assert_eq!(MeterKind::S.format(213), "S9+40dB");
         assert_eq!(MeterKind::S.format(255), "S9+60dB");
     }
 
     #[test]
     fn other_meter_true_scales() {
+        assert_eq!(MeterKind::Power.format(112), "50 W");
+        assert_eq!(MeterKind::Power.format(157), "100 W");
+        // Capped at the FTdx10's 100 W even though the raw table runs higher.
         assert_eq!(MeterKind::Power.format(205), "100 W");
-        assert!(MeterKind::Power.format(147).starts_with("50"));
-        assert_eq!(MeterKind::Swr.format(12), "1.0");
-        assert_eq!(MeterKind::Swr.format(242), "5.0");
-        assert_eq!(MeterKind::Vdd.format(196), "13.8 V");
-        assert_eq!(MeterKind::Id.format(100), "10.0 A");
+        assert_eq!(MeterKind::Swr.format(0), "1.0");
+        assert_eq!(MeterKind::Swr.format(242), "9.9");
+        assert_eq!(MeterKind::Vdd.format(206), "14.1 V");
+        assert_eq!(MeterKind::Id.format(51), "5.0 A");
+        assert_eq!(MeterKind::Comp.format(204), "20.0 dB");
+        assert_eq!(MeterKind::Temp.format(106), "40 °C");
         assert_eq!(MeterKind::Alc.format(255), "100 %");
     }
 

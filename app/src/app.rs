@@ -319,6 +319,8 @@ pub struct ScuApp {
     /// Operating mode per VFO (0 = A/Main, 1 = B/Sub).
     mode: [Option<Mode>; 2],
     smeter: u8,
+    /// Transmit state last reported by the radio's `TX;` poll.
+    radio_tx: bool,
     meters: [Option<u8>; 10],
     /// Peak-hold state per meter index: the held fraction and the wall-clock
     /// time (egui seconds) it was last exceeded.
@@ -483,6 +485,7 @@ impl ScuApp {
             squelch: 0,
             mode: [None, None],
             smeter: 0,
+            radio_tx: false,
             meters: [None; 10],
             meter_peak: [0.0; 10],
             meter_peak_at: [0.0; 10],
@@ -1148,6 +1151,7 @@ impl ScuApp {
             Event::Disconnected(reason) => {
                 self.status = format!("disconnected: {reason}");
                 self.handle = None;
+                self.radio_tx = false;
                 self.stop_tx();
                 self.sync_cat_server();
             }
@@ -1297,6 +1301,11 @@ impl ScuApp {
             "AC" => {
                 if let Some(on) = scu_cat::parse_atu(text) {
                     self.atu_on = on;
+                }
+            }
+            "TX" => {
+                if let Some(on) = scu_cat::parse_transmit(text) {
+                    self.radio_tx = on;
                 }
             }
             "SM" => {
@@ -2650,6 +2659,18 @@ impl ScuApp {
                 continue;
             };
             let kind = MeterKind::from_rm_index(index as u8);
+            // Meters that only mean something while keyed read zero during
+            // receive, matching the radio's front panel. IDD, VDD and the PA
+            // temperature stay live (the final-amp bias/current is valid on RX).
+            let tx_only = matches!(
+                kind,
+                MeterKind::Comp | MeterKind::Alc | MeterKind::Power | MeterKind::Swr
+            );
+            let raw = if tx_only && !(self.tx_keyed() || self.radio_tx) {
+                0
+            } else {
+                raw
+            };
             let frac = kind.fraction(raw);
 
             // Peak-hold: latch the high-water mark, hold it briefly, then let
