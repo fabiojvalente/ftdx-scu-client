@@ -219,6 +219,13 @@ const METER_INDICES: [u8; 7] = [3, 4, 5, 6, 7, 8, 9];
 /// The radio broadcasts crossed pre/post-switch values during this window.
 const VFO_SWITCH_SETTLE: Duration = Duration::from_millis(300);
 
+/// On-screen width, in pixels, at which the passband indicator turns green.
+/// Below this it is drawn amber, echoing kiwisdr's "zoomed in enough" cue.
+const PASSBAND_GREEN_MIN_PX: f32 = 40.0;
+
+/// Height of the frequency ribbon drawn above the waterfall, in pixels.
+const SCALE_BAR_H: f32 = 34.0;
+
 /// Console log verbosity, applied live to the tracing subscriber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum LogLevel {
@@ -1477,6 +1484,18 @@ impl ScuApp {
         self.if_shift_hz[self.rx_sub as usize]
     }
 
+    /// Audio passband `(low_hz, high_hz)` of the active VFO relative to its
+    /// carrier, or `None` when the mode has no IF filter.
+    fn active_passband_hz(&self) -> Option<(i32, i32)> {
+        let model = self.radio.unwrap_or(RadioModel::Ftdx10);
+        scu_cat::if_passband_hz(
+            model,
+            self.active_mode()?,
+            self.active_if_width(),
+            self.active_if_shift_hz(),
+        )
+    }
+
     /// Frequency of the VFO currently selected for receive.
     fn active_frequency(&self) -> u64 {
         if self.rx_sub {
@@ -1740,33 +1759,111 @@ impl ScuApp {
         ));
     }
 
-    fn paint_frequency_axis(&self, painter: &egui::Painter, rect: egui::Rect) {
-        if self.active_frequency() == 0 {
+    /// Frequency ribbon drawn above the waterfall in the style of kiwisdr: a
+    /// solid bar carrying tick marks and frequency labels, with the passband
+    /// bracket across its top and the carrier marked by a line spanning the
+    /// whole pane.
+    fn paint_frequency_scale(
+        &self,
+        painter: &egui::Painter,
+        scale_rect: egui::Rect,
+        full_rect: egui::Rect,
+    ) {
+        painter.rect_filled(scale_rect, 0.0, theme::card_bg());
+        painter.line_segment(
+            [
+                egui::pos2(scale_rect.left(), scale_rect.bottom()),
+                egui::pos2(scale_rect.right(), scale_rect.bottom()),
+            ],
+            egui::Stroke::new(1.0, theme::outline()),
+        );
+
+        if self.active_frequency() == 0 || self.span_hz <= 0.0 {
             return;
         }
+
         let axis = self.axis();
-        let color = theme::text();
-        let font = egui::FontId::monospace(11.0);
-        for (t, align) in [
-            (0.0, egui::Align2::LEFT_BOTTOM),
-            (0.5, egui::Align2::CENTER_BOTTOM),
-            (1.0, egui::Align2::RIGHT_BOTTOM),
-        ] {
-            let hz = axis.hz_at(t);
-            let label = format_hz_label(hz);
-            let x = rect.left() + rect.width() * t as f32;
-            let pos = egui::pos2(x, rect.bottom() - 2.0);
-            painter.text(pos, align, label, font.clone(), color);
+        let span = self.span_hz;
+        let left_hz = axis.hz_at(0.0);
+        let right_hz = axis.hz_at(1.0);
+
+        let target = (scale_rect.width() / 100.0).max(2.0) as f64;
+        let step = nice_step(span / target);
+        let first = (left_hz / step).ceil() * step;
+        let font = egui::FontId::monospace(10.0);
+        let tick = egui::Stroke::new(1.0, theme::text_faint());
+
+        let mut hz = first;
+        let mut guard = 0;
+        while hz <= right_hz + step * 1e-3 && guard < 128 {
+            let x = scale_rect.left() + scale_rect.width() * ((hz - left_hz) / span) as f32;
+            painter.line_segment(
+                [
+                    egui::pos2(x, scale_rect.top() + 14.0),
+                    egui::pos2(x, scale_rect.top() + 19.0),
+                ],
+                tick,
+            );
+            painter.text(
+                egui::pos2(x, scale_rect.bottom() - 2.0),
+                egui::Align2::CENTER_BOTTOM,
+                format_hz_label(hz),
+                font.clone(),
+                theme::text(),
+            );
+            hz += step;
+            guard += 1;
         }
 
-        // Center-tuned marker.
+        self.paint_passband(painter, scale_rect);
+
+        // Center-tuned (carrier) marker through the whole pane.
         let center = egui::Stroke::new(1.0, theme::warn_amber());
         painter.line_segment(
             [
-                egui::pos2(rect.center().x, rect.top()),
-                egui::pos2(rect.center().x, rect.bottom()),
+                egui::pos2(full_rect.center().x, full_rect.top()),
+                egui::pos2(full_rect.center().x, full_rect.bottom()),
             ],
             center,
+        );
+    }
+
+    /// Passband bracket drawn across the top of the frequency ribbon, spanning
+    /// the audio frequencies the IF filter passes with the carrier at the pane
+    /// centre. Amber while too narrow to resolve, green once zoomed in past
+    /// [`PASSBAND_GREEN_MIN_PX`], echoing kiwisdr.
+    fn paint_passband(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let Some((low_hz, high_hz)) = self.active_passband_hz() else {
+            return;
+        };
+        if self.active_frequency() == 0 || self.span_hz <= 0.0 {
+            return;
+        }
+        let x_for = |hz: i32| rect.left() + rect.width() * (0.5 + hz as f64 / self.span_hz) as f32;
+        let raw_left = x_for(low_hz);
+        let raw_right = x_for(high_hz);
+        if raw_right < rect.left() || raw_left > rect.right() {
+            return;
+        }
+        let left = raw_left.max(rect.left());
+        let right = raw_right.min(rect.right());
+
+        let color = if right - left >= PASSBAND_GREEN_MIN_PX {
+            theme::spectrum_green()
+        } else {
+            theme::warn_amber()
+        };
+        let y = rect.top() + 7.0;
+        let cap = 5.0;
+        let stroke = egui::Stroke::new(1.5, color);
+        painter.line_segment([egui::pos2(left, y), egui::pos2(right, y)], stroke);
+        painter.line_segment(
+            [egui::pos2(left, y - cap), egui::pos2(left, y + cap)],
+            stroke,
+        );
+        painter.line_segment(
+            [egui::pos2(right, y - cap), egui::pos2(right, y + cap)],
+            stroke,
         );
     }
 
@@ -1982,15 +2079,22 @@ impl ScuApp {
         self.tune_interaction(&response, &painter, response.rect);
     }
 
-    /// Waterfall pane: scrolling texture plus the frequency axis.
+    /// Waterfall pane: frequency ribbon on top, scrolling texture below.
     fn pane_waterfall(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.waterfall.update_texture(&ctx);
         let size = egui::Vec2::new(ui.available_width(), ui.available_height().max(80.0));
         let (response, painter) = ui.allocate_painter(size, egui::Sense::click());
-        self.waterfall.paint(&painter, response.rect);
-        self.paint_frequency_axis(&painter, response.rect);
-        self.tune_interaction(&response, &painter, response.rect);
+        let full = response.rect;
+        let scale_h = SCALE_BAR_H.min(full.height() * 0.5);
+        let scale_rect =
+            egui::Rect::from_min_max(full.min, egui::pos2(full.right(), full.top() + scale_h));
+        let plot_rect =
+            egui::Rect::from_min_max(egui::pos2(full.left(), full.top() + scale_h), full.max);
+
+        self.waterfall.paint(&painter, plot_rect);
+        self.paint_frequency_scale(&painter, scale_rect, full);
+        self.tune_interaction(&response, &painter, plot_rect);
     }
 
     /// Tab title for a pane, with live VFO state for the VFO panes.
@@ -4379,6 +4483,25 @@ fn snap_hz(hz: f64, step: u64) -> u64 {
 /// the exact Hz the radio will tune to rather than a rounded MHz value.
 fn format_hz_label(hz: f64) -> String {
     scu_cat::format_hz(snap_hz(hz, 1))
+}
+
+/// Round `raw` up to the next 1 / 2 / 5 x 10^n step, for readable tick spacing.
+fn nice_step(raw: f64) -> f64 {
+    if raw <= 0.0 {
+        return 1.0;
+    }
+    let base = 10f64.powf(raw.log10().floor());
+    let frac = raw / base;
+    let mult = if frac <= 1.0 {
+        1.0
+    } else if frac <= 2.0 {
+        2.0
+    } else if frac <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    mult * base
 }
 
 fn config_default_freq() -> u64 {

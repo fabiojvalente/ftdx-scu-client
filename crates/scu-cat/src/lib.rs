@@ -469,6 +469,66 @@ pub fn if_width_options(model: RadioModel, mode: Mode) -> Option<Vec<(u8, u16)>>
     Some(options.to_vec())
 }
 
+/// Bandwidth in Hz used when the `SH` code is `0` (the mode default).
+pub fn default_if_width_hz(mode: Mode) -> Option<u16> {
+    Some(match if_width_group(mode)? {
+        IfWidthGroup::Ssb => 2400,
+        IfWidthGroup::Cw => 500,
+    })
+}
+
+/// Resolve an `SH` code to a bandwidth in Hz, mapping code `0` to the mode
+/// default. `None` for modes without an IF width (AM / FM).
+pub fn if_width_hz(model: RadioModel, mode: Mode, code: u8) -> Option<u16> {
+    let options = if_width_options(model, mode)?;
+    let hz = options
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, hz)| *hz)
+        .unwrap_or(0);
+    (hz > 0).then_some(hz).or_else(|| default_if_width_hz(mode))
+}
+
+/// Bandwidth in Hz used for full-carrier modes, which have no `SH` filter.
+fn full_carrier_width_hz(mode: Mode) -> Option<u16> {
+    Some(match mode {
+        Mode::Am | Mode::AmN => 6000,
+        Mode::Fm | Mode::FmN | Mode::DataFm | Mode::DataFmN => 5000,
+        _ => return None,
+    })
+}
+
+/// Nominal passband centre by mode, in Hz relative to the suppressed carrier.
+/// Full-carrier modes (AM / FM) are centred on the carrier itself.
+fn if_passband_center_hz(mode: Mode) -> Option<i32> {
+    Some(match mode {
+        Mode::Usb | Mode::DataU | Mode::Psk | Mode::RttyU => 1_500,
+        Mode::Lsb | Mode::DataL | Mode::RttyL => -1_500,
+        Mode::CwU => 700,
+        Mode::CwL => -700,
+        Mode::Am | Mode::AmN | Mode::Fm | Mode::FmN | Mode::DataFm | Mode::DataFmN => 0,
+    })
+}
+
+/// Audio passband edges `(low_hz, high_hz)` relative to the carrier, derived
+/// from the mode, the `SH` width code and the `IS` shift.
+///
+/// The passband is modelled as the IF filter bandwidth centred on the mode's
+/// nominal audio offset, displaced by the IF shift. Full-carrier modes (AM /
+/// FM), which expose no IF width, use a fixed nominal bandwidth.
+pub fn if_passband_hz(
+    model: RadioModel,
+    mode: Mode,
+    width_code: u8,
+    shift_hz: i32,
+) -> Option<(i32, i32)> {
+    let center = if_passband_center_hz(mode)? + clamp_if_shift_hz(shift_hz);
+    let width =
+        if_width_hz(model, mode, width_code).or_else(|| full_carrier_width_hz(mode))? as i32;
+    let half = width / 2;
+    Some((center - half, center + half))
+}
+
 /// Build a "set IF width" command (`SH` P1=0/1 + three-digit code).
 pub fn set_if_width(sub: bool, code: u8) -> String {
     format!("SH{}{:03};", sub as u8, code)
@@ -1976,6 +2036,44 @@ mod tests {
         assert_eq!(parse_if_shift("IS00+0600;"), Some(600));
         assert_eq!(parse_if_shift("IS10-0240;"), Some(-240));
         assert_eq!(parse_if_shift("SH0008;"), None);
+    }
+
+    #[test]
+    fn if_passband_tracks_mode_width_and_shift() {
+        // USB, default width (2400 Hz) centred at +1500.
+        assert_eq!(
+            if_passband_hz(RadioModel::Ftdx10, Mode::Usb, 0, 0),
+            Some((300, 2700))
+        );
+        // Narrower width (code 3 = 600 Hz) shrinks symmetrically.
+        assert_eq!(
+            if_passband_hz(RadioModel::Ftdx10, Mode::Usb, 3, 0),
+            Some((1200, 1800))
+        );
+        // LSB mirrors to negative frequencies.
+        assert_eq!(
+            if_passband_hz(RadioModel::Ftdx10, Mode::Lsb, 0, 0),
+            Some((-2700, -300))
+        );
+        // A positive shift moves the passband up, also in LSB.
+        assert_eq!(
+            if_passband_hz(RadioModel::Ftdx10, Mode::Lsb, 0, 500),
+            Some((-2200, 200))
+        );
+        // CW sits around the 700 Hz sidetone pitch.
+        assert_eq!(
+            if_passband_hz(RadioModel::Ftdx10, Mode::CwU, 5, 0),
+            Some((575, 825))
+        );
+        // Full-carrier modes straddle the carrier.
+        assert_eq!(
+            if_passband_hz(RadioModel::Ftdx10, Mode::Am, 0, 0),
+            Some((-3000, 3000))
+        );
+        assert_eq!(
+            if_passband_hz(RadioModel::Ftdx10, Mode::Fm, 0, 0),
+            Some((-2500, 2500))
+        );
     }
 
     #[test]
