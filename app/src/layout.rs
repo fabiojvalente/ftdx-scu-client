@@ -240,13 +240,15 @@ fn default_active_id() -> String {
 
 impl Default for LayoutsFile {
     fn default() -> Self {
-        Self {
+        let mut file = Self {
             version: LAYOUT_VERSION,
             active_id: DEFAULT_ID.to_string(),
             draft: default_tree(),
             presets: Vec::new(),
             popped: Vec::new(),
-        }
+        };
+        file.ensure_builtins();
+        file
     }
 }
 
@@ -255,11 +257,44 @@ impl LayoutsFile {
     pub fn load() -> Self {
         match storage_load() {
             Some(text) => match serde_json::from_str::<LayoutsFile>(&text) {
-                Ok(file) if file.version == LAYOUT_VERSION => file,
+                Ok(mut file) if file.version == LAYOUT_VERSION => {
+                    file.ensure_builtins();
+                    file
+                }
                 _ => Self::default(),
             },
             None => Self::default(),
         }
+    }
+
+    /// Make sure the two built-in arrangements exist as ordinary entries in
+    /// `presets`. Treating them as presets means a switch to Default or
+    /// Dashboard loads the arrangement the user last left there instead of
+    /// regenerating it from code, and edits to them are persisted like any
+    /// other preset. The menus hide these two ids because they are listed
+    /// explicitly.
+    pub fn ensure_builtins(&mut self) {
+        if !self.presets.iter().any(|p| p.id == DEFAULT_ID) {
+            self.presets.push(Preset {
+                id: DEFAULT_ID.to_string(),
+                name: "Default".to_string(),
+                tree: default_tree(),
+            });
+        }
+        if !self.presets.iter().any(|p| p.id == DASHBOARD_ID) {
+            self.presets.push(Preset {
+                id: DASHBOARD_ID.to_string(),
+                name: "Dashboard".to_string(),
+                tree: dashboard_tree(),
+            });
+        }
+    }
+
+    /// The user-saved presets, in menu order (built-ins excluded).
+    pub fn user_presets(&self) -> impl Iterator<Item = &Preset> {
+        self.presets
+            .iter()
+            .filter(|p| p.id != DEFAULT_ID && p.id != DASHBOARD_ID)
     }
 
     pub fn save(&self) {
@@ -636,10 +671,29 @@ mod tests {
         file.popped.push(Pane::Meters);
         let text = serde_json::to_string_pretty(&file).expect("serialize");
         let restored: LayoutsFile = serde_json::from_str(&text).expect("deserialize");
-        assert_eq!(restored.presets.len(), 1);
-        assert_eq!(restored.presets[0].name, "Mine");
-        assert_eq!(restored.popped, vec![Pane::Meters]);
+        assert_eq!(restored.user_presets().count(), 1);
         assert_eq!(restored.active_id, DEFAULT_ID);
+        assert_eq!(restored.popped, vec![Pane::Meters]);
+        assert!(restored.presets.iter().any(|p| p.id == DEFAULT_ID));
+        assert!(restored.presets.iter().any(|p| p.id == DASHBOARD_ID));
+    }
+
+    #[test]
+    fn builtins_are_seeded_for_old_files() {
+        // A file written before built-ins were stored as presets has no entries
+        // with the built-in ids; seeding must add them without touching the
+        // user's working draft.
+        let mut file = LayoutsFile {
+            version: LAYOUT_VERSION,
+            active_id: DEFAULT_ID.to_string(),
+            draft: dashboard_tree(),
+            presets: Vec::new(),
+            popped: Vec::new(),
+        };
+        file.ensure_builtins();
+        assert_eq!(file.draft, dashboard_tree());
+        assert!(file.presets.iter().any(|p| p.id == DEFAULT_ID));
+        assert!(file.presets.iter().any(|p| p.id == DASHBOARD_ID));
     }
 
     #[test]

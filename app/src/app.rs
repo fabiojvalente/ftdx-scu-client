@@ -3701,22 +3701,34 @@ impl ScuApp {
     }
 
     fn reset_layout(&mut self) {
+        let default = layout::default_tree();
         self.layouts.active_id = layout::DEFAULT_ID.to_string();
-        self.layouts.draft = layout::default_tree();
+        if let Some(preset) = self
+            .layouts
+            .presets
+            .iter_mut()
+            .find(|p| p.id == layout::DEFAULT_ID)
+        {
+            preset.tree = default.clone();
+        }
+        self.layouts.draft = default;
         self.mark_layout_dirty();
     }
 
     fn switch_layout(&mut self, id: &str) {
-        if id == layout::DEFAULT_ID {
-            self.layouts.active_id = layout::DEFAULT_ID.to_string();
-            self.layouts.draft = layout::default_tree();
-        } else if id == layout::DASHBOARD_ID {
-            self.layouts.active_id = layout::DASHBOARD_ID.to_string();
-            self.layouts.draft = layout::dashboard_tree();
-        } else if let Some(preset) = self.layouts.presets.iter().find(|p| p.id == id) {
-            self.layouts.active_id = preset.id.clone();
-            self.layouts.draft = preset.tree.clone();
+        if id == self.layouts.active_id {
+            // Already here: regenerating the tree would discard the user's
+            // edits (the old code did exactly that for Default/Dashboard).
+            return;
         }
+        // Fold any edits into the layout we are leaving before loading another,
+        // so a panel change is never lost by a layout switch.
+        self.sync_active_preset();
+        let Some(preset) = self.layouts.presets.iter().find(|p| p.id == id) else {
+            return;
+        };
+        self.layouts.active_id = preset.id.clone();
+        self.layouts.draft = preset.tree.clone();
         self.mark_layout_dirty();
     }
 
@@ -3851,11 +3863,12 @@ impl ScuApp {
             self.switch_layout(layout::DASHBOARD_ID);
             ui.close();
         }
-        if !self.layouts.presets.is_empty() {
+        let user_presets = self.layouts.user_presets().count();
+        if user_presets > 0 {
             ui.separator();
         }
 
-        let presets = self.layouts.presets.clone();
+        let presets: Vec<layout::Preset> = self.layouts.user_presets().cloned().collect();
         for preset in presets {
             let mark = if active == preset.id { "\u{2022} " } else { "" };
             let label = format!("{mark}{}", preset.name);
@@ -3879,7 +3892,7 @@ impl ScuApp {
 
         ui.separator();
         if ui.button("Save current as…").clicked() {
-            let suggested = format!("Layout {}", self.layouts.presets.len() + 1);
+            let suggested = format!("Layout {}", user_presets + 1);
             self.layout_prompt_input = suggested.clone();
             self.layout_prompt_focus = true;
             self.layout_prompt = Some(LayoutPrompt::SaveAs);
