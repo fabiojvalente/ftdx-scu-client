@@ -269,14 +269,16 @@ enum SettingsTab {
     Meters,
     Panes,
     Logging,
+    Debug,
 }
 
 impl SettingsTab {
-    const ALL: [SettingsTab; 4] = [
+    const ALL: [SettingsTab; 5] = [
         SettingsTab::Appearance,
         SettingsTab::Meters,
         SettingsTab::Panes,
         SettingsTab::Logging,
+        SettingsTab::Debug,
     ];
 
     fn label(self) -> &'static str {
@@ -285,6 +287,7 @@ impl SettingsTab {
             SettingsTab::Meters => "Meters",
             SettingsTab::Panes => "Panes",
             SettingsTab::Logging => "Logging",
+            SettingsTab::Debug => "Debug",
         }
     }
 }
@@ -2982,8 +2985,8 @@ impl ScuApp {
             });
     }
 
-    /// Floating settings window, split into tabs: appearance, meters, panes and
-    /// logging.
+    /// Floating settings window, split into tabs: appearance, meters, panes,
+    /// logging and debug.
     fn ui_settings(&mut self, ctx: &egui::Context) {
         if !self.show_settings {
             return;
@@ -3015,6 +3018,7 @@ impl ScuApp {
                         SettingsTab::Meters => self.settings_meters(ui),
                         SettingsTab::Panes => self.settings_panes(ui),
                         SettingsTab::Logging => self.settings_logging(ui),
+                        SettingsTab::Debug => self.settings_debug(ui),
                     });
             });
         self.show_settings = open;
@@ -3159,6 +3163,59 @@ impl ScuApp {
                 .small()
                 .color(theme::text_faint()),
         );
+    }
+
+    /// Debug tab: live diagnostics. The Meters section lists the raw 0-255 ADC
+    /// reading behind each gauge alongside the value it calibrates to, which is
+    /// what you need when a needle looks wrong.
+    fn settings_debug(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "Meters");
+        ui.label(
+            egui::RichText::new("Raw readings as reported by the radio, before calibration.")
+                .small()
+                .color(theme::text_faint()),
+        );
+        egui::Grid::new("debug-meters")
+            .num_columns(3)
+            .spacing([18.0, 3.0])
+            .striped(true)
+            .show(ui, |ui| {
+                for header in ["Meter", "Raw", "Value"] {
+                    ui.label(
+                        egui::RichText::new(header)
+                            .small()
+                            .strong()
+                            .color(theme::text_dim()),
+                    );
+                }
+                ui.end_row();
+
+                let row = |ui: &mut egui::Ui, kind: MeterKind, raw: Option<u8>| {
+                    ui.label(egui::RichText::new(kind.label()).monospace());
+                    match raw {
+                        Some(raw) => {
+                            ui.label(egui::RichText::new(raw.to_string()).monospace());
+                            ui.label(
+                                egui::RichText::new(kind.format(raw))
+                                    .monospace()
+                                    .color(theme::text_dim()),
+                            );
+                        }
+                        None => {
+                            let faint = theme::text_faint();
+                            ui.label(egui::RichText::new("--").monospace().color(faint));
+                            ui.label(egui::RichText::new("--").monospace().color(faint));
+                        }
+                    }
+                    ui.end_row();
+                };
+
+                row(ui, MeterKind::S, Some(self.smeter));
+                for index in METER_INDICES {
+                    let kind = MeterKind::from_rm_index(index);
+                    row(ui, kind, self.meters[index as usize]);
+                }
+            });
     }
 
     /// Click-to-tune plus a hover frequency readout over a spectrum/waterfall area.
