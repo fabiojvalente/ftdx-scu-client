@@ -3,6 +3,7 @@ mod app;
 mod cat_server;
 mod layout;
 mod logging;
+mod meter;
 mod shortcuts;
 mod theme;
 mod waterfall;

@@ -19,6 +19,7 @@ use scu_scope::{BinInterleave, Colormap, FrequencyAxis};
 use serde::{Deserialize, Serialize};
 
 use crate::layout::{self, LayoutsFile, Pane};
+use crate::meter::{scale_for, LinearMeter};
 use crate::shortcuts;
 use crate::theme;
 use crate::waterfall::Waterfall;
@@ -319,6 +320,10 @@ pub struct ScuApp {
     mode: [Option<Mode>; 2],
     smeter: u8,
     meters: [Option<u8>; 10],
+    /// Peak-hold state per meter index: the held fraction and the wall-clock
+    /// time (egui seconds) it was last exceeded.
+    meter_peak: [f32; 10],
+    meter_peak_at: [f64; 10],
     span_hz: f64,
     scope_mode: Option<ScopeMode>,
     scope_centered_sent: bool,
@@ -479,6 +484,8 @@ impl ScuApp {
             mode: [None, None],
             smeter: 0,
             meters: [None; 10],
+            meter_peak: [0.0; 10],
+            meter_peak_at: [0.0; 10],
             span_hz: 200_000.0,
             scope_mode: None,
             scope_centered_sent: false,
@@ -736,7 +743,11 @@ impl ScuApp {
             ui.label(egui::RichText::new("Stopped").color(theme::text_dim()));
         }
         if let Some(error) = &status.error {
-            ui.label(egui::RichText::new(error).small().color(theme::warn_amber()));
+            ui.label(
+                egui::RichText::new(error)
+                    .small()
+                    .color(theme::warn_amber()),
+            );
         }
     }
 
@@ -857,7 +868,11 @@ impl ScuApp {
         ui.add(
             egui::ProgressBar::new((level as f32 / 32767.0).clamp(0.0, 1.0))
                 .desired_height(10.0)
-                .fill(if self.tx_keyed() { theme::tx_red() } else { theme::rx_green() })
+                .fill(if self.tx_keyed() {
+                    theme::tx_red()
+                } else {
+                    theme::rx_green()
+                })
                 .text(if self.tx_keyed() { "TX" } else { "RX" }),
         );
         ui.label(
@@ -1081,6 +1096,7 @@ impl ScuApp {
                 self.connecting = false;
                 self.scope_centered_sent = false;
                 self.meters = [None; 10];
+                self.meter_peak = [0.0; 10];
                 self.status = "connected".into();
                 self.initial_queries();
                 self.sync_cat_server();
@@ -1822,7 +1838,9 @@ impl ScuApp {
                     if self.connected() {
                         if ui
                             .add(egui::Button::new(
-                                egui::RichText::new("Disconnect").strong().color(theme::tx_red()),
+                                egui::RichText::new("Disconnect")
+                                    .strong()
+                                    .color(theme::tx_red()),
                             ))
                             .clicked()
                         {
@@ -1854,10 +1872,9 @@ impl ScuApp {
                         format!("Theme: {}", self.settings.theme_kind.label()),
                         |ui| self.theme_menu(ui),
                     );
-                    ui.menu_button(
-                        format!("Scale: {}", self.settings.ui_scale.label()),
-                        |ui| self.scale_menu(ui),
-                    );
+                    ui.menu_button(format!("Scale: {}", self.settings.ui_scale.label()), |ui| {
+                        self.scale_menu(ui)
+                    });
                     ui.separator();
 
                     ui.label(egui::RichText::new(&self.status).color(self.status_color()));
@@ -1945,8 +1962,10 @@ impl ScuApp {
     /// Spectrum pane: panadapter trace plus click-to-tune.
     fn pane_spectrum(&mut self, ui: &mut egui::Ui) {
         let size = ui.available_size();
-        let (response, painter) =
-            ui.allocate_painter(egui::Vec2::new(size.x, size.y.max(80.0)), egui::Sense::click());
+        let (response, painter) = ui.allocate_painter(
+            egui::Vec2::new(size.x, size.y.max(80.0)),
+            egui::Sense::click(),
+        );
         self.paint_spectrum(&painter, response.rect);
         self.tune_interaction(&response, &painter, response.rect);
     }
@@ -2040,8 +2059,16 @@ impl ScuApp {
         } else {
             egui::Color32::from_rgb(48, 54, 64)
         };
-        let stroke = if on { theme::tx_red() } else { theme::outline() };
-        let text_color = if on { theme::on_accent() } else { theme::text() };
+        let stroke = if on {
+            theme::tx_red()
+        } else {
+            theme::outline()
+        };
+        let text_color = if on {
+            theme::on_accent()
+        } else {
+            theme::text()
+        };
         let label = if on { "TX" } else { "PTT" };
         let button = egui::Button::new(
             egui::RichText::new(label)
@@ -2085,7 +2112,11 @@ impl ScuApp {
     /// One VFO read-out card (Main = VFO-A, Sub = VFO-B).
     fn vfo_card(&mut self, ui: &mut egui::Ui, sub: bool) {
         let active = self.rx_sub == sub;
-        let border = if active { theme::accent() } else { theme::outline() };
+        let border = if active {
+            theme::accent()
+        } else {
+            theme::outline()
+        };
         let name = if sub { "SUB" } else { "MAIN" };
         let vfo = if sub { "B" } else { "A" };
 
@@ -2108,7 +2139,11 @@ impl ScuApp {
                         egui::RichText::new(name)
                             .strong()
                             .size(14.0)
-                            .color(if active { theme::accent() } else { theme::text_dim() }),
+                            .color(if active {
+                                theme::accent()
+                            } else {
+                                theme::text_dim()
+                            }),
                     );
                     ui.label(
                         egui::RichText::new(format!("VFO {vfo}"))
@@ -2143,7 +2178,12 @@ impl ScuApp {
                                 self.select_rx_vfo(sub);
                             }
                             if self.tx_on(sub) {
-                                ui.label(egui::RichText::new("TX").small().strong().color(theme::tx_red()));
+                                ui.label(
+                                    egui::RichText::new("TX")
+                                        .small()
+                                        .strong()
+                                        .color(theme::tx_red()),
+                                );
                             }
                         },
                     );
@@ -2164,7 +2204,11 @@ impl ScuApp {
                             egui::TextEdit::singleline(&mut self.freq_input[idx])
                                 .id(edit_id)
                                 .font(egui::FontId::monospace(freq_size))
-                                .text_color(if active { theme::freq_cyan() } else { theme::text_dim() })
+                                .text_color(if active {
+                                    theme::freq_cyan()
+                                } else {
+                                    theme::text_dim()
+                                })
                                 .desired_width(width)
                                 .frame(egui::Frame::NONE)
                                 .margin(egui::Margin::ZERO),
@@ -2173,7 +2217,11 @@ impl ScuApp {
 
                     if std::mem::take(&mut self.focus_freq[idx]) {
                         ui.memory_mut(|m| m.request_focus(response.id));
-                        select_all_text(ui.ctx(), response.id, self.freq_input[idx].chars().count());
+                        select_all_text(
+                            ui.ctx(),
+                            response.id,
+                            self.freq_input[idx].chars().count(),
+                        );
                     }
                     if response.gained_focus() {
                         select_all_text(
@@ -2206,7 +2254,11 @@ impl ScuApp {
                                     .monospace()
                                     .strong()
                                     .size(freq_size)
-                                    .color(if active { theme::freq_cyan() } else { theme::text_dim() }),
+                                    .color(if active {
+                                        theme::freq_cyan()
+                                    } else {
+                                        theme::text_dim()
+                                    }),
                             )
                             .sense(egui::Sense::click()),
                         )
@@ -2343,7 +2395,12 @@ impl ScuApp {
     /// Radio pane: power state and receive-VFO selection.
     fn pane_radio(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("RIG").small().strong().color(theme::accent()));
+            ui.label(
+                egui::RichText::new("RIG")
+                    .small()
+                    .strong()
+                    .color(theme::accent()),
+            );
             let radio = self
                 .radio
                 .map(|r| r.name())
@@ -2409,7 +2466,11 @@ impl ScuApp {
                 .color(theme::text_faint()),
         );
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Step").small().color(theme::text_faint()));
+            ui.label(
+                egui::RichText::new("Step")
+                    .small()
+                    .color(theme::text_faint()),
+            );
             let mut step = self.settings.freq_step_hz;
             egui::ComboBox::from_id_salt("freq-step")
                 .selected_text(step_label(self.settings.freq_step_hz))
@@ -2423,18 +2484,10 @@ impl ScuApp {
                 self.settings.freq_step_hz = step;
                 save_settings(&self.settings);
             }
-            if ui
-                .button("-")
-                .on_hover_text("Tune down one step")
-                .clicked()
-            {
+            if ui.button("-").on_hover_text("Tune down one step").clicked() {
                 self.step_frequency(-1);
             }
-            if ui
-                .button("+")
-                .on_hover_text("Tune up one step")
-                .clicked()
-            {
+            if ui.button("+").on_hover_text("Tune up one step").clicked() {
                 self.step_frequency(1);
             }
         });
@@ -2514,18 +2567,14 @@ impl ScuApp {
         }
         let mut rf_gain = self.rf_gain as i32;
         if ui
-            .add(
-                egui::Slider::new(&mut rf_gain, 0..=scu_cat::RF_GAIN_MAX as i32).text("RF gain"),
-            )
+            .add(egui::Slider::new(&mut rf_gain, 0..=scu_cat::RF_GAIN_MAX as i32).text("RF gain"))
             .changed()
         {
             self.set_rf_gain(rf_gain as u8);
         }
         let mut squelch = self.squelch as i32;
         if ui
-            .add(
-                egui::Slider::new(&mut squelch, 0..=scu_cat::SQUELCH_MAX as i32).text("Squelch"),
-            )
+            .add(egui::Slider::new(&mut squelch, 0..=scu_cat::SQUELCH_MAX as i32).text("Squelch"))
             .changed()
         {
             self.set_squelch(squelch as u8);
@@ -2592,6 +2641,7 @@ impl ScuApp {
     /// Meters pane.
     fn pane_meters(&mut self, ui: &mut egui::Ui) {
         theme::section(ui, "Meters");
+        let now = ui.input(|i| i.time);
         for index in 0..self.meters.len() {
             if !self.settings.visible_meters.contains(&(index as u8)) {
                 continue;
@@ -2600,19 +2650,32 @@ impl ScuApp {
                 continue;
             };
             let kind = MeterKind::from_rm_index(index as u8);
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(kind.label())
-                        .monospace()
-                        .strong()
-                        .color(theme::text_dim()),
-                );
-                ui.add(
-                    egui::ProgressBar::new(kind.fraction(raw))
-                        .fill(theme::accent())
-                        .text(egui::RichText::new(kind.format(raw)).color(theme::text())),
-                );
+            let frac = kind.fraction(raw);
+
+            // Peak-hold: latch the high-water mark, hold it briefly, then let
+            // it fall back without ever dropping below the live reading.
+            let peak = &mut self.meter_peak[index];
+            let at = &mut self.meter_peak_at[index];
+            if frac >= *peak {
+                *peak = frac;
+                *at = now;
+            } else if now - *at > 0.8 {
+                let decay = 0.35 * (now - *at) as f32;
+                *peak = (*peak - decay).max(frac);
+            }
+
+            let label = kind.label();
+            let value = kind.format(raw);
+            ui.add(LinearMeter {
+                label: Some(&label),
+                value: &value,
+                fraction: frac,
+                scale: scale_for(kind),
+                peak: Some(*peak),
+                dim: false,
+                height: 15.0,
             });
+            ui.add_space(1.0);
         }
     }
 
@@ -2627,10 +2690,7 @@ impl ScuApp {
                 .show_ui(ui, |ui| {
                     for (index, span) in scu_cat::SCOPE_SPANS_HZ.iter().enumerate() {
                         let selected = (self.span_hz - span).abs() < 0.5;
-                        if ui
-                            .selectable_label(selected, span_label(*span))
-                            .clicked()
-                        {
+                        if ui.selectable_label(selected, span_label(*span)).clicked() {
                             selected_span = Some(index);
                         }
                     }
@@ -2856,15 +2916,15 @@ impl ScuApp {
                 let lines: Vec<&str> = self
                     .cat_log
                     .iter()
-                    .filter(|line| {
-                        filter.is_empty() || line.to_ascii_lowercase().contains(&filter)
-                    })
+                    .filter(|line| filter.is_empty() || line.to_ascii_lowercase().contains(&filter))
                     .map(String::as_str)
                     .collect();
                 let count = lines.len();
                 ui.ctx().copy_text(lines.join("\n"));
-                self.notice =
-                    Some((format!("Copied {count} CAT line(s) to clipboard"), Instant::now()));
+                self.notice = Some((
+                    format!("Copied {count} CAT line(s) to clipboard"),
+                    Instant::now(),
+                ));
             }
             #[cfg(not(target_arch = "wasm32"))]
             if ui.button("Save").clicked() {
@@ -2872,9 +2932,7 @@ impl ScuApp {
                 let text: String = self
                     .cat_log
                     .iter()
-                    .filter(|line| {
-                        filter.is_empty() || line.to_ascii_lowercase().contains(&filter)
-                    })
+                    .filter(|line| filter.is_empty() || line.to_ascii_lowercase().contains(&filter))
                     .cloned()
                     .collect::<Vec<_>>()
                     .join("\n");
@@ -2882,7 +2940,10 @@ impl ScuApp {
                     .unwrap_or_else(|_| std::path::PathBuf::from("."))
                     .join("cat-log.txt");
                 self.notice = Some(match std::fs::write(&path, text) {
-                    Ok(()) => (format!("Saved CAT log to {}", path.display()), Instant::now()),
+                    Ok(()) => (
+                        format!("Saved CAT log to {}", path.display()),
+                        Instant::now(),
+                    ),
                     Err(e) => (format!("Could not save CAT log: {e}"), Instant::now()),
                 });
             }
@@ -4068,7 +4129,11 @@ fn device_combo(
 ) -> Option<Option<String>> {
     let mut choice = None;
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).small().color(theme::text_faint()));
+        ui.label(
+            egui::RichText::new(label)
+                .small()
+                .color(theme::text_faint()),
+        );
         let text = current
             .clone()
             .unwrap_or_else(|| "System default".to_string());
@@ -4094,9 +4159,21 @@ fn device_combo(
 
 /// A compact toggle button that lights up with the accent colour when `on`.
 fn toggle_chip(ui: &mut egui::Ui, on: bool, label: &str) -> bool {
-    let fill = if on { theme::accent() } else { theme::button_bg() };
-    let stroke = if on { theme::accent() } else { theme::outline() };
-    let text_color = if on { theme::on_accent() } else { theme::text_dim() };
+    let fill = if on {
+        theme::accent()
+    } else {
+        theme::button_bg()
+    };
+    let stroke = if on {
+        theme::accent()
+    } else {
+        theme::outline()
+    };
+    let text_color = if on {
+        theme::on_accent()
+    } else {
+        theme::text_dim()
+    };
     ui.add(
         egui::Button::new(
             egui::RichText::new(label)
@@ -4353,7 +4430,7 @@ mod tests {
         // with VFO-B active, `MD0` is VFO-B and `MD1` is VFO-A...
         assert!(md_vfo_sub(false, true)); // MD0, B active -> VFO-B
         assert!(!md_vfo_sub(true, true)); // MD1, B active -> VFO-A
-        // ...and with VFO-A active the mapping flips.
+                                          // ...and with VFO-A active the mapping flips.
         assert!(!md_vfo_sub(false, false)); // MD0, A active -> VFO-A
         assert!(md_vfo_sub(true, false)); // MD1, A active -> VFO-B
 
