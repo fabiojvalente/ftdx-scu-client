@@ -3330,6 +3330,7 @@ name = "scu-scope"
 version = "0.1.0"
 dependencies = [
  "scu-protocol",
+ "serde",
 ]
 
 [[package]]

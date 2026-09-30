@@ -75,6 +75,7 @@ pub fn normalize(raw: u8) -> f32 {
 }
 
 /// How to extract visible bins from the active (doubled) region.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinInterleave {
     /// One byte per bin, stepping over the interleaved second stream. Covers the
@@ -152,6 +153,7 @@ impl FrequencyAxis {
 }
 
 /// Waterfall color maps.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Colormap {
     Grayscale,

@@ -89,6 +89,39 @@ pub struct AppSettings {
     /// Console log verbosity.
     #[serde(default)]
     pub log_level: LogLevel,
+    /// Local playback volume (`0.0..=1.5`).
+    #[serde(default = "default_volume")]
+    pub volume: f32,
+    /// Silence local RX playback.
+    #[serde(default)]
+    pub muted: bool,
+    /// Route channel 1 to the right output instead of duplicating to both.
+    #[serde(default)]
+    pub stereo: bool,
+    /// Capture gain applied to the local microphone.
+    #[serde(default = "default_mic_capture_gain")]
+    pub mic_gain: f32,
+    /// Preferred local microphone device (`None` = system default).
+    #[serde(default)]
+    pub mic_device: Option<String>,
+    /// Tuning step used by the frequency editors and step buttons.
+    #[serde(default = "default_freq_step")]
+    pub freq_step_hz: u64,
+    /// Keep the radio scope centered on the active VFO.
+    #[serde(default = "default_true")]
+    pub follow_vfo: bool,
+    /// Scope bin extraction rule.
+    #[serde(default = "default_scope_bins")]
+    pub scope_bins: BinInterleave,
+    /// Waterfall colour palette.
+    #[serde(default = "default_colormap")]
+    pub waterfall_colormap: Colormap,
+    /// Waterfall magnitude clamped to the colormap floor.
+    #[serde(default = "default_black_level")]
+    pub waterfall_black_level: f32,
+    /// Waterfall contrast gain above the black level.
+    #[serde(default = "default_waterfall_gain")]
+    pub waterfall_gain: f32,
 }
 
 impl Default for AppSettings {
@@ -111,6 +144,17 @@ impl Default for AppSettings {
             high_contrast: false,
             large_targets: false,
             log_level: LogLevel::default(),
+            volume: default_volume(),
+            muted: false,
+            stereo: false,
+            mic_gain: default_mic_capture_gain(),
+            mic_device: None,
+            freq_step_hz: default_freq_step(),
+            follow_vfo: true,
+            scope_bins: default_scope_bins(),
+            waterfall_colormap: default_colormap(),
+            waterfall_black_level: default_black_level(),
+            waterfall_gain: default_waterfall_gain(),
         }
     }
 }
@@ -129,6 +173,34 @@ fn default_vox_hang() -> u32 {
 
 fn default_rigctld_port() -> u16 {
     4532
+}
+
+fn default_volume() -> f32 {
+    1.0
+}
+
+fn default_mic_capture_gain() -> f32 {
+    1.0
+}
+
+fn default_freq_step() -> u64 {
+    1_000
+}
+
+fn default_scope_bins() -> BinInterleave {
+    BinInterleave::Split
+}
+
+fn default_colormap() -> Colormap {
+    Colormap::Turbo
+}
+
+fn default_black_level() -> f32 {
+    0.30
+}
+
+fn default_waterfall_gain() -> f32 {
+    1.4
 }
 
 fn default_visible_meters() -> Vec<u8> {
@@ -249,17 +321,14 @@ pub struct ScuApp {
     meters: [Option<u8>; 10],
     span_hz: f64,
     scope_mode: Option<ScopeMode>,
-    follow_vfo: bool,
     scope_centered_sent: bool,
 
     latest_bins: Vec<f32>,
     waterfall: Waterfall,
-    scope_bins: BinInterleave,
 
     /// Editable frequency text, indexed by VFO (0 = A/Main, 1 = B/Sub).
     freq_input: [String; 2],
     freq_editing: [bool; 2],
-    freq_step_hz: u64,
     cat_input: String,
     cat_log: Vec<String>,
     /// Case-insensitive substring filter for the CAT console; empty shows all.
@@ -268,18 +337,12 @@ pub struct ScuApp {
     /// busy stream can be frozen while reading or copying it.
     cat_paused: bool,
 
-    volume: f32,
-    muted: bool,
-    stereo: bool,
-
     ptt: bool,
     tx_power: u16,
     radio_mic_gain: u8,
     atu_on: bool,
     mic: Option<MicInput>,
     mic_devices: Vec<String>,
-    mic_device: Option<String>,
-    mic_gain: f32,
     mic_status: String,
 
     settings: AppSettings,
@@ -380,6 +443,10 @@ impl ScuApp {
             settings.large_targets,
         );
         let layouts = LayoutsFile::load();
+        let mut waterfall = Waterfall::new(1024, 480);
+        waterfall.colormap = settings.waterfall_colormap;
+        waterfall.black_level = settings.waterfall_black_level;
+        waterfall.gain = settings.waterfall_gain;
         // RUST_LOG wins; otherwise apply the saved level to the subscriber.
         #[cfg(not(target_arch = "wasm32"))]
         if std::env::var_os("RUST_LOG").is_none() {
@@ -414,29 +481,21 @@ impl ScuApp {
             meters: [None; 10],
             span_hz: 200_000.0,
             scope_mode: None,
-            follow_vfo: true,
             scope_centered_sent: false,
             latest_bins: Vec::new(),
-            waterfall: Waterfall::new(1024, 480),
-            scope_bins: BinInterleave::Split,
+            waterfall,
             freq_input,
             freq_editing: [false, false],
-            freq_step_hz: 1_000,
             cat_input: String::new(),
             cat_log: Vec::new(),
             cat_filter: String::new(),
             cat_paused: false,
-            volume: 1.0,
-            muted: false,
-            stereo: false,
             ptt: false,
             tx_power: scu_cat::POWER_MAX_W,
             radio_mic_gain: 50,
             atu_on: false,
             mic: None,
             mic_devices: MicInput::devices(),
-            mic_device: None,
-            mic_gain: 1.0,
             mic_status: String::new(),
             settings,
             show_settings: false,
@@ -541,9 +600,9 @@ impl ScuApp {
         }
         match AudioOutput::new() {
             Ok(output) => {
-                output.set_volume(self.volume);
-                output.set_enabled(!self.muted && !self.tx_keyed());
-                output.set_stereo(self.stereo);
+                output.set_volume(self.settings.volume);
+                output.set_enabled(!self.settings.muted && !self.tx_keyed());
+                output.set_stereo(self.settings.stereo);
                 self.audio = Some(output);
             }
             Err(e) => {
@@ -570,7 +629,7 @@ impl ScuApp {
     /// picking up the speakers).
     fn sync_audio_enabled(&self) {
         if let Some(audio) = &self.audio {
-            audio.set_enabled(!self.muted && !self.tx_keyed());
+            audio.set_enabled(!self.settings.muted && !self.tx_keyed());
         }
     }
 
@@ -849,8 +908,8 @@ impl ScuApp {
         }
         let sink: TxAudioSink = Box::new(move |body: &[u8]| handle.send_tx_audio(body));
         let config = MicConfig {
-            device: self.mic_device.clone(),
-            gain: self.mic_gain,
+            device: self.settings.mic_device.clone(),
+            gain: self.settings.mic_gain,
         };
         match MicInput::new(config, sink) {
             Ok(mic) => {
@@ -1065,7 +1124,7 @@ impl ScuApp {
             Event::Cat(text) => self.on_cat(&text),
             Event::Audio(_) => {}
             Event::Scope(body) => {
-                let line = scu_scope::decode_with(&body, self.scope_bins);
+                let line = scu_scope::decode_with(&body, self.settings.scope_bins);
                 self.waterfall.push(&line.bins);
                 self.latest_bins = line.bins;
             }
@@ -1251,7 +1310,7 @@ impl ScuApp {
         if let Some(mode) = scu_cat::parse_scope_mode(text) {
             self.scope_mode = Some(mode);
             // A FIX/CURSOR scope won't track the VFO; switch to CENTER once.
-            if self.follow_vfo && !mode.is_center() && !self.scope_centered_sent {
+            if self.settings.follow_vfo && !mode.is_center() && !self.scope_centered_sent {
                 self.scope_centered_sent = true;
                 if let Some(handle) = &self.handle {
                     handle.send_cat(&scu_cat::set_scope_mode(mode.with_center().code()));
@@ -1271,7 +1330,8 @@ impl ScuApp {
     }
 
     fn set_scope_follow_vfo(&mut self, follow: bool) {
-        self.follow_vfo = follow;
+        self.settings.follow_vfo = follow;
+        save_settings(&self.settings);
         if follow {
             if let Some(mode) = self.scope_mode {
                 if let Some(handle) = &self.handle {
@@ -1331,7 +1391,7 @@ impl ScuApp {
     /// Nudge a specific VFO by whole tuning steps (used by the scroll wheel on
     /// each VFO card).
     fn step_frequency_on(&mut self, sub: bool, steps: i64) {
-        let step = self.freq_step_hz.max(1) as i64;
+        let step = self.settings.freq_step_hz.max(1) as i64;
         let current = if sub {
             self.frequency_b
         } else {
@@ -1455,7 +1515,7 @@ impl ScuApp {
                 handle.send_cat(&set);
             }
             // Belt and braces: make sure the scope is back in CENTER/follow.
-            if self.follow_vfo {
+            if self.settings.follow_vfo {
                 if let Some(mode) = self.scope_mode {
                     handle.send_cat(&scu_cat::set_scope_mode(mode.with_center().code()));
                 }
@@ -1915,7 +1975,9 @@ impl ScuApp {
         let letter = if sub { "B" } else { "A" };
         let mut title = format!("VFO {letter}");
         if self.rx_sub == sub {
-            title.push_str(" \u{25cf}");
+            // U+2022 (bullet): U+25CF is missing from the bundled fonts and
+            // renders as a missing-glyph box.
+            title.push_str(" \u{2022}");
         }
         if self.tx_on(sub) {
             title.push_str(" TX");
@@ -2348,16 +2410,19 @@ impl ScuApp {
         );
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Step").small().color(theme::text_faint()));
-            let mut step = self.freq_step_hz;
+            let mut step = self.settings.freq_step_hz;
             egui::ComboBox::from_id_salt("freq-step")
-                .selected_text(step_label(self.freq_step_hz))
+                .selected_text(step_label(self.settings.freq_step_hz))
                 .width(88.0)
                 .show_ui(ui, |ui| {
                     for (value, label) in FREQ_STEPS {
                         ui.selectable_value(&mut step, value, label);
                     }
                 });
-            self.freq_step_hz = step;
+            if step != self.settings.freq_step_hz {
+                self.settings.freq_step_hz = step;
+                save_settings(&self.settings);
+            }
             if ui
                 .button("-")
                 .on_hover_text("Tune down one step")
@@ -2575,7 +2640,7 @@ impl ScuApp {
             self.set_span(index);
         }
 
-        let mut follow = self.follow_vfo;
+        let mut follow = self.settings.follow_vfo;
         if ui
             .checkbox(&mut follow, "Scope follows VFO")
             .on_hover_text("Set the radio's scope to CENTER mode so the waterfall tracks tuning")
@@ -2586,25 +2651,48 @@ impl ScuApp {
 
         ui.horizontal(|ui| {
             ui.label("Colormap");
+            let mut colormap = self.waterfall.colormap;
             egui::ComboBox::from_id_salt("colormap")
-                .selected_text(self.waterfall.colormap.label())
+                .selected_text(colormap.label())
                 .show_ui(ui, |ui| {
                     for map in Colormap::ALL {
-                        ui.selectable_value(&mut self.waterfall.colormap, map, map.label());
+                        ui.selectable_value(&mut colormap, map, map.label());
                     }
                 });
+            if colormap != self.waterfall.colormap {
+                self.waterfall.colormap = colormap;
+                self.settings.waterfall_colormap = colormap;
+                save_settings(&self.settings);
+            }
         });
-        ui.add(egui::Slider::new(&mut self.waterfall.black_level, 0.0..=0.9).text("Black"));
-        ui.add(egui::Slider::new(&mut self.waterfall.gain, 0.2..=4.0).text("Gain"));
+        if ui
+            .add(egui::Slider::new(&mut self.waterfall.black_level, 0.0..=0.9).text("Black"))
+            .changed()
+        {
+            self.settings.waterfall_black_level = self.waterfall.black_level;
+            save_settings(&self.settings);
+        }
+        if ui
+            .add(egui::Slider::new(&mut self.waterfall.gain, 0.2..=4.0).text("Gain"))
+            .changed()
+        {
+            self.settings.waterfall_gain = self.waterfall.gain;
+            save_settings(&self.settings);
+        }
         ui.horizontal(|ui| {
             ui.label("Bins");
+            let mut bins = self.settings.scope_bins;
             egui::ComboBox::from_id_salt("bin-mode")
-                .selected_text(self.scope_bins.label())
+                .selected_text(bins.label())
                 .show_ui(ui, |ui| {
                     for mode in BinInterleave::ALL {
-                        ui.selectable_value(&mut self.scope_bins, mode, mode.label());
+                        ui.selectable_value(&mut bins, mode, mode.label());
                     }
                 });
+            if bins != self.settings.scope_bins {
+                self.settings.scope_bins = bins;
+                save_settings(&self.settings);
+            }
             if ui.button("Clear").clicked() {
                 self.waterfall.clear();
             }
@@ -2614,29 +2702,32 @@ impl ScuApp {
     /// Audio pane: mute, volume and stereo.
     fn pane_audio(&mut self, ui: &mut egui::Ui) {
         theme::section(ui, "Audio");
-        let mut muted = self.muted;
+        let mut muted = self.settings.muted;
         if ui.checkbox(&mut muted, "Mute").changed() {
-            self.muted = muted;
+            self.settings.muted = muted;
             self.sync_audio_enabled();
+            save_settings(&self.settings);
         }
         if ui
-            .add(egui::Slider::new(&mut self.volume, 0.0..=1.5).text("Volume"))
+            .add(egui::Slider::new(&mut self.settings.volume, 0.0..=1.5).text("Volume"))
             .changed()
         {
             if let Some(audio) = &self.audio {
-                audio.set_volume(self.volume);
+                audio.set_volume(self.settings.volume);
             }
+            save_settings(&self.settings);
         }
-        let mut stereo = self.stereo;
+        let mut stereo = self.settings.stereo;
         if ui
             .checkbox(&mut stereo, "Stereo (ch1 -> right)")
             .on_hover_text("Off: duplicate the receiver channel to both outputs")
             .changed()
         {
-            self.stereo = stereo;
+            self.settings.stereo = stereo;
             if let Some(audio) = &self.audio {
                 audio.set_stereo(stereo);
             }
+            save_settings(&self.settings);
         }
 
         // Loopback streaming shares this panel with local playback.
@@ -2686,6 +2777,7 @@ impl ScuApp {
         ui.horizontal(|ui| {
             ui.label("Mic");
             let current = self
+                .settings
                 .mic_device
                 .clone()
                 .unwrap_or_else(|| "Default".to_string());
@@ -2694,22 +2786,23 @@ impl ScuApp {
                 .selected_text(current)
                 .show_ui(ui, |ui| {
                     if ui
-                        .selectable_label(self.mic_device.is_none(), "Default")
+                        .selectable_label(self.settings.mic_device.is_none(), "Default")
                         .clicked()
                     {
-                        self.mic_device = None;
+                        self.settings.mic_device = None;
                         changed = true;
                     }
                     let devices = self.mic_devices.clone();
                     for name in devices {
-                        let selected = self.mic_device.as_deref() == Some(name.as_str());
+                        let selected = self.settings.mic_device.as_deref() == Some(name.as_str());
                         if ui.selectable_label(selected, &name).clicked() {
-                            self.mic_device = Some(name);
+                            self.settings.mic_device = Some(name);
                             changed = true;
                         }
                     }
                 });
             if changed {
+                save_settings(&self.settings);
                 self.mic = None;
                 if let Some(handle) = self.handle.clone() {
                     self.ensure_mic(handle);
@@ -2717,12 +2810,13 @@ impl ScuApp {
             }
         });
         if ui
-            .add(egui::Slider::new(&mut self.mic_gain, 0.0..=3.0).text("Capture gain"))
+            .add(egui::Slider::new(&mut self.settings.mic_gain, 0.0..=3.0).text("Capture gain"))
             .changed()
         {
             if let Some(mic) = &self.mic {
-                mic.set_gain(self.mic_gain);
+                mic.set_gain(self.settings.mic_gain);
             }
+            save_settings(&self.settings);
         }
         if !self.mic_status.is_empty() {
             ui.label(egui::RichText::new(&self.mic_status).small().weak());
@@ -3336,7 +3430,7 @@ impl ScuApp {
 
         let presets = self.layouts.presets.clone();
         for preset in presets {
-            let mark = if active == preset.id { "\u{25cf} " } else { "" };
+            let mark = if active == preset.id { "\u{2022} " } else { "" };
             let label = format!("{mark}{}", preset.name);
             ui.menu_button(label, |ui| {
                 if ui.button("Switch to").clicked() {
@@ -3774,21 +3868,27 @@ impl ScuApp {
     }
 
     fn nudge_volume(&mut self, delta: f32) {
-        let next = (self.volume + delta).clamp(0.0, 1.5);
-        if (next - self.volume).abs() < f32::EPSILON {
+        let next = (self.settings.volume + delta).clamp(0.0, 1.5);
+        if (next - self.settings.volume).abs() < f32::EPSILON {
             return;
         }
-        self.volume = next;
+        self.settings.volume = next;
         if let Some(audio) = &self.audio {
             audio.set_volume(next);
         }
+        save_settings(&self.settings);
         self.show_notice(format!("Volume {:.0}%", next * 100.0));
     }
 
     fn toggle_mute(&mut self) {
-        self.muted = !self.muted;
+        self.settings.muted = !self.settings.muted;
         self.sync_audio_enabled();
-        self.show_notice(if self.muted { "Muted" } else { "Unmuted" });
+        save_settings(&self.settings);
+        self.show_notice(if self.settings.muted {
+            "Muted"
+        } else {
+            "Unmuted"
+        });
     }
 
     /// The `?` / `h` keyboard-shortcuts overlay.

@@ -11,7 +11,7 @@ path = "src/main.rs"
 [dependencies]
 scu-protocol.workspace = true
 scu-cat.workspace = true
-scu-scope.workspace = true
+scu-scope = { workspace = true, features = ["serde"] }
 scu-audio.workspace = true
 scu-client.workspace = true
 anyhow.workspace = true
