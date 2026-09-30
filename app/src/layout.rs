@@ -31,6 +31,7 @@ pub enum Pane {
     VfoA,
     VfoB,
     Operate,
+    Panadapter,
     Spectrum,
     Waterfall,
     Radio,
@@ -49,10 +50,11 @@ pub enum Pane {
 
 impl Pane {
     /// Catalogue, in menu order.
-    pub const ALL: [Pane; 17] = [
+    pub const ALL: [Pane; 18] = [
         Pane::VfoA,
         Pane::VfoB,
         Pane::Operate,
+        Pane::Panadapter,
         Pane::Spectrum,
         Pane::Waterfall,
         Pane::Radio,
@@ -74,6 +76,7 @@ impl Pane {
             Pane::VfoA => "VFO A",
             Pane::VfoB => "VFO B",
             Pane::Operate => "Operate",
+            Pane::Panadapter => "Panadapter",
             Pane::Spectrum => "Spectrum",
             Pane::Waterfall => "Waterfall",
             Pane::Radio => "Radio",
@@ -157,25 +160,19 @@ pub fn default_tree() -> Tree<Pane> {
     let operate = tabs(&mut t, &[Pane::Operate]);
     let vfo_a = tabs(&mut t, &[Pane::VfoA]);
     let vfo_b = tabs(&mut t, &[Pane::VfoB]);
-    let vfo_row = linear(
-        &mut t,
-        LinearDir::Horizontal,
-        &[(vfo_a, 1.0), (vfo_b, 1.0)],
-    );
-    let spectrum = tabs(&mut t, &[Pane::Spectrum]);
-    let waterfall = tabs(&mut t, &[Pane::Waterfall]);
+    let vfo_row = linear(&mut t, LinearDir::Horizontal, &[(vfo_a, 1.0), (vfo_b, 1.0)]);
+    let panadapter = tabs(&mut t, &[Pane::Panadapter]);
     let center = linear(
         &mut t,
         LinearDir::Vertical,
-        &[
-            (operate, 0.7),
-            (vfo_row, 1.6),
-            (spectrum, 1.4),
-            (waterfall, 2.2),
-        ],
+        &[(operate, 0.7), (vfo_row, 1.6), (panadapter, 3.6)],
     );
 
-    let root = linear(&mut t, LinearDir::Horizontal, &[(left, 0.42), (center, 1.0)]);
+    let root = linear(
+        &mut t,
+        LinearDir::Horizontal,
+        &[(left, 0.42), (center, 1.0)],
+    );
     Tree::new(TREE_ID, root, t)
 }
 
@@ -192,25 +189,18 @@ pub fn dashboard_tree() -> Tree<Pane> {
     );
 
     let vfo_a = tabs(&mut t, &[Pane::VfoA]);
-    let spectrum = tabs(&mut t, &[Pane::Spectrum]);
+    let panadapter = tabs(&mut t, &[Pane::Panadapter]);
     let middle = linear(
         &mut t,
         LinearDir::Horizontal,
-        &[(vfo_a, 1.0), (spectrum, 1.6)],
+        &[(vfo_a, 1.0), (panadapter, 1.6)],
     );
 
-    let waterfall = tabs(&mut t, &[Pane::Waterfall]);
     let vfo_b = tabs(&mut t, &[Pane::VfoB, Pane::Clarifier, Pane::Dsp]);
-    let bottom = linear(
-        &mut t,
-        LinearDir::Horizontal,
-        &[(waterfall, 1.7), (vfo_b, 1.0)],
-    );
-
     let root = linear(
         &mut t,
         LinearDir::Vertical,
-        &[(top, 1.0), (middle, 1.4), (bottom, 1.4)],
+        &[(top, 1.0), (middle, 1.8), (vfo_b, 0.8)],
     );
     Tree::new(TREE_ID, root, t)
 }
@@ -340,12 +330,10 @@ fn first_tabset(tree: &Tree<Pane>) -> Option<TileId> {
 
 /// The tile id of the given pane, if present.
 pub fn pane_tile(tree: &Tree<Pane>, pane: Pane) -> Option<TileId> {
-    tree.tiles
-        .iter()
-        .find_map(|(id, tile)| match tile {
-            Tile::Pane(p) if *p == pane => Some(*id),
-            _ => None,
-        })
+    tree.tiles.iter().find_map(|(id, tile)| match tile {
+        Tile::Pane(p) if *p == pane => Some(*id),
+        _ => None,
+    })
 }
 
 /// Add `pane` to the tree, preferring the active tabset, else the first one.
@@ -356,7 +344,12 @@ pub fn add_pane(tree: &mut Tree<Pane>, pane: Pane) {
     let target = tree
         .active_tiles()
         .into_iter()
-        .find(|id| matches!(tree.tiles.get(*id), Some(Tile::Container(Container::Tabs(_)))))
+        .find(|id| {
+            matches!(
+                tree.tiles.get(*id),
+                Some(Tile::Container(Container::Tabs(_)))
+            )
+        })
         .or_else(|| first_tabset(tree));
     let Some(target) = target else {
         // No tabset yet — start a fresh tree.
@@ -501,8 +494,7 @@ impl Behavior<Pane> for FlexBehavior<'_> {
         let close_btn_size = egui::Vec2::splat(self.close_button_outer_size());
         let close_btn_left_padding = 4.0;
         let font_id = egui::TextStyle::Button.resolve(ui.style());
-        let galley =
-            text.into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, font_id);
+        let galley = text.into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, font_id);
 
         let x_margin = self.tab_title_spacing(ui.visuals());
 
@@ -558,13 +550,11 @@ impl Behavior<Pane> for FlexBehavior<'_> {
                 .align_size_within_rect(galley.size(), tab_rect.shrink(x_margin))
                 .min;
 
-            ui.painter().galley(text_position, galley.clone(), text_color);
+            ui.painter()
+                .galley(text_position, galley.clone(), text_color);
             if state.active {
-                ui.painter().galley(
-                    text_position + egui::vec2(0.5, 0.0),
-                    galley,
-                    text_color,
-                );
+                ui.painter()
+                    .galley(text_position + egui::vec2(0.5, 0.0), galley, text_color);
             }
 
             if state.closable {
@@ -577,11 +567,7 @@ impl Behavior<Pane> for FlexBehavior<'_> {
                     .on_hover_cursor(egui::CursorIcon::Default);
 
                 close_btn_response.widget_info(|| {
-                    egui::WidgetInfo::labeled(
-                        egui::WidgetType::Button,
-                        ui.is_enabled(),
-                        "Close",
-                    )
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Close")
                 });
 
                 let visuals = ui.style().interact(&close_btn_response);
@@ -675,9 +661,9 @@ mod tests {
     fn add_pane_to_empty_tree_starts_a_tabs_container() {
         let mut tree = Tree::empty(TREE_ID);
         assert!(tree.is_empty());
-        add_pane(&mut tree, Pane::Spectrum);
+        add_pane(&mut tree, Pane::Panadapter);
         assert!(!tree.is_empty());
-        assert!(pane_tile(&tree, Pane::Spectrum).is_some());
+        assert!(pane_tile(&tree, Pane::Panadapter).is_some());
     }
 
     #[test]
@@ -730,8 +716,14 @@ mod tests {
         // `TexturesDelta::drop` does not fire.
         output.textures_delta.clear();
 
-        // Every pane should still be reachable after a layout pass.
+        // Every pane in the default arrangement should still be reachable
+        // after a layout pass. The standalone Spectrum/Waterfall panes exist
+        // for custom layouts but are intentionally absent from the default.
         for pane in Pane::ALL {
+            if matches!(pane, Pane::Spectrum | Pane::Waterfall) {
+                assert!(pane_tile(&tree, pane).is_none(), "unexpected {pane:?}");
+                continue;
+            }
             assert!(pane_tile(&tree, pane).is_some(), "missing {pane:?}");
         }
     }

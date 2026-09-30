@@ -111,6 +111,12 @@ pub struct AppSettings {
     /// Keep the radio scope centered on the active VFO.
     #[serde(default = "default_true")]
     pub follow_vfo: bool,
+    /// Show the spectrum trace in the panadapter.
+    #[serde(default = "default_true")]
+    pub show_spectrum: bool,
+    /// Show the waterfall in the panadapter.
+    #[serde(default = "default_true")]
+    pub show_waterfall: bool,
     /// Scope bin extraction rule.
     #[serde(default = "default_scope_bins")]
     pub scope_bins: BinInterleave,
@@ -152,6 +158,8 @@ impl Default for AppSettings {
             mic_device: None,
             freq_step_hz: default_freq_step(),
             follow_vfo: true,
+            show_spectrum: true,
+            show_waterfall: true,
             scope_bins: default_scope_bins(),
             waterfall_colormap: default_colormap(),
             waterfall_black_level: default_black_level(),
@@ -225,6 +233,10 @@ const PASSBAND_GREEN_MIN_PX: f32 = 40.0;
 
 /// Height of the frequency ribbon drawn above the waterfall, in pixels.
 const SCALE_BAR_H: f32 = 34.0;
+
+/// Default fraction of the panadapter body given to the spectrum trace when
+/// both the spectrum and the waterfall are visible.
+const SPECTRUM_SHARE: f32 = 0.38;
 
 /// Console log verbosity, applied live to the tracing subscriber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -341,6 +353,11 @@ pub struct ScuApp {
     scope_centered_sent: bool,
 
     latest_bins: Vec<f32>,
+    /// Smoothed lower/upper bounds of the spectrum magnitude, used to auto-scale
+    /// the panadapter trace so it fills the pane instead of hugging the floor
+    /// (the native scope packs its useful range into the lower half).
+    spectrum_lo: f32,
+    spectrum_hi: f32,
     waterfall: Waterfall,
 
     /// Editable frequency text, indexed by VFO (0 = A/Main, 1 = B/Sub).
@@ -503,6 +520,8 @@ impl ScuApp {
             scope_mode: None,
             scope_centered_sent: false,
             latest_bins: Vec::new(),
+            spectrum_lo: f32::INFINITY,
+            spectrum_hi: f32::NEG_INFINITY,
             waterfall,
             freq_input,
             freq_editing: [false, false],
@@ -1155,6 +1174,7 @@ impl ScuApp {
             Event::Scope(body) => {
                 let line = scu_scope::decode_with(&body, self.settings.scope_bins);
                 self.waterfall.push(&line.bins);
+                self.update_spectrum_range(&line.bins);
                 self.latest_bins = line.bins;
             }
             Event::Error(message) => self.push_log(format!("! {message}")),
@@ -1724,8 +1744,49 @@ impl ScuApp {
         FrequencyAxis::new(self.active_frequency() as f64, self.span_hz)
     }
 
+    /// Update the auto-scale bounds from a fresh sweep. The floor drops fast and
+    /// the ceiling rises fast so the trace immediately uses the full pane, but
+    /// both recover slowly so the display doesn't breathe on every sweep. The
+    /// native scope packs its useful amplitude range into the lower half, so a
+    /// fixed `1 - raw/255` mapping would leave the top half of the pane empty.
+    fn update_spectrum_range(&mut self, bins: &[f32]) {
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for &magnitude in bins {
+            lo = lo.min(magnitude);
+            hi = hi.max(magnitude);
+        }
+        if !lo.is_finite() || !hi.is_finite() {
+            return;
+        }
+
+        const ATTACK: f32 = 0.5;
+        const RELEASE: f32 = 0.02;
+
+        if !self.spectrum_lo.is_finite() {
+            self.spectrum_lo = lo;
+        } else {
+            let rate = if lo < self.spectrum_lo {
+                ATTACK
+            } else {
+                RELEASE
+            };
+            self.spectrum_lo += (lo - self.spectrum_lo) * rate;
+        }
+        if !self.spectrum_hi.is_finite() {
+            self.spectrum_hi = hi;
+        } else {
+            let rate = if hi > self.spectrum_hi {
+                ATTACK
+            } else {
+                RELEASE
+            };
+            self.spectrum_hi += (hi - self.spectrum_hi) * rate;
+        }
+    }
+
     fn paint_spectrum(&self, painter: &egui::Painter, rect: egui::Rect) {
-        painter.rect_filled(rect, 4.0, theme::inset_bg());
+        painter.rect_filled(rect, 0.0, theme::inset_bg());
         let midline = egui::Stroke::new(1.0, theme::outline());
         painter.line_segment(
             [
@@ -1746,11 +1807,19 @@ impl ScuApp {
             return;
         }
 
+        // Auto-scale the trace to the observed magnitude range (with a little
+        // headroom) so the noise floor sits near the bottom and signals use the
+        // full height, regardless of the band's absolute level.
+        let span = (self.spectrum_hi - self.spectrum_lo).max(1e-3);
+        let lo = self.spectrum_lo - span * 0.05;
+        let denom = (span * 1.1).max(1e-3);
+
         let n = self.latest_bins.len();
         let mut points = Vec::with_capacity(n);
         for (i, &magnitude) in self.latest_bins.iter().enumerate() {
             let x = rect.left() + rect.width() * i as f32 / (n - 1) as f32;
-            let y = rect.bottom() - magnitude * rect.height();
+            let t = ((magnitude - lo) / denom).clamp(0.0, 1.0);
+            let y = rect.bottom() - t * rect.height();
             points.push(egui::pos2(x, y));
         }
         painter.add(egui::Shape::line(
@@ -1759,16 +1828,10 @@ impl ScuApp {
         ));
     }
 
-    /// Frequency ribbon drawn above the waterfall in the style of kiwisdr: a
+    /// Frequency ribbon drawn next to the waterfall in the style of kiwisdr: a
     /// solid bar carrying tick marks and frequency labels, with the passband
-    /// bracket across its top and the carrier marked by a line spanning the
-    /// whole pane.
-    fn paint_frequency_scale(
-        &self,
-        painter: &egui::Painter,
-        scale_rect: egui::Rect,
-        full_rect: egui::Rect,
-    ) {
+    /// bracket across its top.
+    fn paint_frequency_scale(&self, painter: &egui::Painter, scale_rect: egui::Rect) {
         painter.rect_filled(scale_rect, 0.0, theme::card_bg());
         painter.line_segment(
             [
@@ -1816,15 +1879,20 @@ impl ScuApp {
         }
 
         self.paint_passband(painter, scale_rect);
+    }
 
-        // Center-tuned (carrier) marker through the whole pane.
-        let center = egui::Stroke::new(1.0, theme::warn_amber());
+    /// Center-tuned (carrier) marker drawn through a pane as a vertical line at
+    /// the middle, where the active VFO sits.
+    fn paint_carrier(&self, painter: &egui::Painter, full_rect: egui::Rect) {
+        if self.active_frequency() == 0 || self.span_hz <= 0.0 {
+            return;
+        }
         painter.line_segment(
             [
                 egui::pos2(full_rect.center().x, full_rect.top()),
                 egui::pos2(full_rect.center().x, full_rect.bottom()),
             ],
-            center,
+            egui::Stroke::new(1.0, theme::warn_amber()),
         );
     }
 
@@ -2068,7 +2136,7 @@ impl ScuApp {
         });
     }
 
-    /// Spectrum pane: panadapter trace plus click-to-tune.
+    /// Standalone spectrum pane, kept for custom layouts.
     fn pane_spectrum(&mut self, ui: &mut egui::Ui) {
         let size = ui.available_size();
         let (response, painter) = ui.allocate_painter(
@@ -2079,7 +2147,7 @@ impl ScuApp {
         self.tune_interaction(&response, &painter, response.rect);
     }
 
-    /// Waterfall pane: frequency ribbon on top, scrolling texture below.
+    /// Standalone waterfall pane, kept for custom layouts.
     fn pane_waterfall(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.waterfall.update_texture(&ctx);
@@ -2093,8 +2161,101 @@ impl ScuApp {
             egui::Rect::from_min_max(egui::pos2(full.left(), full.top() + scale_h), full.max);
 
         self.waterfall.paint(&painter, plot_rect);
-        self.paint_frequency_scale(&painter, scale_rect, full);
+        self.paint_frequency_scale(&painter, scale_rect);
+        self.paint_carrier(&painter, full);
         self.tune_interaction(&response, &painter, plot_rect);
+    }
+
+    /// Combined panadapter pane: the frequency ribbon sits between the
+    /// spectrum trace and the waterfall. The waterfall (with its ribbon) lives
+    /// in a natively resizable bottom panel, so dragging the separator adjusts
+    /// how the height is split between the two. Either half can be hidden from
+    /// the Scope settings pane.
+    fn pane_panadapter(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        self.waterfall.update_texture(&ctx);
+        let full = ui.available_rect_before_wrap();
+
+        let show_spectrum = self.settings.show_spectrum;
+        let show_waterfall = self.settings.show_waterfall;
+
+        if !show_spectrum && !show_waterfall {
+            ui.allocate_rect(full, egui::Sense::hover());
+            let painter = ui.painter_at(full);
+            painter.rect_filled(full, 0.0, theme::inset_bg());
+            painter.text(
+                full.center(),
+                egui::Align2::CENTER_CENTER,
+                "Enable Spectrum or Waterfall in the Scope panel",
+                egui::FontId::proportional(14.0),
+                theme::text_dim(),
+            );
+            return;
+        }
+
+        if !show_waterfall {
+            // Spectrum only: no split, fill the pane.
+            let (response, painter) = ui.allocate_painter(full.size(), egui::Sense::click());
+            self.paint_spectrum(&painter, response.rect);
+            self.tune_interaction(&response, &painter, response.rect);
+            return;
+        }
+
+        if !show_spectrum {
+            // Waterfall only: ribbon on top, texture below.
+            let (response, painter) = ui.allocate_painter(full.size(), egui::Sense::click());
+            let rect = response.rect;
+            let scale_h = SCALE_BAR_H.min(rect.height() * 0.5);
+            let scale_rect =
+                egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), rect.top() + scale_h));
+            let plot_rect =
+                egui::Rect::from_min_max(egui::pos2(rect.left(), rect.top() + scale_h), rect.max);
+            self.waterfall.paint(&painter, plot_rect);
+            self.paint_frequency_scale(&painter, scale_rect);
+            self.paint_carrier(&painter, rect);
+            self.tune_interaction(&response, &painter, plot_rect);
+            return;
+        }
+
+        // Both visible: the waterfall (with its ribbon) lives in a resizable
+        // bottom panel whose separator is the native drag handle; the spectrum
+        // fills the remaining top area.
+        let panel_id = ui.id().with("panadapter-waterfall");
+        let min_h = (SCALE_BAR_H + 40.0).min(full.height() * 0.5);
+        let max_h = (full.height() - 40.0).max(min_h);
+        let default_h = (full.height() * (1.0 - SPECTRUM_SHARE)).clamp(min_h, max_h);
+
+        egui::Panel::bottom(panel_id)
+            .resizable(true)
+            .default_size(default_h)
+            .min_size(min_h)
+            .max_size(max_h)
+            .show_separator_line(true)
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| {
+                let (response, painter) =
+                    ui.allocate_painter(ui.available_size(), egui::Sense::click());
+                let rect = response.rect;
+                let scale_h = SCALE_BAR_H.min(rect.height() * 0.5);
+                let scale_rect = egui::Rect::from_min_max(
+                    rect.min,
+                    egui::pos2(rect.right(), rect.top() + scale_h),
+                );
+                let plot_rect = egui::Rect::from_min_max(
+                    egui::pos2(rect.left(), rect.top() + scale_h),
+                    rect.max,
+                );
+                self.waterfall.paint(&painter, plot_rect);
+                self.paint_frequency_scale(&painter, scale_rect);
+                self.tune_interaction(&response, &painter, plot_rect);
+            });
+
+        let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::click());
+        self.paint_spectrum(&painter, response.rect);
+        self.tune_interaction(&response, &painter, response.rect);
+
+        // Carrier line through the whole pane, drawn on top of both halves.
+        self.paint_carrier(&ui.painter_at(full), full);
     }
 
     /// Tab title for a pane, with live VFO state for the VFO panes.
@@ -2124,7 +2285,7 @@ impl ScuApp {
     pub(crate) fn render_pane(&mut self, pane: Pane, ui: &mut egui::Ui, _theme: theme::Theme) {
         let scrolls = !matches!(
             pane,
-            Pane::Spectrum | Pane::Waterfall | Pane::VfoA | Pane::VfoB
+            Pane::Panadapter | Pane::Spectrum | Pane::Waterfall | Pane::VfoA | Pane::VfoB
         );
         if scrolls {
             egui::ScrollArea::vertical()
@@ -2140,6 +2301,7 @@ impl ScuApp {
             Pane::VfoA => self.pane_vfo(ui, false),
             Pane::VfoB => self.pane_vfo(ui, true),
             Pane::Operate => self.pane_operate(ui),
+            Pane::Panadapter => self.pane_panadapter(ui),
             Pane::Spectrum => self.pane_spectrum(ui),
             Pane::Waterfall => self.pane_waterfall(ui),
             Pane::Radio => self.pane_radio(ui),
@@ -2836,6 +2998,28 @@ impl ScuApp {
         {
             self.set_scope_follow_vfo(follow);
         }
+
+        ui.horizontal(|ui| {
+            ui.label("Display");
+            let mut spectrum = self.settings.show_spectrum;
+            if ui
+                .checkbox(&mut spectrum, "Spectrum")
+                .on_hover_text("Show or hide the spectrum trace")
+                .changed()
+            {
+                self.settings.show_spectrum = spectrum;
+                save_settings(&self.settings);
+            }
+            let mut waterfall = self.settings.show_waterfall;
+            if ui
+                .checkbox(&mut waterfall, "Waterfall")
+                .on_hover_text("Show or hide the waterfall")
+                .changed()
+            {
+                self.settings.show_waterfall = waterfall;
+                save_settings(&self.settings);
+            }
+        });
 
         ui.horizontal(|ui| {
             ui.label("Colormap");
