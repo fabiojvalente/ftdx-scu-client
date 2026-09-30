@@ -372,13 +372,34 @@ fn recv_runner(
     })
 }
 
+/// How often a healthy session sends keepalives.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+/// Transient send errors (radio reboot, Wi-Fi change, sleep) are retried before
+/// the session is declared dead.
+const KEEPALIVE_RETRIES: u32 = 8;
+/// Delay between keepalive send retries.
+const KEEPALIVE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+
 fn keepalive_runner(handle: ScuHandle, tx: UnboundedSender<Event>) -> BoxFut<'static, ()> {
     Box::pin(async move {
         loop {
-            transport::sleep(Duration::from_secs(1)).await;
-            if handle.send_keepalives().await.is_err() {
-                let _ = tx.unbounded_send(Event::Disconnected("keepalive send failed".into()));
-                break;
+            transport::sleep(KEEPALIVE_INTERVAL).await;
+            let mut failures = 0u32;
+            loop {
+                match handle.send_keepalives().await {
+                    Ok(()) => break,
+                    Err(e) => {
+                        failures += 1;
+                        tracing::warn!(%e, failures, "keepalive send failed, retrying");
+                        if failures > KEEPALIVE_RETRIES {
+                            let _ = tx.unbounded_send(Event::Disconnected(format!(
+                                "keepalive send failed: {e}"
+                            )));
+                            return;
+                        }
+                        transport::sleep(KEEPALIVE_RETRY_INTERVAL).await;
+                    }
+                }
             }
         }
     })

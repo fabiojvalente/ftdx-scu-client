@@ -1,6 +1,10 @@
+#[cfg(not(target_arch = "wasm32"))]
+mod antenna;
 mod app;
 #[cfg(not(target_arch = "wasm32"))]
 mod cat_server;
+#[cfg(not(target_arch = "wasm32"))]
+mod hotkeys;
 mod layout;
 mod logging;
 mod meter;

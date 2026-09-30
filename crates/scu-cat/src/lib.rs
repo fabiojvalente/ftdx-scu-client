@@ -339,6 +339,47 @@ pub fn parse_noise_reduction(frame: &str) -> Option<bool> {
     parse_indexed_on_off(frame, "NR")
 }
 
+/// Maximum noise blanker level (`NL`, 1-20).
+pub const NOISE_BLANKER_LEVEL_MAX: u8 = 20;
+
+/// Maximum noise reduction (DNR) level (`RL`, 1-15).
+pub const NOISE_REDUCTION_LEVEL_MAX: u8 = 15;
+
+/// Build a "set noise blanker level" command (`NL` + VFO + three digits).
+pub fn set_noise_blanker_level(sub: bool, level: u8) -> String {
+    let level = level.clamp(1, NOISE_BLANKER_LEVEL_MAX);
+    format!("NL{}{level:03};", sub as u8)
+}
+
+/// Build a "read noise blanker level" command (`NL0;` / `NL1;`).
+pub fn read_noise_blanker_level(sub: bool) -> String {
+    format!("NL{};", sub as u8)
+}
+
+/// Parse the noise blanker level from an `NL0NNN;` response.
+pub fn parse_noise_blanker_level(frame: &str) -> Option<u8> {
+    parse_indexed_u8(frame, "NL", NOISE_BLANKER_LEVEL_MAX)
+}
+
+/// Build a "set noise reduction (DNR) level" command (`RL` + VFO + two digits).
+pub fn set_noise_reduction_level(sub: bool, level: u8) -> String {
+    let level = level.clamp(1, NOISE_REDUCTION_LEVEL_MAX);
+    format!("RL{}{level:02};", sub as u8)
+}
+
+/// Build a "read noise reduction level" command (`RL0;` / `RL1;`).
+pub fn read_noise_reduction_level(sub: bool) -> String {
+    format!("RL{};", sub as u8)
+}
+
+/// Parse the noise reduction level from an `RL0NN;` response.
+///
+/// The `RL` answer carries the DNR algorithm selector (1-15) on the FTDX10 /
+/// FTDX101 / FT-710, not an on/off flag.
+pub fn parse_noise_reduction_level(frame: &str) -> Option<u8> {
+    parse_indexed_u8(frame, "RL", NOISE_REDUCTION_LEVEL_MAX)
+}
+
 /// Build an "auto notch on/off" command (`BC` P1=0, P2).
 pub fn set_auto_notch(on: bool) -> String {
     format!("BC0{};", on as u8)
@@ -654,6 +695,90 @@ pub fn parse_agc(frame: &str) -> Option<Agc> {
         return None;
     }
     Agc::from_code(parsed.payload.chars().last()?)
+}
+
+/// Receiver front-end gain stage selected by the `PA` command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Preamp {
+    /// IPO: front-end preamplifier bypassed for a better strong-signal
+    /// intercept point.
+    Ipo,
+    /// AMP1: 10 dB preamplifier.
+    Amp1,
+    /// AMP2: 20 dB preamplifier.
+    Amp2,
+}
+
+impl Preamp {
+    pub fn code(self) -> char {
+        match self {
+            Preamp::Ipo => '0',
+            Preamp::Amp1 => '1',
+            Preamp::Amp2 => '2',
+        }
+    }
+
+    pub fn from_code(code: char) -> Option<Self> {
+        Some(match code {
+            '0' => Preamp::Ipo,
+            '1' => Preamp::Amp1,
+            '2' => Preamp::Amp2,
+            _ => return None,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Preamp::Ipo => "IPO",
+            Preamp::Amp1 => "AMP1",
+            Preamp::Amp2 => "AMP2",
+        }
+    }
+
+    pub const ALL: [Preamp; 3] = [Preamp::Ipo, Preamp::Amp1, Preamp::Amp2];
+}
+
+/// Build a "set preamp / IPO" command (`PA` + VFO + code).
+pub fn set_preamp(sub: bool, preamp: Preamp) -> String {
+    format!("PA{}{};", sub as u8, preamp.code())
+}
+
+/// Build a "read preamp / IPO" command (`PA0;` / `PA1;`).
+pub fn read_preamp(sub: bool) -> String {
+    format!("PA{};", sub as u8)
+}
+
+/// Parse the preamp / IPO from a `PA0P2;` response.
+pub fn parse_preamp(frame: &str) -> Option<Preamp> {
+    let parsed = split(frame)?;
+    if parsed.command != "PA" {
+        return None;
+    }
+    Preamp::from_code(parsed.payload.chars().nth(1)?)
+}
+
+/// Attenuator steps in dB, indexed by the `RA` code (0 = off).
+pub const ATTENUATOR_STEPS_DB: [u8; 4] = [0, 6, 12, 18];
+
+/// Build a "set attenuator" command (`RA` + VFO + step code, 0-3).
+pub fn set_attenuator(sub: bool, code: u8) -> String {
+    let code = code.min((ATTENUATOR_STEPS_DB.len() - 1) as u8);
+    format!("RA{}{};", sub as u8, code)
+}
+
+/// Build a "read attenuator" command (`RA0;` / `RA1;`).
+pub fn read_attenuator(sub: bool) -> String {
+    format!("RA{};", sub as u8)
+}
+
+/// Parse the attenuator step code from an `RA0P2;` response.
+pub fn parse_attenuator(frame: &str) -> Option<u8> {
+    let parsed = split(frame)?;
+    if parsed.command != "RA" {
+        return None;
+    }
+    let code: u32 = parsed.payload.get(1..)?.parse().ok()?;
+    Some(code.min((ATTENUATOR_STEPS_DB.len() - 1) as u32) as u8)
 }
 
 /// Maximum RF gain value (`RG` 0-255).
@@ -1961,6 +2086,27 @@ mod tests {
     }
 
     #[test]
+    fn build_and_parse_dsp_levels() {
+        assert_eq!(set_noise_blanker_level(false, 10), "NL0010;");
+        assert_eq!(set_noise_blanker_level(true, 5), "NL1005;");
+        assert_eq!(set_noise_blanker_level(false, 99), "NL0020;");
+        assert_eq!(read_noise_blanker_level(false), "NL0;");
+        assert_eq!(read_noise_blanker_level(true), "NL1;");
+        assert_eq!(parse_noise_blanker_level("NL0010;"), Some(10));
+        assert_eq!(parse_noise_blanker_level("NL1005;"), Some(5));
+        assert_eq!(parse_noise_blanker_level("NR01;"), None);
+
+        assert_eq!(set_noise_reduction_level(false, 1), "RL001;");
+        assert_eq!(set_noise_reduction_level(true, 15), "RL115;");
+        assert_eq!(set_noise_reduction_level(false, 99), "RL015;");
+        assert_eq!(read_noise_reduction_level(false), "RL0;");
+        assert_eq!(read_noise_reduction_level(true), "RL1;");
+        assert_eq!(parse_noise_reduction_level("RL001;"), Some(1));
+        assert_eq!(parse_noise_reduction_level("RL115;"), Some(15));
+        assert_eq!(parse_noise_reduction_level("RM001;"), None);
+    }
+
+    #[test]
     fn build_and_parse_agc() {
         assert_eq!(set_agc(Agc::Mid), "GT02;");
         assert_eq!(read_agc(), "GT0;");
@@ -1974,6 +2120,30 @@ mod tests {
         for agc in Agc::ALL {
             assert_eq!(Agc::from_code(agc.code()), Some(agc));
         }
+    }
+
+    #[test]
+    fn build_and_parse_preamp_and_attenuator() {
+        assert_eq!(set_preamp(false, Preamp::Amp2), "PA02;");
+        assert_eq!(set_preamp(true, Preamp::Ipo), "PA10;");
+        assert_eq!(read_preamp(false), "PA0;");
+        assert_eq!(read_preamp(true), "PA1;");
+        assert_eq!(parse_preamp("PA02;"), Some(Preamp::Amp2));
+        assert_eq!(parse_preamp("PA10;"), Some(Preamp::Ipo));
+        assert_eq!(parse_preamp("GT02;"), None);
+        for preamp in Preamp::ALL {
+            assert_eq!(Preamp::from_code(preamp.code()), Some(preamp));
+        }
+
+        assert_eq!(set_attenuator(false, 2), "RA02;");
+        assert_eq!(set_attenuator(true, 3), "RA13;");
+        assert_eq!(set_attenuator(false, 99), "RA03;");
+        assert_eq!(read_attenuator(false), "RA0;");
+        assert_eq!(read_attenuator(true), "RA1;");
+        assert_eq!(parse_attenuator("RA00;"), Some(0));
+        assert_eq!(parse_attenuator("RA13;"), Some(3));
+        assert_eq!(parse_attenuator("RG0128;"), None);
+        assert_eq!(ATTENUATOR_STEPS_DB, [0, 6, 12, 18]);
     }
 
     #[test]

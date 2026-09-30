@@ -46,11 +46,12 @@ pub enum Pane {
     CatConsole,
     CatServer,
     Vox,
+    Antenna,
 }
 
 impl Pane {
     /// Catalogue, in menu order.
-    pub const ALL: [Pane; 18] = [
+    pub const ALL: [Pane; 19] = [
         Pane::VfoA,
         Pane::VfoB,
         Pane::Operate,
@@ -69,6 +70,7 @@ impl Pane {
         Pane::CatConsole,
         Pane::CatServer,
         Pane::Vox,
+        Pane::Antenna,
     ];
 
     pub fn title(self) -> &'static str {
@@ -91,12 +93,13 @@ impl Pane {
             Pane::CatConsole => "CAT Console",
             Pane::CatServer => "Radio Server (CAT)",
             Pane::Vox => "VOX",
+            Pane::Antenna => "Antenna",
         }
     }
 
     /// Panels that only exist in the native build.
     pub fn native_only(self) -> bool {
-        matches!(self, Pane::CatServer | Pane::Vox)
+        matches!(self, Pane::CatServer | Pane::Vox | Pane::Antenna)
     }
 
     /// Whether this panel can be shown on the current host.
@@ -149,6 +152,7 @@ pub fn default_tree() -> Tree<Pane> {
             Pane::CatConsole,
             Pane::CatServer,
             Pane::Vox,
+            Pane::Antenna,
         ],
     );
     let left = linear(

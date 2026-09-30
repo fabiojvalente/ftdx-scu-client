@@ -13,11 +13,15 @@ use scu_audio::input::{MicConfig, MicInput, TxAudioSink};
 use scu_audio::output::{AudioOutput, AudioSink};
 #[cfg(not(target_arch = "wasm32"))]
 use scu_audio::vox::{Vox, VoxConfig};
-use scu_cat::{self, Agc, MeterKind, Mode, RadioModel, ScopeMode};
+use scu_cat::{self, Agc, MeterKind, Mode, Preamp, RadioModel, ScopeMode};
 use scu_client::{ConnectConfig, Event, ScuClient, ScuHandle};
 use scu_scope::{BinInterleave, Colormap, FrequencyAxis};
 use serde::{Deserialize, Serialize};
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::antenna::{self, AntennaAction, AntennaConfig};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::hotkeys;
 use crate::layout::{self, LayoutsFile, Pane};
 use crate::meter::{scale_for, LinearMeter};
 use crate::shortcuts;
@@ -129,6 +133,31 @@ pub struct AppSettings {
     /// Waterfall contrast gain above the black level.
     #[serde(default = "default_waterfall_gain")]
     pub waterfall_gain: f32,
+    /// Drive an external LAN antenna switch from the Operate pane.
+    #[serde(default)]
+    pub antenna_enabled: bool,
+    /// Host name or IP of the antenna switch.
+    #[serde(default = "default_antenna_host")]
+    pub antenna_host: String,
+    /// HTTP port of the antenna switch.
+    #[serde(default = "default_antenna_port")]
+    pub antenna_port: u16,
+    /// HTTP basic-auth user for the antenna switch.
+    #[serde(default)]
+    pub antenna_username: String,
+    /// HTTP basic-auth password for the antenna switch.
+    #[serde(default)]
+    pub antenna_password: String,
+    /// Number of antenna ports on the switch.
+    #[serde(default = "default_antenna_ports")]
+    pub antenna_ports: u8,
+    /// How often to read the switch state, in seconds.
+    #[serde(default = "default_antenna_poll_secs")]
+    pub antenna_poll_secs: u32,
+    /// System-wide PTT/MOX shortcut, in canonical `global-hotkey` form
+    /// (`"alt+KeyP"`, `"F13"`, ...). `None` disables it.
+    #[serde(default)]
+    pub ptt_hotkey: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -164,6 +193,14 @@ impl Default for AppSettings {
             waterfall_colormap: default_colormap(),
             waterfall_black_level: default_black_level(),
             waterfall_gain: default_waterfall_gain(),
+            antenna_enabled: false,
+            antenna_host: default_antenna_host(),
+            antenna_port: default_antenna_port(),
+            antenna_username: String::new(),
+            antenna_password: String::new(),
+            antenna_ports: default_antenna_ports(),
+            antenna_poll_secs: default_antenna_poll_secs(),
+            ptt_hotkey: None,
         }
     }
 }
@@ -210,6 +247,22 @@ fn default_black_level() -> f32 {
 
 fn default_waterfall_gain() -> f32 {
     1.4
+}
+
+fn default_antenna_host() -> String {
+    "192.168.1.165".into()
+}
+
+fn default_antenna_port() -> u16 {
+    80
+}
+
+fn default_antenna_ports() -> u8 {
+    6
+}
+
+fn default_antenna_poll_secs() -> u32 {
+    60
 }
 
 fn default_visible_meters() -> Vec<u8> {
@@ -286,15 +339,19 @@ enum SettingsTab {
     #[default]
     Appearance,
     Meters,
+    Antenna,
+    Keys,
     Panes,
     Logging,
     Debug,
 }
 
 impl SettingsTab {
-    const ALL: [SettingsTab; 5] = [
+    const ALL: [SettingsTab; 7] = [
         SettingsTab::Appearance,
         SettingsTab::Meters,
+        SettingsTab::Antenna,
+        SettingsTab::Keys,
         SettingsTab::Panes,
         SettingsTab::Logging,
         SettingsTab::Debug,
@@ -304,6 +361,8 @@ impl SettingsTab {
         match self {
             SettingsTab::Appearance => "Appearance",
             SettingsTab::Meters => "Meters",
+            SettingsTab::Antenna => "Antenna",
+            SettingsTab::Keys => "Keys",
             SettingsTab::Panes => "Panes",
             SettingsTab::Logging => "Logging",
             SettingsTab::Debug => "Debug",
@@ -335,6 +394,14 @@ pub struct ScuApp {
     noise_reduction: bool,
     auto_notch: bool,
     narrow: bool,
+    /// Noise blanker level (`NL`, 1-20) per VFO (0 = A/Main, 1 = B/Sub).
+    noise_blanker_level: [u8; 2],
+    /// Noise reduction (DNR) level (`RL`, 1-15) per VFO.
+    noise_reduction_level: [u8; 2],
+    /// Receiver front-end stage (`PA`) per VFO (0 = A/Main, 1 = B/Sub).
+    preamp: [Option<Preamp>; 2],
+    /// Attenuator step code (`RA`, 0 = off ... 3 = 18 dB) per VFO.
+    attenuator: [u8; 2],
     agc: Option<Agc>,
     rf_gain: u8,
     squelch: u8,
@@ -424,6 +491,17 @@ pub struct ScuApp {
     /// Panes asked to pop out this frame (processed after the tree render).
     popout_requests: Vec<Pane>,
 
+    /// External LAN antenna switch (status + command worker).
+    #[cfg(not(target_arch = "wasm32"))]
+    antenna: antenna::AntennaState,
+
+    /// System-wide PTT/MOX hotkey registration.
+    #[cfg(not(target_arch = "wasm32"))]
+    hotkeys: hotkeys::HotkeyManager,
+    /// True while the Settings "Keys" tab is capturing a keypress.
+    #[cfg(not(target_arch = "wasm32"))]
+    recording_hotkey: bool,
+
     /// Audio fan-out the engine writes RX frames to (local + streaming outputs).
     audio_sinks: Arc<std::sync::Mutex<Vec<AudioSink>>>,
 
@@ -486,6 +564,12 @@ impl ScuApp {
         if std::env::var_os("RUST_LOG").is_none() {
             crate::logging::set_level(settings.log_level.filter());
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        let hotkeys = {
+            let mut hotkeys = hotkeys::HotkeyManager::new(cc.egui_ctx.clone());
+            hotkeys.apply(settings.ptt_hotkey.as_deref());
+            hotkeys
+        };
         Self {
             config,
             handle: None,
@@ -507,6 +591,10 @@ impl ScuApp {
             noise_reduction: false,
             auto_notch: false,
             narrow: false,
+            noise_blanker_level: [10, 10],
+            noise_reduction_level: [1, 1],
+            preamp: [None, None],
+            attenuator: [0, 0],
             agc: None,
             rf_gain: 128,
             squelch: 0,
@@ -556,6 +644,12 @@ impl ScuApp {
             layout_prompt_focus: false,
             ptt_held: false,
             popout_requests: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            antenna: antenna::AntennaState::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            hotkeys,
+            #[cfg(not(target_arch = "wasm32"))]
+            recording_hotkey: false,
             audio_sinks: Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(not(target_arch = "wasm32"))]
             rx_stream: None,
@@ -1091,7 +1185,8 @@ impl ScuApp {
                 // needs to be known to route the two answers.
                 "ID;", "FA;", "FB;", "VS;", "MD0;", "MD1;", "FT;", "ST;", "SH0;", "SH1;", "IS0;",
                 "IS1;", "SM0;", "PS;", "PC;", "MG;", "AC;", "RT;", "XT;", "NB0;", "NR0;", "BC0;",
-                "NA0;", "GT0;", "RG0;", "SQ0;", "TX;", "AI1;", "SS05;", "SS06;",
+                "NA0;", "NL0;", "NL1;", "RL0;", "RL1;", "GT0;", "PA0;", "PA1;", "RA0;", "RA1;",
+                "RG0;", "SQ0;", "TX;", "AI1;", "SS05;", "SS06;",
             ] {
                 handle.send_cat(cmd);
             }
@@ -1180,7 +1275,16 @@ impl ScuApp {
             Event::Error(message) => self.push_log(format!("! {message}")),
             Event::Disconnected(reason) => {
                 self.status = format!("disconnected: {reason}");
+                // Tear the engine down here as well as via `Stopped`: the session
+                // is already dead, and leaving `engine_rx` set would make
+                // `connect()` bail out (see its `engine_rx.is_some()` guard).
+                if let Some(flag) = &self.shutdown {
+                    flag.store(true, Ordering::Relaxed);
+                }
                 self.handle = None;
+                self.engine_rx = None;
+                self.shutdown = None;
+                self.connecting = false;
                 self.radio_tx = false;
                 self.stop_tx();
                 self.sync_cat_server();
@@ -1273,6 +1377,30 @@ impl ScuApp {
             "NA" => {
                 if let Some(on) = scu_cat::parse_narrow(text) {
                     self.narrow = on;
+                }
+            }
+            "NL" => {
+                if let Some(level) = scu_cat::parse_noise_blanker_level(text) {
+                    let sub = frame_vfo_sub(text, self.rx_sub);
+                    self.noise_blanker_level[sub as usize] = level;
+                }
+            }
+            "RL" => {
+                if let Some(level) = scu_cat::parse_noise_reduction_level(text) {
+                    let sub = frame_vfo_sub(text, self.rx_sub);
+                    self.noise_reduction_level[sub as usize] = level;
+                }
+            }
+            "PA" => {
+                if let Some(preamp) = scu_cat::parse_preamp(text) {
+                    let sub = frame_vfo_sub(text, self.rx_sub);
+                    self.preamp[sub as usize] = Some(preamp);
+                }
+            }
+            "RA" => {
+                if let Some(code) = scu_cat::parse_attenuator(text) {
+                    let sub = frame_vfo_sub(text, self.rx_sub);
+                    self.attenuator[sub as usize] = code;
                 }
             }
             "SH" => {
@@ -1682,6 +1810,42 @@ impl ScuApp {
         }
     }
 
+    /// Set the noise blanker level (`NL`) for the active VFO.
+    fn set_noise_blanker_level(&mut self, level: u8) {
+        let sub = self.rx_sub;
+        self.noise_blanker_level[sub as usize] = level;
+        if let Some(handle) = &self.handle {
+            handle.send_cat(&scu_cat::set_noise_blanker_level(sub, level));
+        }
+    }
+
+    /// Set the noise reduction (DNR) level (`RL`) for the active VFO.
+    fn set_noise_reduction_level(&mut self, level: u8) {
+        let sub = self.rx_sub;
+        self.noise_reduction_level[sub as usize] = level;
+        if let Some(handle) = &self.handle {
+            handle.send_cat(&scu_cat::set_noise_reduction_level(sub, level));
+        }
+    }
+
+    /// Set the receiver front-end stage (`PA`) for the active VFO.
+    fn set_preamp(&mut self, preamp: Preamp) {
+        let sub = self.rx_sub;
+        self.preamp[sub as usize] = Some(preamp);
+        if let Some(handle) = &self.handle {
+            handle.send_cat(&scu_cat::set_preamp(sub, preamp));
+        }
+    }
+
+    /// Set the attenuator step (`RA`) for the active VFO.
+    fn set_attenuator(&mut self, code: u8) {
+        let sub = self.rx_sub;
+        self.attenuator[sub as usize] = code;
+        if let Some(handle) = &self.handle {
+            handle.send_cat(&scu_cat::set_attenuator(sub, code));
+        }
+    }
+
     fn set_agc(&mut self, agc: Agc) {
         self.agc = Some(agc);
         if let Some(handle) = &self.handle {
@@ -1731,13 +1895,89 @@ impl ScuApp {
                 for cmd in [
                     "FA;", "FB;", "VS;", "MD0;", "MD1;", "ST;", "SH0;", "SH1;", "IS0;", "IS1;", cf,
                     "SM0;", "PC;", "MG;", "AC;", "RT;", "XT;", "NB0;", "NR0;", "BC0;", "NA0;",
-                    "GT0;", "RG0;", "SQ0;", "TX;", "SS05;", "RM3;", "RM4;", "RM5;", "RM6;", "RM7;",
-                    "RM8;", "RM9;",
+                    "NL0;", "NL1;", "RL0;", "RL1;", "GT0;", "PA0;", "PA1;", "RA0;", "RA1;", "RG0;",
+                    "SQ0;", "TX;", "SS05;", "RM3;", "RM4;", "RM5;", "RM6;", "RM7;", "RM8;", "RM9;",
                 ] {
                     handle.send_cat(cmd);
                 }
             }
         }
+    }
+
+    /// Build the switch connection properties from the current settings.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn antenna_config(&self) -> AntennaConfig {
+        AntennaConfig {
+            host: self.settings.antenna_host.clone(),
+            port: self.settings.antenna_port,
+            username: self.settings.antenna_username.clone(),
+            password: self.settings.antenna_password.clone(),
+        }
+    }
+
+    /// Poll the antenna switch state on an interval while it is enabled. Runs
+    /// independently of the radio session, so it works while disconnected.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_antenna(&mut self, ctx: &egui::Context) {
+        self.antenna.drain();
+        if !self.settings.antenna_enabled || self.antenna.in_flight() {
+            return;
+        }
+        if self.antenna.take_confirm_due() {
+            self.antenna
+                .request(self.antenna_config(), AntennaAction::Poll, ctx.clone());
+            return;
+        }
+        let interval = Duration::from_secs(self.settings.antenna_poll_secs.max(1) as u64);
+        let due = self
+            .antenna
+            .since_last_attempt()
+            .map(|elapsed| elapsed >= interval)
+            .unwrap_or(true);
+        if due {
+            self.antenna
+                .request(self.antenna_config(), AntennaAction::Poll, ctx.clone());
+        }
+    }
+
+    /// Move the antenna one step up or down. The port is updated optimistically
+    /// so the panel reacts instantly; the switch's answer corrects it.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn antenna_step(&mut self, up: bool, ctx: &egui::Context) {
+        let ports = self.settings.antenna_ports.max(1);
+        if let Some(current) = self.antenna.current {
+            let next = if up {
+                current % ports + 1
+            } else {
+                (current + ports - 2) % ports + 1
+            };
+            self.antenna.current = Some(next);
+        }
+        self.antenna.confirm_soon();
+        let action = if up {
+            AntennaAction::Up
+        } else {
+            AntennaAction::Down
+        };
+        self.antenna
+            .request(self.antenna_config(), action, ctx.clone());
+    }
+
+    /// Select a specific antenna port. The selection is shown optimistically
+    /// before the switch confirms it.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn antenna_set(&mut self, port: u8, ctx: &egui::Context) {
+        self.antenna.current = Some(port);
+        self.antenna.confirm_soon();
+        self.antenna
+            .request(self.antenna_config(), AntennaAction::Set(port), ctx.clone());
+    }
+
+    /// Read the switch status immediately, regardless of the poll interval.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn refresh_antenna(&mut self, ctx: &egui::Context) {
+        self.antenna
+            .request(self.antenna_config(), AntennaAction::Poll, ctx.clone());
     }
 
     fn axis(&self) -> FrequencyAxis {
@@ -2106,6 +2346,82 @@ impl ScuApp {
         self.ptt_held = ptt_held;
     }
 
+    /// Antenna pane: controls for the external LAN antenna switch. Independent
+    /// of the radio session.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pane_antenna(&mut self, ui: &mut egui::Ui) {
+        if !self.settings.antenna_enabled {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("Antenna switch control is disabled.").color(theme::text_dim()),
+            );
+            ui.label(
+                egui::RichText::new("Enable it in Settings \u{203a} Antenna.")
+                    .small()
+                    .color(theme::text_faint()),
+            );
+            return;
+        }
+
+        theme::section(ui, "Antenna");
+        let current = self.antenna.current;
+        let ports = self.settings.antenna_ports;
+        let ctx = ui.ctx().clone();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Current").color(theme::text_dim()));
+            let text = current
+                .map(|port| port.to_string())
+                .unwrap_or_else(|| "--".to_string());
+            ui.label(egui::RichText::new(text).strong().color(theme::accent()));
+            if !self.antenna.band.is_empty() {
+                ui.label(
+                    egui::RichText::new(&self.antenna.band)
+                        .small()
+                        .color(theme::text_faint()),
+                );
+            }
+            if ui
+                .add(egui::Button::new("Refresh").small())
+                .on_hover_text("Refresh the switch status now")
+                .clicked()
+            {
+                self.refresh_antenna(&ctx);
+            }
+            if self.antenna.in_flight() {
+                ui.spinner();
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            for port in 1..=ports {
+                if toggle_chip(ui, current == Some(port), &port.to_string()) {
+                    self.antenna_set(port, &ctx);
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            if ui
+                .button("ANT UP")
+                .on_hover_text("Move to the next antenna port")
+                .clicked()
+            {
+                self.antenna_step(true, &ctx);
+            }
+            if ui
+                .button("ANT DOWN")
+                .on_hover_text("Move to the previous antenna port")
+                .clicked()
+            {
+                self.antenna_step(false, &ctx);
+            }
+        });
+
+        if let Some(err) = self.antenna.error.clone() {
+            ui.label(egui::RichText::new(err).small().color(theme::tx_red()));
+        }
+    }
+
     /// One VFO read-out pane, sized to the available width. Carries the VFO's
     /// S-meter and the VFO switch/copy shortcuts.
     fn pane_vfo(&mut self, ui: &mut egui::Ui, sub: bool) {
@@ -2323,6 +2639,12 @@ impl ScuApp {
             Pane::Vox => {
                 #[cfg(not(target_arch = "wasm32"))]
                 self.ui_vox(ui);
+                #[cfg(target_arch = "wasm32")]
+                ui.label("Not available in the browser build.");
+            }
+            Pane::Antenna => {
+                #[cfg(not(target_arch = "wasm32"))]
+                self.pane_antenna(ui);
                 #[cfg(target_arch = "wasm32")]
                 ui.label("Not available in the browser build.");
             }
@@ -2809,9 +3131,31 @@ impl ScuApp {
         if ui.checkbox(&mut nb, "Noise blanker").changed() {
             self.set_noise_blanker(nb);
         }
+        let sub = self.rx_sub as usize;
+        let mut nb_level = self.noise_blanker_level[sub] as i32;
+        if ui
+            .add(
+                egui::Slider::new(&mut nb_level, 1..=scu_cat::NOISE_BLANKER_LEVEL_MAX as i32)
+                    .text("NB level"),
+            )
+            .changed()
+        {
+            self.set_noise_blanker_level(nb_level as u8);
+        }
         let mut nr = self.noise_reduction;
         if ui.checkbox(&mut nr, "Noise reduction").changed() {
             self.set_noise_reduction(nr);
+        }
+        let mut nr_level = self.noise_reduction_level[sub] as i32;
+        if ui
+            .add(
+                egui::Slider::new(&mut nr_level, 1..=scu_cat::NOISE_REDUCTION_LEVEL_MAX as i32)
+                    .text("DNR level"),
+            )
+            .on_hover_text("On the FTDX10 this selects the DNR algorithm (1-15)")
+            .changed()
+        {
+            self.set_noise_reduction_level(nr_level as u8);
         }
         let mut notch = self.auto_notch;
         if ui.checkbox(&mut notch, "Auto notch").changed() {
@@ -2842,6 +3186,45 @@ impl ScuApp {
             if let Some(agc) = selected_agc {
                 self.set_agc(agc);
             }
+        }
+        let current_preamp = self.preamp[self.rx_sub as usize];
+        let mut selected_preamp = current_preamp;
+        egui::ComboBox::from_id_salt("preamp")
+            .selected_text(format!(
+                "Preamp {}",
+                current_preamp.map(|p| p.label()).unwrap_or("--")
+            ))
+            .show_ui(ui, |ui| {
+                for preamp in Preamp::ALL {
+                    ui.selectable_value(&mut selected_preamp, Some(preamp), preamp.label());
+                }
+            });
+        if selected_preamp != current_preamp {
+            if let Some(preamp) = selected_preamp {
+                self.set_preamp(preamp);
+            }
+        }
+        let current_att = self.attenuator[self.rx_sub as usize];
+        let att_label = if current_att == 0 {
+            "Off".to_string()
+        } else {
+            format!("{} dB", scu_cat::ATTENUATOR_STEPS_DB[current_att as usize])
+        };
+        let mut selected_att = current_att;
+        egui::ComboBox::from_id_salt("attenuator")
+            .selected_text(format!("ATT {att_label}"))
+            .show_ui(ui, |ui| {
+                for (code, db) in scu_cat::ATTENUATOR_STEPS_DB.iter().enumerate() {
+                    let label = if *db == 0 {
+                        "Off".to_string()
+                    } else {
+                        format!("{db} dB")
+                    };
+                    ui.selectable_value(&mut selected_att, code as u8, label);
+                }
+            });
+        if selected_att != current_att {
+            self.set_attenuator(selected_att);
         }
         let mut rf_gain = self.rf_gain as i32;
         if ui
@@ -3304,6 +3687,8 @@ impl ScuApp {
                     .show(ui, |ui| match self.settings_tab {
                         SettingsTab::Appearance => self.settings_appearance(ui),
                         SettingsTab::Meters => self.settings_meters(ui),
+                        SettingsTab::Antenna => self.settings_antenna(ui),
+                        SettingsTab::Keys => self.settings_keys(ui),
                         SettingsTab::Panes => self.settings_panes(ui),
                         SettingsTab::Logging => self.settings_logging(ui),
                         SettingsTab::Debug => self.settings_debug(ui),
@@ -3382,6 +3767,256 @@ impl ScuApp {
                 }
                 self.settings.visible_meters.sort_unstable();
                 save_settings(&self.settings);
+            }
+        }
+    }
+
+    /// Antenna tab: enable the LAN antenna switch and set its connection
+    /// properties. When enabled, the switch controls appear in the Antenna pane.
+    fn settings_antenna(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "LAN antenna switch");
+        ui.label(
+            egui::RichText::new(
+                "Tailored to the MS-S6AB; it may also work with any switch driven by \
+                 the MS-AB controller. The switch exposes a small HTTP interface \
+                 (/ant/up, /ant/down, /ant?val=N) protected by HTTP basic auth.",
+            )
+            .small()
+            .color(theme::text_faint()),
+        );
+        let mut enabled = self.settings.antenna_enabled;
+        if ui
+            .checkbox(&mut enabled, "Enable antenna switch control")
+            .on_hover_text("Show the antenna switch controls in the Antenna pane")
+            .changed()
+        {
+            self.settings.antenna_enabled = enabled;
+            save_settings(&self.settings);
+        }
+
+        ui.add_enabled_ui(enabled, |ui| {
+            let mut changed = false;
+            egui::Grid::new("antenna-connection")
+                .num_columns(2)
+                .spacing([10.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Host");
+                    changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.settings.antenna_host)
+                                .desired_width(160.0)
+                                .hint_text("192.168.1.165"),
+                        )
+                        .changed();
+                    ui.end_row();
+
+                    ui.label("Port");
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut self.settings.antenna_port)
+                                .range(1..=65535)
+                                .speed(1.0),
+                        )
+                        .changed();
+                    ui.end_row();
+
+                    ui.label("User");
+                    changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.settings.antenna_username)
+                                .desired_width(160.0),
+                        )
+                        .changed();
+                    ui.end_row();
+
+                    ui.label("Password");
+                    changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.settings.antenna_password)
+                                .password(true)
+                                .desired_width(160.0),
+                        )
+                        .changed();
+                    ui.end_row();
+
+                    ui.label("Ports");
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut self.settings.antenna_ports)
+                                .range(1..=16)
+                                .speed(1.0),
+                        )
+                        .on_hover_text("How many antenna ports the switch exposes")
+                        .changed();
+                    ui.end_row();
+
+                    ui.label("Poll");
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut self.settings.antenna_poll_secs)
+                                .range(1..=3600)
+                                .speed(1.0)
+                                .suffix(" s"),
+                        )
+                        .on_hover_text("How often to read the switch state")
+                        .changed();
+                    ui.end_row();
+                });
+            if changed {
+                save_settings(&self.settings);
+            }
+        });
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            theme::section(ui, "Status");
+            let (text, color) = if let Some(err) = &self.antenna.error {
+                (err.clone(), theme::tx_red())
+            } else if let Some(current) = self.antenna.current {
+                let band = if self.antenna.band.is_empty() {
+                    String::new()
+                } else {
+                    format!(" \u{00b7} {}", self.antenna.band)
+                };
+                (format!("Port {current}{band}"), theme::rx_green())
+            } else {
+                ("Not read yet".to_string(), theme::text_dim())
+            };
+            ui.label(egui::RichText::new(text).color(color));
+        }
+        #[cfg(target_arch = "wasm32")]
+        ui.label(
+            egui::RichText::new("Antenna switch control is not available in the browser build.")
+                .small()
+                .color(theme::text_faint()),
+        );
+    }
+
+    /// Keys tab: the system-wide PTT/MOX shortcut.
+    fn settings_keys(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "Global PTT (MOX)");
+        ui.label(
+            egui::RichText::new(
+                "Hold the shortcut to key the transmitter from any application, \
+                 even when this window is not focused. Release to return to receive.",
+            )
+            .small()
+            .color(theme::text_faint()),
+        );
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            ui.label(
+                egui::RichText::new("Global shortcuts are not available in the browser build.")
+                    .color(theme::text_dim()),
+            );
+            return;
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let current = self.settings.ptt_hotkey.clone();
+            ui.horizontal(|ui| {
+                ui.label("Shortcut");
+                let text = current
+                    .as_deref()
+                    .map(hotkeys::display)
+                    .unwrap_or_else(|| "Not set".to_string());
+                let color = if current.is_some() {
+                    theme::accent()
+                } else {
+                    theme::text_dim()
+                };
+                ui.label(egui::RichText::new(text).monospace().strong().color(color));
+            });
+
+            if self.recording_hotkey {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Press a key combination\u{2026}")
+                            .strong()
+                            .color(theme::warn_amber()),
+                    );
+                    if ui.button("Cancel").clicked() {
+                        self.recording_hotkey = false;
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Use a modifier (Ctrl / Alt / Shift / Cmd) or a function key. Esc cancels.",
+                    )
+                    .small()
+                    .color(theme::text_faint()),
+                );
+            } else {
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Record")
+                        .on_hover_text("Capture the next key combination")
+                        .clicked()
+                    {
+                        self.recording_hotkey = true;
+                    }
+                    if ui
+                        .add_enabled(current.is_some(), egui::Button::new("Clear"))
+                        .on_hover_text("Remove the global shortcut")
+                        .clicked()
+                    {
+                        self.settings.ptt_hotkey = None;
+                        save_settings(&self.settings);
+                        self.hotkeys.apply(None);
+                    }
+                });
+            }
+
+            if let Some(err) = self.hotkeys.error() {
+                ui.label(egui::RichText::new(err).small().color(theme::tx_red()));
+            }
+            if self.hotkeys.is_pressed() {
+                ui.label(
+                    egui::RichText::new("Keyed by global shortcut")
+                        .small()
+                        .color(theme::rx_green()),
+                );
+            }
+        }
+    }
+
+    /// While the Keys tab is recording, turn the next key press into a global
+    /// shortcut (or cancel on Esc).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn capture_hotkey(&mut self, ctx: &egui::Context) {
+        let mut captured: Option<Option<String>> = None;
+        ctx.input(|input| {
+            for event in &input.events {
+                let egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                } = event
+                else {
+                    continue;
+                };
+                if *key == egui::Key::Escape {
+                    captured = Some(None);
+                    break;
+                }
+                let key = physical_key.unwrap_or(*key);
+                if let Some(spec) = hotkeys::capture(key, modifiers) {
+                    captured = Some(Some(spec));
+                    break;
+                }
+            }
+        });
+
+        if let Some(result) = captured {
+            self.recording_hotkey = false;
+            if let Some(spec) = result {
+                self.settings.ptt_hotkey = Some(spec);
+                save_settings(&self.settings);
+                self.hotkeys.apply(self.settings.ptt_hotkey.as_deref());
             }
         }
     }
@@ -3584,6 +4219,8 @@ impl eframe::App for ScuApp {
     /// session keeps polling and the UI keeps receiving engine messages.
     fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_engine();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.poll_antenna(_ctx);
         self.maybe_refresh_vfo();
         self.poll();
         #[cfg(not(target_arch = "wasm32"))]
@@ -3632,8 +4269,20 @@ impl eframe::App for ScuApp {
         let space = self.handle.is_some()
             && ctx.memory(|m| m.focused().is_none())
             && ctx.input(|i| i.key_down(egui::Key::Space));
-        self.set_ptt(self.ptt_held || space);
+        #[cfg(not(target_arch = "wasm32"))]
+        let global_ptt = self.handle.is_some() && self.hotkeys.is_pressed();
+        #[cfg(target_arch = "wasm32")]
+        let global_ptt = false;
+        self.set_ptt(self.ptt_held || space || global_ptt);
 
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.recording_hotkey {
+            self.capture_hotkey(&ctx);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.show_settings {
+            self.recording_hotkey = false;
+        }
         self.ui_settings(&ctx);
         self.ui_layout_prompt(&ctx);
         self.ui_shortcuts_help(&ctx);
@@ -4067,6 +4716,13 @@ impl ScuApp {
     /// Dispatch keyboard shortcuts. Runs before the panels so that a frequency
     /// editor can take focus in the same frame.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // While capturing a global shortcut the keymap is suspended so the
+        // pressed combination is not also dispatched as a command.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.recording_hotkey {
+            return;
+        }
+
         let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         let presses = Self::collect_shortcuts(ctx);
 
@@ -4454,11 +5110,15 @@ async fn engine_future(
                 }
             }
             Some(Some(event)) => {
+                let disconnected = matches!(event, Event::Disconnected(_));
                 if tx.send(EngineMsg::Event(event)).is_err() {
                     break;
                 }
                 // Wake the UI even when it is unfocused or occluded.
                 ctx.request_repaint();
+                if disconnected {
+                    break;
+                }
             }
             Some(None) => break,
             None => {}
