@@ -1855,8 +1855,7 @@ impl ScuApp {
     /// One VFO read-out pane, sized to the available width. Carries the VFO's
     /// S-meter and the VFO switch/copy shortcuts.
     fn pane_vfo(&mut self, ui: &mut egui::Ui, sub: bool) {
-        let width = ui.available_width().max(180.0);
-        self.vfo_card(ui, sub, width);
+        self.vfo_card(ui, sub);
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui
@@ -2022,13 +2021,11 @@ impl ScuApp {
     }
 
     /// One VFO read-out card (Main = VFO-A, Sub = VFO-B).
-    fn vfo_card(&mut self, ui: &mut egui::Ui, sub: bool, width: f32) {
+    fn vfo_card(&mut self, ui: &mut egui::Ui, sub: bool) {
         let active = self.rx_sub == sub;
         let border = if active { theme::accent() } else { theme::outline() };
         let name = if sub { "SUB" } else { "MAIN" };
         let vfo = if sub { "B" } else { "A" };
-        // Keep the frequency inside the card at any window width.
-        let freq_size = (width / 7.5).clamp(18.0, 30.0);
 
         egui::Frame::new()
             .fill(theme::card_bg())
@@ -2036,6 +2033,13 @@ impl ScuApp {
             .corner_radius(6)
             .inner_margin(egui::Margin::symmetric(12, 8))
             .show(ui, |ui| {
+                // The frame has already reserved room for its inner margin and
+                // stroke, so size the content to the width available *inside*
+                // it. Using the outer width overflows to the right and clips
+                // the border off at the pane edge.
+                let width = ui.available_width();
+                // Keep the frequency inside the card at any window width.
+                let freq_size = (width / 7.5).clamp(18.0, 30.0);
                 ui.set_width(width);
                 ui.horizontal(|ui| {
                     ui.label(
@@ -2532,7 +2536,12 @@ impl ScuApp {
             };
             let kind = MeterKind::from_rm_index(index as u8);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(kind.label()).monospace().strong());
+                ui.label(
+                    egui::RichText::new(kind.label())
+                        .monospace()
+                        .strong()
+                        .color(theme::text_dim()),
+                );
                 ui.add(
                     egui::ProgressBar::new(kind.fraction(raw))
                         .fill(theme::accent())
@@ -3275,7 +3284,11 @@ impl ScuApp {
                     .frame(theme::top_bar_frame())
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(pane.title()).strong());
+                            ui.label(
+                                egui::RichText::new(pane.title())
+                                    .strong()
+                                    .color(theme::text()),
+                            );
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {

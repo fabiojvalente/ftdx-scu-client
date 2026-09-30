@@ -317,7 +317,10 @@ impl Theme {
         v.widgets.hovered.bg_fill = self.button_hover_bg;
         v.widgets.hovered.weak_bg_fill = self.button_hover_bg;
         v.widgets.hovered.bg_stroke = Stroke::new(1.0, self.accent);
-        v.widgets.hovered.fg_stroke = Stroke::new(1.0, self.on_accent);
+        // Hovered widgets (checkboxes, labels, buttons) sit on `button_hover_bg`,
+        // not on the bright accent fill, so use normal text colour — `on_accent`
+        // would make them unreadable in dark themes.
+        v.widgets.hovered.fg_stroke = Stroke::new(1.0, self.text);
         v.widgets.hovered.corner_radius = CornerRadius::same(self.radius);
         v.widgets.hovered.expansion = 0.0;
 
@@ -331,7 +334,7 @@ impl Theme {
         v.widgets.open.bg_fill = self.button_hover_bg;
         v.widgets.open.weak_bg_fill = self.button_hover_bg;
         v.widgets.open.bg_stroke = Stroke::new(1.0, self.accent);
-        v.widgets.open.fg_stroke = Stroke::new(1.0, self.on_accent);
+        v.widgets.open.fg_stroke = Stroke::new(1.0, self.text);
         v.widgets.open.corner_radius = CornerRadius::same(self.radius);
 
         v

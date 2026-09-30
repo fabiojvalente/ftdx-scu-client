@@ -438,11 +438,21 @@ impl Behavior<Pane> for FlexBehavior<'_> {
         if self.app.is_popped(pane) {
             return;
         }
-        if ui
-            .small_button("\u{2b08}")
-            .on_hover_text("Open this panel in its own window")
-            .clicked()
-        {
+        // A zero horizontal padding plus a square `min_size` gives the icon a
+        // square button instead of a wide rectangle.
+        let clicked = ui
+            .scope(|ui| {
+                ui.spacing_mut().button_padding = egui::Vec2::ZERO;
+                ui.add(
+                    egui::Button::new(egui::RichText::new("\u{2b08}").size(9.0))
+                        .small()
+                        .min_size(egui::Vec2::splat(18.0)),
+                )
+                .on_hover_text("Open this panel in its own window")
+                .clicked()
+            })
+            .inner;
+        if clicked {
             self.app.request_popout(pane);
         }
     }
@@ -470,13 +480,132 @@ impl Behavior<Pane> for FlexBehavior<'_> {
         _visuals: &egui::Visuals,
         _tiles: &Tiles<Pane>,
         _tile_id: TileId,
-        state: &egui_tiles::TabState,
+        _state: &egui_tiles::TabState,
     ) -> Stroke {
-        if state.active {
-            Stroke::new(1.0, self.theme.accent)
+        Stroke::NONE
+    }
+
+    /// Mirror of the default `egui_tiles` tab UI, with one change: the active
+    /// tab's title is painted twice with a sub-pixel offset to fake a heavier
+    /// weight. egui has no bold font face (`RichText::strong` only tweaks the
+    /// colour), so this is how we add a little weight to the selected tab.
+    fn tab_ui(
+        &mut self,
+        tiles: &mut Tiles<Pane>,
+        ui: &mut egui::Ui,
+        id: egui::Id,
+        tile_id: TileId,
+        state: &egui_tiles::TabState,
+    ) -> egui::Response {
+        let text = self.tab_title_for_tile(tiles, tile_id);
+        let close_btn_size = egui::Vec2::splat(self.close_button_outer_size());
+        let close_btn_left_padding = 4.0;
+        let font_id = egui::TextStyle::Button.resolve(ui.style());
+        let galley =
+            text.into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, font_id);
+
+        let x_margin = self.tab_title_spacing(ui.visuals());
+
+        let button_width = galley.size().x
+            + 2.0 * x_margin
+            + f32::from(state.closable) * (close_btn_left_padding + close_btn_size.x);
+        let (_, tab_rect) = ui.allocate_space(egui::vec2(button_width, ui.available_height()));
+
+        let draggable = self.is_tile_draggable(tiles, tile_id);
+        let sense = if draggable {
+            egui::Sense::click_and_drag()
         } else {
-            Stroke::new(1.0, self.theme.outline)
+            egui::Sense::click()
+        };
+        let tab_response = ui.interact(tab_rect, id, sense);
+        let tab_response = if draggable {
+            tab_response.on_hover_cursor(self.tab_hover_cursor_icon())
+        } else {
+            tab_response
+        };
+
+        tab_response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::Button,
+                ui.is_enabled(),
+                state.active,
+                galley.text(),
+            )
+        });
+
+        if ui.is_rect_visible(tab_rect) && !state.is_being_dragged {
+            let bg_color = self.tab_bg_color(ui.visuals(), tiles, tile_id, state);
+            let stroke = self.tab_outline_stroke(ui.visuals(), tiles, tile_id, state);
+            ui.painter().rect(
+                tab_rect.shrink(0.5),
+                0.0,
+                bg_color,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+
+            if state.active {
+                // Make the tab name area connect with the tab ui area:
+                ui.painter().hline(
+                    tab_rect.x_range(),
+                    tab_rect.bottom(),
+                    Stroke::new(stroke.width + 1.0, bg_color),
+                );
+            }
+
+            let text_color = self.tab_text_color(ui.visuals(), tiles, tile_id, state);
+            let text_position = egui::Align2::LEFT_CENTER
+                .align_size_within_rect(galley.size(), tab_rect.shrink(x_margin))
+                .min;
+
+            ui.painter().galley(text_position, galley.clone(), text_color);
+            if state.active {
+                ui.painter().galley(
+                    text_position + egui::vec2(0.5, 0.0),
+                    galley,
+                    text_color,
+                );
+            }
+
+            if state.closable {
+                let close_btn_rect = egui::Align2::RIGHT_CENTER
+                    .align_size_within_rect(close_btn_size, tab_rect.shrink(x_margin));
+
+                let close_btn_id = ui.auto_id_with("tab_close_btn");
+                let close_btn_response = ui
+                    .interact(close_btn_rect, close_btn_id, egui::Sense::click_and_drag())
+                    .on_hover_cursor(egui::CursorIcon::Default);
+
+                close_btn_response.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        ui.is_enabled(),
+                        "Close",
+                    )
+                });
+
+                let visuals = ui.style().interact(&close_btn_response);
+
+                let rect = close_btn_rect
+                    .shrink(self.close_button_inner_margin())
+                    .expand(visuals.expansion);
+                let stroke = visuals.fg_stroke;
+
+                ui.painter()
+                    .line_segment([rect.left_top(), rect.right_bottom()], stroke);
+                ui.painter()
+                    .line_segment([rect.right_top(), rect.left_bottom()], stroke);
+
+                if (close_btn_response.clicked()
+                    || tab_response.clicked_by(egui::PointerButton::Middle))
+                    && self.on_tab_close(tiles, tile_id)
+                {
+                    tiles.remove(tile_id);
+                }
+            }
         }
+
+        self.on_tab_button(tiles, tile_id, tab_response)
     }
 
     fn tab_text_color(
