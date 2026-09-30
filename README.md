@@ -163,7 +163,7 @@ cargo install wasm-bindgen-cli --version 0.2.129   # must match Cargo.lock
 python3 -m http.server 8080 --directory app/dist
 ```
 
-Open <http://localhost:8080>. With [Trunk](https://trunkrs.dev) installed,
+Open <http://localhost:8080>. With [Trunk](https://github.com/trunk-rs/trunk) installed,
 `cd app && trunk serve` is an equivalent workflow.
 
 Start the bridge on the LAN next to the radio:
