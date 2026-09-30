@@ -30,6 +30,10 @@ pub const DEFAULT_PORT: u16 = 4532;
 /// How long a rigctld-initiated key-up may be held without a release.
 const TX_SAFETY_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// Delay before re-asserting the frequency after a mode change, letting the
+/// radio finish applying the mode's carrier offset (see [`set_mode`]).
+const MODE_SETTLE_DELAY: Duration = Duration::from_millis(150);
+
 #[derive(Debug, Error)]
 pub enum RigctldError {
     #[error("failed to bind rigctld listener: {0}")]
@@ -310,6 +314,7 @@ async fn handle_client(stream: TcpStream, ctx: Arc<Context>) {
         if command.is_empty() {
             continue;
         }
+        tracing::debug!(%client_id, %command, "rigctld command");
 
         let (response, close) = process_command(command, &ctx, &client_id);
         if !response.is_empty() {
@@ -454,17 +459,21 @@ fn set_frequency(ctx: &Context, value: &str) -> String {
     if hz == 0 || hz > 999_999_990 {
         return rprt_fail();
     }
-    let command = {
-        let sub = ctx.state.lock().unwrap().sub_vfo;
-        if sub {
-            scu_cat::set_frequency_b(hz)
-        } else {
-            scu_cat::set_frequency(hz)
-        }
-    };
+    let sub = ctx.state.lock().unwrap().sub_vfo;
+    let command = frequency_command(sub, hz);
+    tracing::info!(hz, %command, "rigctld set_freq");
     ctx.link.send(&command);
     ctx.state.lock().unwrap().set_frequency(hz);
     "RPRT 0".to_string()
+}
+
+/// CAT command that sets `hz` on VFO-A (`sub == false`) or VFO-B.
+fn frequency_command(sub: bool, hz: u64) -> String {
+    if sub {
+        scu_cat::set_frequency_b(hz)
+    } else {
+        scu_cat::set_frequency(hz)
+    }
 }
 
 fn get_mode(ctx: &Context) -> String {
@@ -484,8 +493,39 @@ fn set_mode(ctx: &Context, value: &str) -> String {
     // Hamlib's `set_mode` targets the current (active) VFO. The FTDX10's `MD`
     // P1 is relative to the active VFO, so the active VFO is always `MD0`.
     let command = scu_cat::set_mode_vfo(false, mode);
+    tracing::info!(?mode, %command, "rigctld set_mode");
     ctx.link.send(&command);
-    ctx.state.lock().unwrap().set_mode(mode);
+
+    // Re-assert the tuned frequency immediately (so the mode→frequency order is
+    // right even if the radio applies the mode synchronously), then once more
+    // after the mode has settled. On the FTDX10 (and the other Yaesu rigs) `MD`
+    // can shift the dial by the mode's carrier offset (e.g. the CW/RTTY pitch),
+    // and the radio applies that offset a moment after acknowledging the mode.
+    // Clients such as WaveLogGate apply a QSY as `F <hz>` followed by
+    // `M <mode> -1`, so the shift lands after the frequency and leaves the rig
+    // off-channel; Wavelog then never confirms the spot and the DX Waterfall
+    // click is lost.
+    let (sub, hz) = {
+        let mut state = ctx.state.lock().unwrap();
+        state.set_mode(mode);
+        (state.sub_vfo, state.frequency())
+    };
+    if hz > 0 {
+        ctx.link.send(&frequency_command(sub, hz));
+    }
+
+    let link = Arc::clone(&ctx.link);
+    let state = Arc::clone(&ctx.state);
+    std::thread::spawn(move || {
+        std::thread::sleep(MODE_SETTLE_DELAY);
+        let (sub, hz) = {
+            let state = state.lock().unwrap();
+            (state.sub_vfo, state.frequency())
+        };
+        if hz > 0 {
+            link.send(&frequency_command(sub, hz));
+        }
+    });
     "RPRT 0".to_string()
 }
 
@@ -857,6 +897,20 @@ mod tests {
         assert_eq!(run(&h, "M PKTUSB 0").0, "RPRT 0");
         assert_eq!(run(&h, "m").0, "PKTUSB\n0");
         assert!(run(&h, "M BOGUS 0").0.starts_with("RPRT -1"));
+    }
+
+    #[test]
+    fn mode_change_re_asserts_tuned_frequency() {
+        let h = harness();
+        // WaveLogGate applies a Wavelog QSY as `F <hz>` followed by `M <mode> -1`.
+        assert_eq!(run(&h, "F 14062000").0, "RPRT 0");
+        assert_eq!(run(&h, "M CW -1").0, "RPRT 0");
+        // The mode is sent, then the frequency is re-applied so the rig does not
+        // settle on the mode's carrier offset (the FTDX10 shifts on mode change).
+        assert_eq!(
+            h.link.sent.lock().unwrap().as_slice(),
+            ["FA014062000;", "MD03;", "FA014062000;"]
+        );
     }
 
     #[test]
