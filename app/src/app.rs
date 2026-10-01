@@ -133,6 +133,10 @@ pub struct AppSettings {
     /// Waterfall contrast gain above the black level.
     #[serde(default = "default_waterfall_gain")]
     pub waterfall_gain: f32,
+    /// Fraction of the panadapter body given to the spectrum trace when both
+    /// the spectrum and the waterfall are visible.
+    #[serde(default = "default_panadapter_split")]
+    pub panadapter_split: f32,
     /// Drive an external LAN antenna switch from the Operate pane.
     #[serde(default)]
     pub antenna_enabled: bool,
@@ -193,6 +197,7 @@ impl Default for AppSettings {
             waterfall_colormap: default_colormap(),
             waterfall_black_level: default_black_level(),
             waterfall_gain: default_waterfall_gain(),
+            panadapter_split: default_panadapter_split(),
             antenna_enabled: false,
             antenna_host: default_antenna_host(),
             antenna_port: default_antenna_port(),
@@ -247,6 +252,10 @@ fn default_black_level() -> f32 {
 
 fn default_waterfall_gain() -> f32 {
     1.4
+}
+
+fn default_panadapter_split() -> f32 {
+    SPECTRUM_SHARE
 }
 
 fn default_antenna_host() -> String {
@@ -490,6 +499,9 @@ pub struct ScuApp {
     ptt_held: bool,
     /// Panes asked to pop out this frame (processed after the tree render).
     popout_requests: Vec<Pane>,
+    /// Panes whose tab was closed this frame; hidden in place after the render
+    /// so they can be reopened in the same slot.
+    close_requests: Vec<Pane>,
 
     /// External LAN antenna switch (status + command worker).
     #[cfg(not(target_arch = "wasm32"))]
@@ -644,6 +656,7 @@ impl ScuApp {
             layout_prompt_focus: false,
             ptt_held: false,
             popout_requests: Vec::new(),
+            close_requests: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             antenna: antenna::AntennaState::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -2064,7 +2077,7 @@ impl ScuApp {
         }
         painter.add(egui::Shape::line(
             points,
-            egui::Stroke::new(1.2, theme::spectrum_green()),
+            egui::Stroke::new(1.2, theme::spectrum_orange()),
         ));
     }
 
@@ -2157,7 +2170,7 @@ impl ScuApp {
         let right = raw_right.min(rect.right());
 
         let color = if right - left >= PASSBAND_GREEN_MIN_PX {
-            theme::spectrum_green()
+            theme::spectrum_orange()
         } else {
             theme::warn_amber()
         };
@@ -2539,9 +2552,10 @@ impl ScuApp {
         let panel_id = ui.id().with("panadapter-waterfall");
         let min_h = (SCALE_BAR_H + 40.0).min(full.height() * 0.5);
         let max_h = (full.height() - 40.0).max(min_h);
-        let default_h = (full.height() * (1.0 - SPECTRUM_SHARE)).clamp(min_h, max_h);
+        let split = self.settings.panadapter_split.clamp(0.0, 1.0);
+        let default_h = (full.height() * (1.0 - split)).clamp(min_h, max_h);
 
-        egui::Panel::bottom(panel_id)
+        let panel = egui::Panel::bottom(panel_id)
             .resizable(true)
             .default_size(default_h)
             .min_size(min_h)
@@ -2565,6 +2579,20 @@ impl ScuApp {
                 self.paint_frequency_scale(&painter, scale_rect);
                 self.tune_interaction(&response, &painter, plot_rect);
             });
+
+        // Persist the divider position once the separator drag ends, so the
+        // split is restored on the next launch.
+        if panel.response.rect.height() > 0.0
+            && ctx
+                .read_response(panel_id.with("__resize"))
+                .is_some_and(|r| r.drag_stopped())
+        {
+            let share = (1.0 - panel.response.rect.height() / full.height()).clamp(0.0, 1.0);
+            if (share - self.settings.panadapter_split).abs() > f32::EPSILON {
+                self.settings.panadapter_split = share;
+                save_settings(&self.settings);
+            }
+        }
 
         let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::click());
         self.paint_spectrum(&painter, response.rect);
@@ -2647,6 +2675,9 @@ impl ScuApp {
                 self.pane_antenna(ui);
                 #[cfg(target_arch = "wasm32")]
                 ui.label("Not available in the browser build.");
+            }
+            Pane::Unsupported => {
+                ui.label("This panel is no longer supported.");
             }
         }
     }
@@ -4024,20 +4055,16 @@ impl ScuApp {
     /// Panes tab: add/remove optional panels and reset the arrangement.
     fn settings_panes(&mut self, ui: &mut egui::Ui) {
         theme::section(ui, "Optional panes");
-        let mut show = layout::pane_tile(&self.layouts.draft, Pane::CatConsole).is_some();
+        let mut show = layout::pane_open(&self.layouts.draft, Pane::CatConsole)
+            || self.is_popped(Pane::CatConsole);
         if ui
             .checkbox(&mut show, "CAT console")
             .on_hover_text("Add or remove the CAT command log pane")
             .changed()
         {
-            if show {
-                layout::add_pane(&mut self.layouts.draft, Pane::CatConsole);
-            } else {
-                layout::remove_pane(&mut self.layouts.draft, Pane::CatConsole);
-            }
+            self.set_pane_shown(Pane::CatConsole, show);
             self.settings.show_cat_console = show;
             save_settings(&self.settings);
-            self.mark_layout_dirty();
         }
         ui.label(
             egui::RichText::new("Use the Panels menu in the toolbar for every other pane.")
@@ -4264,6 +4291,7 @@ impl eframe::App for ScuApp {
         // Pop-out requests were queued while the tree was borrowed; apply them
         // now, then draw the floating windows.
         self.process_popouts();
+        self.process_close_requests();
         self.render_popped(&ctx);
 
         let space = self.handle.is_some()
@@ -4361,6 +4389,7 @@ impl ScuApp {
             preset.tree = default.clone();
         }
         self.layouts.draft = default;
+        self.layouts.sync_popped_visibility();
         self.mark_layout_dirty();
     }
 
@@ -4378,6 +4407,7 @@ impl ScuApp {
         };
         self.layouts.active_id = preset.id.clone();
         self.layouts.draft = preset.tree.clone();
+        self.layouts.sync_popped_visibility();
         self.mark_layout_dirty();
     }
 
@@ -4406,6 +4436,7 @@ impl ScuApp {
 
     fn delete_preset(&mut self, id: &str) {
         self.layouts.presets.retain(|p| p.id != id);
+        layout::delete_user_layout(id);
         if self.layouts.active_id == id {
             self.switch_layout(layout::DEFAULT_ID);
         }
@@ -4424,25 +4455,49 @@ impl ScuApp {
         }
     }
 
+    /// Queue a pane to be hidden in place after the current tree render.
+    pub(crate) fn request_close_pane(&mut self, pane: Pane) {
+        if !self.close_requests.contains(&pane) {
+            self.close_requests.push(pane);
+        }
+    }
+
     /// Move a pane out of the dock tree and into its own window.
     fn process_popouts(&mut self) {
         if self.popout_requests.is_empty() {
             return;
         }
         for pane in std::mem::take(&mut self.popout_requests) {
-            layout::remove_pane(&mut self.layouts.draft, pane);
             if !self.layouts.popped.contains(&pane) {
                 self.layouts.popped.push(pane);
             }
         }
+        // The pane stays in the tree as a hidden tile; docking will reveal it
+        // again in the exact container it came from.
+        self.layouts.sync_popped_visibility();
         self.mark_layout_dirty();
     }
 
-    /// Return a floating pane to the dock tree.
-    fn dock_pane(&mut self, pane: Pane) {
+    /// Hide panes whose tab was closed, keeping their tile in the tree.
+    fn process_close_requests(&mut self) {
+        for pane in std::mem::take(&mut self.close_requests) {
+            self.set_pane_shown(pane, false);
+        }
+    }
+
+    /// Show or hide one pane. Showing a hidden pane restores the slot it had
+    /// before it was hidden; hiding keeps the tile so a later show returns to
+    /// the same place.
+    fn set_pane_shown(&mut self, pane: Pane, shown: bool) {
         self.layouts.popped.retain(|p| *p != pane);
-        layout::add_pane(&mut self.layouts.draft, pane);
+        layout::set_pane_open(&mut self.layouts.draft, pane, shown);
         self.mark_layout_dirty();
+    }
+
+    /// Return a floating pane to the dock tree, restoring the slot it occupied
+    /// before it was popped out.
+    fn dock_pane(&mut self, pane: Pane) {
+        self.set_pane_shown(pane, true);
     }
 
     /// Draw each floating pane in its own OS window (an embedded window on the
@@ -4560,7 +4615,7 @@ impl ScuApp {
                 continue;
             }
             let popped = self.is_popped(pane);
-            let open = popped || layout::pane_tile(&self.layouts.draft, pane).is_some();
+            let open = popped || layout::pane_open(&self.layouts.draft, pane);
             let label = if popped {
                 format!("{} (floating)", pane.title())
             } else {
@@ -4568,13 +4623,13 @@ impl ScuApp {
             };
             if ui.selectable_label(open, label).clicked() {
                 if popped {
+                    // Docking restores the slot the pane was popped from.
                     self.dock_pane(pane);
-                } else if open {
-                    layout::remove_pane(&mut self.layouts.draft, pane);
-                    self.mark_layout_dirty();
                 } else {
-                    layout::add_pane(&mut self.layouts.draft, pane);
-                    self.mark_layout_dirty();
+                    // Disabling keeps the pane's tile so re-enabling restores
+                    // its place; enabling a pane with no slot falls back to the
+                    // active tab set.
+                    self.set_pane_shown(pane, !open);
                 }
             }
         }
@@ -4944,18 +4999,15 @@ impl ScuApp {
         self.show_notice(format!("Span {}", span_label(self.span_hz)));
     }
 
-    /// Show or hide one dock pane (also docks it if it is floating).
+    /// Show or hide one dock pane (also docks it if it is floating), keeping a
+    /// hidden pane's slot so it can be shown again in the same place.
     fn toggle_pane(&mut self, pane: Pane) {
         if self.is_popped(pane) {
             self.dock_pane(pane);
             return;
         }
-        if layout::pane_tile(&self.layouts.draft, pane).is_some() {
-            layout::remove_pane(&mut self.layouts.draft, pane);
-        } else {
-            layout::add_pane(&mut self.layouts.draft, pane);
-        }
-        self.mark_layout_dirty();
+        let open = layout::pane_open(&self.layouts.draft, pane);
+        self.set_pane_shown(pane, !open);
     }
 
     fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
