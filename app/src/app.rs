@@ -60,6 +60,10 @@ pub struct AppSettings {
     pub cat_server_enabled: bool,
     #[serde(default = "default_rigctld_port")]
     pub cat_server_port: u16,
+    /// Let rigctld clients change the radio's VFO selection and split state.
+    /// Off by default: needed only for WSJT-X *Split Operation: Rig*.
+    #[serde(default)]
+    pub cat_server_split_control: bool,
     /// Route RX to a loopback device for external software.
     #[serde(default)]
     pub rx_stream_enabled: bool,
@@ -171,6 +175,7 @@ impl Default for AppSettings {
             show_cat_console: true,
             cat_server_enabled: false,
             cat_server_port: default_rigctld_port(),
+            cat_server_split_control: false,
             rx_stream_enabled: false,
             rx_stream_device: None,
             tx_stream_enabled: false,
@@ -477,6 +482,11 @@ pub struct ScuApp {
     vfo_switch_ignore_until: Option<Instant>,
     /// A post-switch per-VFO re-read is pending once the settle window closes.
     vfo_switch_refresh: bool,
+    /// Whether the pending VFO-switch refresh follows a switch this app made.
+    vfo_switch_local: bool,
+    /// Set after a switch we did not initiate: once a fresh `FA`/`FB` reply for
+    /// the active VFO arrives, that value is written back to recentre the scope.
+    recentre_pending: Option<Instant>,
 
     /// Active palette (source of truth; mirrored into the theme module).
     theme: theme::Theme,
@@ -646,6 +656,8 @@ impl ScuApp {
             if_shift_hz: [0, 0],
             vfo_switch_ignore_until: None,
             vfo_switch_refresh: false,
+            vfo_switch_local: false,
+            recentre_pending: None,
             theme,
             applied_appearance: Some(appearance),
             layouts,
@@ -860,6 +872,22 @@ impl ScuApp {
                 save_settings(&self.settings);
             }
         });
+
+        let mut split_control = self.settings.cat_server_split_control;
+        if ui
+            .checkbox(&mut split_control, "Allow clients to control split / VFO")
+            .on_hover_text(
+                "Off (default): clients can tune and key the radio, but VFO and split \
+                 requests are not sent to it. Fine for WSJT-X with Split Operation set \
+                 to None or Fake It.\nOn: forward them to the radio. Needed for WSJT-X \
+                 Split Operation: Rig.",
+            )
+            .changed()
+        {
+            self.settings.cat_server_split_control = split_control;
+            save_settings(&self.settings);
+            self.cat_server.set_split_control(split_control);
+        }
 
         let status = self.cat_server.status();
         if status.running {
@@ -1335,6 +1363,7 @@ impl ScuApp {
                     if !self.freq_editing[0] {
                         self.freq_input[0] = freq_input_text(hz);
                     }
+                    self.finish_recentre(false);
                 }
             }
             "FB" => {
@@ -1343,12 +1372,14 @@ impl ScuApp {
                     if !self.freq_editing[1] {
                         self.freq_input[1] = freq_input_text(hz);
                     }
+                    self.finish_recentre(true);
                 }
             }
             "VS" => {
                 if let Some(sub) = scu_cat::parse_vfo(text) {
                     if sub != self.rx_sub {
-                        self.begin_vfo_switch(sub);
+                        // Switched by the radio or a rigctld client, not by us.
+                        self.begin_vfo_switch(sub, false);
                     }
                 }
             }
@@ -1671,17 +1702,28 @@ impl ScuApp {
             return;
         }
         if let Some(handle) = &self.handle {
-            handle.send_cat(scu_cat::select_vfo(sub));
+            let command = scu_cat::select_vfo(sub);
+            handle.send_cat(command);
+            tracing::info!(command, "app select VFO");
+            self.push_log(format!("> {command}"));
         }
-        self.begin_vfo_switch(sub);
+        self.begin_vfo_switch(sub, true);
     }
 
     /// Record that the operating VFO changed. `SH`/`IS` are P1=0-fixed on the
     /// FTDX10 and the radio broadcasts crossed values around the switch, so
     /// those frames are ignored for a short settle window and the per-VFO state
     /// is re-read afterwards (see [`Self::maybe_refresh_vfo`]).
-    fn begin_vfo_switch(&mut self, sub: bool) {
+    ///
+    /// `local` is `true` when this app initiated the switch. Only then is the
+    /// cached frequency re-sent afterwards; for a switch made by the radio or a
+    /// rigctld client (WSJT-X), the cached value may be older than what that
+    /// client just set, so the frequencies are re-read instead and the scope is
+    /// recentred from the fresh reply ([`Self::finish_recentre`]).
+    fn begin_vfo_switch(&mut self, sub: bool, local: bool) {
         self.rx_sub = sub;
+        self.recentre_pending = None;
+        self.vfo_switch_local = local;
         // The waterfall history belongs to the previous VFO's frequency; drop
         // it so the display doesn't look stuck on the old centre.
         self.waterfall.clear();
@@ -1713,8 +1755,17 @@ impl ScuApp {
             }
             // The native scope follows a *tune*, not the CAT VFO select, so
             // re-asserting the active VFO's frequency forces it to recentre.
+            // Skipped for switches we did not initiate: our cached frequency
+            // may predate a change made by a rigctld client, and writing it back
+            // would detune the radio. Re-read both VFOs instead.
             let hz = self.active_frequency();
-            if hz != 0 {
+            if !self.vfo_switch_local {
+                // Re-read both VFOs; the scope is recentred from the fresh
+                // reply (see `finish_recentre`), never from our cached value.
+                handle.send_cat("FA;");
+                handle.send_cat("FB;");
+                self.recentre_pending = Some(Instant::now());
+            } else if hz != 0 {
                 let set = if self.rx_sub {
                     scu_cat::set_frequency_b(hz)
                 } else {
@@ -1728,6 +1779,39 @@ impl ScuApp {
                     handle.send_cat(&scu_cat::set_scope_mode(mode.with_center().code()));
                 }
             }
+        }
+    }
+
+    /// Complete a scope recentre queued by a switch we did not initiate.
+    ///
+    /// Called when a fresh `FA`/`FB` reply for VFO `sub` has just been stored.
+    /// The radio's scope follows a *tune*, so the active VFO's frequency is
+    /// written back, but only the value the radio itself just reported: a
+    /// cached value could predate a change made by a rigctld client and detune
+    /// the radio. Never done while transmitting.
+    fn finish_recentre(&mut self, sub: bool) {
+        let Some(since) = self.recentre_pending else {
+            return;
+        };
+        if since.elapsed() > Duration::from_secs(2) || self.tx_keyed() {
+            self.recentre_pending = None;
+            return;
+        }
+        if sub != self.rx_sub {
+            return;
+        }
+        self.recentre_pending = None;
+        let hz = self.active_frequency();
+        if hz == 0 {
+            return;
+        }
+        if let Some(handle) = &self.handle {
+            let set = if sub {
+                scu_cat::set_frequency_b(hz)
+            } else {
+                scu_cat::set_frequency(hz)
+            };
+            handle.send_cat(&set);
         }
     }
 
@@ -1747,7 +1831,10 @@ impl ScuApp {
     fn set_split(&mut self, on: bool) {
         self.split = on;
         if let Some(handle) = &self.handle {
-            handle.send_cat(scu_cat::set_split(on));
+            let command = scu_cat::set_split(on);
+            handle.send_cat(command);
+            tracing::info!(command, "app set split");
+            self.push_log(format!("> {command}"));
         }
     }
 
@@ -4249,6 +4336,9 @@ impl eframe::App for ScuApp {
         #[cfg(not(target_arch = "wasm32"))]
         self.poll_antenna(_ctx);
         self.maybe_refresh_vfo();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.cat_server
+            .set_split_control(self.settings.cat_server_split_control);
         self.poll();
         #[cfg(not(target_arch = "wasm32"))]
         self.reconcile_external_ptt();

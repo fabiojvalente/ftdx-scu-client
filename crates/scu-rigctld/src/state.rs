@@ -7,8 +7,32 @@
 //! radio independently.
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use scu_cat::{Agc, Mode, RadioModel};
+
+/// How long a value set by a rigctld client is shielded from radio replies.
+///
+/// The app polls `FA`/`FB`/`VS`/`ST` every second, and a reply that left the
+/// radio *before* a client's setter was applied can arrive *after* the cache was
+/// updated. Applying it would roll the cache back to the old value, so the next
+/// getter (or the mode-settle re-send) would act on stale data and leave RX and
+/// TX on different frequencies.
+const SET_GUARD: Duration = Duration::from_millis(500);
+
+/// Timestamp of the last client-initiated change to one cached field.
+#[derive(Debug, Clone, Copy, Default)]
+struct Guard(Option<Instant>);
+
+impl Guard {
+    fn arm(&mut self) {
+        self.0 = Some(Instant::now());
+    }
+
+    fn active(&self) -> bool {
+        self.0.is_some_and(|at| at.elapsed() < SET_GUARD)
+    }
+}
 
 /// Shared, lock-guarded [`RadioState`].
 pub type SharedState = Arc<Mutex<RadioState>>;
@@ -41,9 +65,93 @@ pub struct RadioState {
     pub nr: bool,
     pub auto_notch: bool,
     pub narrow: bool,
+    /// Split state a client asked for while real split control is disabled. It
+    /// is remembered so the client sees consistent answers, but never reaches
+    /// the radio (see `Rigctld::set_split_control`).
+    pub soft_split: bool,
+    pub soft_split_freq: u64,
+    pub soft_split_mode: Option<Mode>,
+    /// Bumped on every client-initiated frequency change, so deferred
+    /// re-sends can tell whether a newer `set_freq` superseded them.
+    freq_seq: u64,
+    freq_a_guard: Guard,
+    freq_b_guard: Guard,
+    vfo_guard: Guard,
+    split_guard: Guard,
 }
 
 impl RadioState {
+    /// Sequence number of the latest client-initiated frequency change.
+    pub fn freq_seq(&self) -> u64 {
+        self.freq_seq
+    }
+
+    /// `true` when the transmit VFO is VFO-B. With split on, transmit uses the
+    /// VFO that is *not* selected for receive; otherwise it follows receive.
+    pub fn tx_sub(&self) -> bool {
+        if self.split {
+            !self.sub_vfo
+        } else {
+            self.sub_vfo
+        }
+    }
+
+    /// Frequency of the VFO that is *not* selected for receive (the split
+    /// transmit VFO).
+    pub fn other_frequency(&self) -> u64 {
+        if self.sub_vfo {
+            self.freq_a
+        } else {
+            self.freq_b
+        }
+    }
+
+    /// Set the frequency of the VFO that is *not* selected for receive.
+    pub fn set_other_frequency(&mut self, hz: u64) {
+        self.set_frequency_for(!self.sub_vfo, hz);
+    }
+
+    /// Mode of the VFO that is *not* selected for receive.
+    pub fn other_mode(&self) -> Option<Mode> {
+        if self.sub_vfo {
+            self.mode_a
+        } else {
+            self.mode_b
+        }
+    }
+
+    pub fn set_other_mode(&mut self, mode: Mode) {
+        if self.sub_vfo {
+            self.mode_a = Some(mode);
+        } else {
+            self.mode_b = Some(mode);
+        }
+    }
+
+    /// Record a client-initiated receive-VFO selection.
+    pub fn set_sub_vfo(&mut self, sub: bool) {
+        self.sub_vfo = sub;
+        self.vfo_guard.arm();
+    }
+
+    /// Record a client-initiated split on/off.
+    pub fn set_split_on(&mut self, on: bool) {
+        self.split = on;
+        self.split_guard.arm();
+    }
+
+    /// Record a client-initiated frequency change on a specific VFO.
+    pub fn set_frequency_for(&mut self, sub: bool, hz: u64) {
+        if sub {
+            self.freq_b = hz;
+            self.freq_b_guard.arm();
+        } else {
+            self.freq_a = hz;
+            self.freq_a_guard.arm();
+        }
+        self.freq_seq = self.freq_seq.wrapping_add(1);
+    }
+
     /// Frequency of the active receive VFO.
     pub fn frequency(&self) -> u64 {
         if self.sub_vfo {
@@ -54,11 +162,7 @@ impl RadioState {
     }
 
     pub fn set_frequency(&mut self, hz: u64) {
-        if self.sub_vfo {
-            self.freq_b = hz;
-        } else {
-            self.freq_a = hz;
-        }
+        self.set_frequency_for(self.sub_vfo, hz);
     }
 
     /// Mode of the active receive VFO.
@@ -86,12 +190,16 @@ impl RadioState {
         match parsed.command {
             "FA" => {
                 if let Some(hz) = scu_cat::parse_frequency(frame) {
-                    self.freq_a = hz;
+                    if !self.freq_a_guard.active() {
+                        self.freq_a = hz;
+                    }
                 }
             }
             "FB" => {
                 if let Some(hz) = scu_cat::parse_frequency(frame) {
-                    self.freq_b = hz;
+                    if !self.freq_b_guard.active() {
+                        self.freq_b = hz;
+                    }
                 }
             }
             "MD" => {
@@ -110,12 +218,16 @@ impl RadioState {
             }
             "VS" => {
                 if let Some(sub) = scu_cat::parse_vfo(frame) {
-                    self.sub_vfo = sub;
+                    if !self.vfo_guard.active() {
+                        self.sub_vfo = sub;
+                    }
                 }
             }
             "ST" => {
                 if let Some(on) = scu_cat::parse_split(frame) {
-                    self.split = on;
+                    if !self.split_guard.active() {
+                        self.split = on;
+                    }
                 }
             }
             "RT" => {
@@ -210,8 +322,20 @@ impl RadioState {
                 }
             }
             "IF" => {
+                // `IF` reports the *operating* frequency: the receive VFO's, or
+                // the transmit VFO's while keyed in split. Only trust it for the
+                // receive VFO while not transmitting, and never let it clobber a
+                // value a client just set.
                 if let Some(status) = scu_cat::parse_if(frame) {
-                    self.freq_a = status.frequency_hz;
+                    if !self.ptt {
+                        if self.sub_vfo {
+                            if !self.freq_b_guard.active() {
+                                self.freq_b = status.frequency_hz;
+                            }
+                        } else if !self.freq_a_guard.active() {
+                            self.freq_a = status.frequency_hz;
+                        }
+                    }
                 }
             }
             _ => {}
@@ -279,6 +403,52 @@ mod tests {
         state.set_frequency(14_000_000);
         assert_eq!(state.freq_b, 14_000_000);
         assert_eq!(state.freq_a, 7_000_000);
+    }
+
+    #[test]
+    fn if_updates_only_the_receive_vfo_and_not_while_keyed() {
+        let if_frame = "IF007074000000+00000000000;";
+        let mut state = RadioState::default();
+        state.apply(if_frame);
+        assert_eq!(state.freq_a, 7_074_000);
+
+        let mut state = RadioState {
+            sub_vfo: true,
+            freq_a: 14_074_000,
+            ..Default::default()
+        };
+        state.apply(if_frame);
+        assert_eq!(state.freq_a, 14_074_000);
+        assert_eq!(state.freq_b, 7_074_000);
+
+        let mut state = RadioState {
+            ptt: true,
+            freq_a: 14_074_000,
+            ..Default::default()
+        };
+        state.apply(if_frame);
+        assert_eq!(state.freq_a, 14_074_000);
+    }
+
+    #[test]
+    fn client_set_shields_value_from_stale_replies() {
+        let mut state = RadioState::default();
+        state.set_frequency_for(false, 14_074_000);
+        state.apply("FA007074000;");
+        assert_eq!(state.freq_a, 14_074_000);
+        // The other VFO is not shielded.
+        state.apply("FB007074000;");
+        assert_eq!(state.freq_b, 7_074_000);
+    }
+
+    #[test]
+    fn tx_vfo_follows_split() {
+        let mut state = RadioState::default();
+        assert!(!state.tx_sub());
+        state.split = true;
+        assert!(state.tx_sub());
+        state.sub_vfo = true;
+        assert!(!state.tx_sub());
     }
 
     #[test]

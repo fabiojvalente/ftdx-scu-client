@@ -162,7 +162,11 @@ The app can present the radio to third-party software. In the side rail:
   Hamlib binary, no serial port, no GPL dependency). Configure the other program
   as **Hamlib NET rigctl** at `127.0.0.1:4532`; several clients can share the one
   session. Getters are answered from a cached radio state and a TX safety
-  watchdog releases PTT if a client disappears mid-transmission.
+  watchdog releases PTT if a client disappears mid-transmission. By default
+  clients cannot change the radio's VFO selection or split state (those requests
+  are answered but not sent), which is right for WSJT-X with *Split Operation*
+  set to **None** or **Fake It**. For **Rig** split, tick *Allow clients to
+  control split / VFO* (headless: `--split-control`).
 - **Audio Streaming** — route RX to a loopback output device and take TX from a
   loopback input device (BlackHole, Loopback, Common-Radio, VB-Cable, …), so the
   external program's soundcard in/out is bridged to the radio.
