@@ -99,6 +99,7 @@ A `Makefile` wraps the common tasks (run `make` to list them):
 
 ```sh
 make run        # build and run the native desktop app
+make dmg        # build a universal macOS .dmg installer into dist/
 make web        # build the browser (WebAssembly) bundle into app/dist/
 make serve      # build the web bundle and serve it on :8080
 make bridge     # run the WebSocket <-> UDP bridge the browser build needs
@@ -110,6 +111,28 @@ make test       # run the workspace test suite
 ```sh
 cargo run -p scu-app --release
 ```
+
+### macOS app bundle & DMG
+
+On macOS the packaging script builds an `.app` bundle and a `.dmg`
+installer using only tools that ship with the OS (`lipo`, `sips`,
+`iconutil`, `hdiutil`) — no Homebrew or third-party tooling.
+
+```sh
+make app        # universal .app bundle into dist/
+make dmg        # universal .dmg installer into dist/
+```
+
+A universal build needs both Rust targets:
+
+```sh
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+```
+
+The icon comes from `static/icon.png`. The release workflow runs the same
+script, so tagged releases attach the `.dmg` to the GitHub release. The
+DMG is unsigned: on first launch use **right-click → Open** to bypass
+Gatekeeper.
 
 ### Headless probe
 

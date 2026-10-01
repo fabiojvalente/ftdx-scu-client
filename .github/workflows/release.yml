@@ -140,49 +140,13 @@ jobs:
           APPIMAGE="$(find . -maxdepth 1 -name '*.AppImage' | head -n1)"
           mv "$APPIMAGE" "dist/scu-app-${VERSION}-${{ matrix.platform }}.AppImage"
 
-      - name: Package .app bundle (macOS)
+      - name: Package .dmg (macOS)
         if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME//\//-}"
-          APP="SCU-LAN10 Client.app"
-
-          mkdir -p "$APP/Contents/MacOS" dist
-          lipo -create \
-            "target/aarch64-apple-darwin/release/scu-app" \
-            "target/x86_64-apple-darwin/release/scu-app" \
-            -output "$APP/Contents/MacOS/scu-app"
-
-          cat > "$APP/Contents/Info.plist" <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleName</key>
-            <string>SCU-LAN10 Client</string>
-            <key>CFBundleDisplayName</key>
-            <string>SCU-LAN10 Client</string>
-            <key>CFBundleIdentifier</key>
-            <string>com.fabiojvalente.scu-app</string>
-            <key>CFBundleExecutable</key>
-            <string>scu-app</string>
-            <key>CFBundlePackageType</key>
-            <string>APPL</string>
-            <key>CFBundleShortVersionString</key>
-            <string>${VERSION#v}</string>
-            <key>CFBundleVersion</key>
-            <string>${VERSION#v}</string>
-            <key>LSMinimumSystemVersion</key>
-            <string>10.15</string>
-            <key>NSHighResolutionCapable</key>
-            <true/>
-          </dict>
-          </plist>
-          EOF
-
-          ditto -c -k --sequesterRsrc --keepParent "$APP" \
-            "dist/scu-app-${VERSION}-${{ matrix.platform }}.zip"
+          ./scripts/package-macos.sh --universal --no-build --version "$VERSION"
 
       - name: Package .exe (Windows)
         if: runner.os == 'Windows'

@@ -7,11 +7,13 @@ SHELL := /bin/bash
 CARGO ?= cargo
 APP := scu-app
 WEB_DIR := app/dist
+DIST_DIR ?= dist
 PORT ?= 8080
+UNAME_S := $(shell uname -s)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help native run bridge rigctld web web-trunk serve test fmt lint clean
+.PHONY: help native run bridge rigctld web web-trunk serve test fmt lint clean check-macos app dmg
 
 help: ## Show this help
 	@printf "SCU-LAN10 Client targets:\n\n"
@@ -23,6 +25,18 @@ native: ## Build the native desktop app (release)
 
 run: ## Build and run the native desktop app
 	$(CARGO) run --release -p $(APP)
+
+check-macos:
+	@if [ "$(UNAME_S)" != "Darwin" ]; then \
+		echo "error: this target only runs on macOS (got $(UNAME_S))." >&2; \
+		exit 1; \
+	fi
+
+app: check-macos ## Build a universal macOS .app bundle into dist/
+	./scripts/package-macos.sh --universal --app-only --out $(DIST_DIR)
+
+dmg: check-macos ## Build a universal macOS .dmg installer into dist/
+	./scripts/package-macos.sh --universal --out $(DIST_DIR)
 
 bridge: ## Run the WebSocket/UDP bridge needed by the web app
 	$(CARGO) run --release -p scu-bridge -- --listen 0.0.0.0:9000
