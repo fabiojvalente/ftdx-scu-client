@@ -410,6 +410,88 @@ pub fn parse_narrow(frame: &str) -> Option<bool> {
     parse_indexed_on_off(frame, "NA")
 }
 
+/// Roofing filter bandwidth selection (`RF`).
+///
+/// The FTDX10 offers 12 kHz, 3 kHz, 500 Hz and the optional 300 Hz roofing
+/// filters. The `RF` *set* command reports them with P2 codes `1`/`2`/`4`/`5`,
+/// while the radio answers with P3 codes `6`/`7`/`9`/`A` (the slots `3` and `8`
+/// are reserved).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoofingFilter {
+    Khz12,
+    Khz3,
+    Hz500,
+    Hz300,
+}
+
+impl RoofingFilter {
+    /// The `RF` P2 digit carrying the filter in the set command.
+    pub fn set_code(self) -> char {
+        match self {
+            RoofingFilter::Khz12 => '1',
+            RoofingFilter::Khz3 => '2',
+            RoofingFilter::Hz500 => '4',
+            RoofingFilter::Hz300 => '5',
+        }
+    }
+
+    /// The `RF` P3 digit the radio reports back in its answer.
+    pub fn answer_code(self) -> char {
+        match self {
+            RoofingFilter::Khz12 => '6',
+            RoofingFilter::Khz3 => '7',
+            RoofingFilter::Hz500 => '9',
+            RoofingFilter::Hz300 => 'A',
+        }
+    }
+
+    /// Decode either the set (`1`-`5`) or answer (`6`-`A`) digit.
+    pub fn from_code(code: char) -> Option<Self> {
+        Some(match code.to_ascii_uppercase() {
+            '1' | '6' => RoofingFilter::Khz12,
+            '2' | '7' => RoofingFilter::Khz3,
+            '4' | '9' => RoofingFilter::Hz500,
+            '5' | 'A' => RoofingFilter::Hz300,
+            _ => return None,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RoofingFilter::Khz12 => "12 kHz",
+            RoofingFilter::Khz3 => "3 kHz",
+            RoofingFilter::Hz500 => "500 Hz",
+            RoofingFilter::Hz300 => "300 Hz",
+        }
+    }
+
+    pub const ALL: [RoofingFilter; 4] = [
+        RoofingFilter::Khz12,
+        RoofingFilter::Khz3,
+        RoofingFilter::Hz500,
+        RoofingFilter::Hz300,
+    ];
+}
+
+/// Build a "set roofing filter" command (`RF` P1=0 fixed + P2).
+pub fn set_roofing_filter(filter: RoofingFilter) -> String {
+    format!("RF0{};", filter.set_code())
+}
+
+/// Build a "read roofing filter" command (`RF0;`, MAIN).
+pub fn read_roofing_filter() -> &'static str {
+    "RF0;"
+}
+
+/// Parse the roofing filter from an `RF0P3;` response.
+pub fn parse_roofing_filter(frame: &str) -> Option<RoofingFilter> {
+    let parsed = split(frame)?;
+    if parsed.command != "RF" {
+        return None;
+    }
+    RoofingFilter::from_code(parsed.payload.chars().nth(1)?)
+}
+
 // ---- IF width (`SH`) and IF shift (`IS`) -----------------------------------
 
 /// Which `SH` bandwidth table a mode uses.
@@ -2083,6 +2165,29 @@ mod tests {
         assert_eq!(read_narrow(), "NA0;");
         assert_eq!(parse_narrow("NA00;"), Some(false));
         assert_eq!(parse_narrow("NB01;"), None);
+    }
+
+    #[test]
+    fn build_and_parse_roofing_filter() {
+        assert_eq!(read_roofing_filter(), "RF0;");
+        assert_eq!(set_roofing_filter(RoofingFilter::Khz12), "RF01;");
+        assert_eq!(set_roofing_filter(RoofingFilter::Khz3), "RF02;");
+        assert_eq!(set_roofing_filter(RoofingFilter::Hz500), "RF04;");
+        assert_eq!(set_roofing_filter(RoofingFilter::Hz300), "RF05;");
+        // The radio answers with the 6-A code range.
+        assert_eq!(parse_roofing_filter("RF06;"), Some(RoofingFilter::Khz12));
+        assert_eq!(parse_roofing_filter("RF07;"), Some(RoofingFilter::Khz3));
+        assert_eq!(parse_roofing_filter("RF09;"), Some(RoofingFilter::Hz500));
+        assert_eq!(parse_roofing_filter("RF0A;"), Some(RoofingFilter::Hz300));
+        // Echoed set codes decode too, reserved slots do not.
+        assert_eq!(parse_roofing_filter("RF02;"), Some(RoofingFilter::Khz3));
+        assert_eq!(parse_roofing_filter("RF03;"), None);
+        assert_eq!(parse_roofing_filter("RF08;"), None);
+        assert_eq!(parse_roofing_filter("RG0;"), None);
+        for filter in RoofingFilter::ALL {
+            assert_eq!(RoofingFilter::from_code(filter.answer_code()), Some(filter));
+            assert_eq!(RoofingFilter::from_code(filter.set_code()), Some(filter));
+        }
     }
 
     #[test]

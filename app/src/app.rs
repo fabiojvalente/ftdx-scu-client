@@ -13,7 +13,7 @@ use scu_audio::input::{MicConfig, MicInput, TxAudioSink};
 use scu_audio::output::{AudioOutput, AudioSink};
 #[cfg(not(target_arch = "wasm32"))]
 use scu_audio::vox::{Vox, VoxConfig};
-use scu_cat::{self, Agc, MeterKind, Mode, Preamp, RadioModel, ScopeMode};
+use scu_cat::{self, Agc, MeterKind, Mode, Preamp, RadioModel, RoofingFilter, ScopeMode};
 use scu_client::{ConnectConfig, Event, ScuClient, ScuHandle};
 use scu_scope::{BinInterleave, Colormap, FrequencyAxis};
 use serde::{Deserialize, Serialize};
@@ -408,6 +408,8 @@ pub struct ScuApp {
     noise_reduction: bool,
     auto_notch: bool,
     narrow: bool,
+    /// Roofing filter (`RF`) last reported by the radio.
+    roofing_filter: Option<RoofingFilter>,
     /// Noise blanker level (`NL`, 1-20) per VFO (0 = A/Main, 1 = B/Sub).
     noise_blanker_level: [u8; 2],
     /// Noise reduction (DNR) level (`RL`, 1-15) per VFO.
@@ -613,6 +615,7 @@ impl ScuApp {
             noise_reduction: false,
             auto_notch: false,
             narrow: false,
+            roofing_filter: None,
             noise_blanker_level: [10, 10],
             noise_reduction_level: [1, 1],
             preamp: [None, None],
@@ -1226,7 +1229,7 @@ impl ScuApp {
                 // needs to be known to route the two answers.
                 "ID;", "FA;", "FB;", "VS;", "MD0;", "MD1;", "FT;", "ST;", "SH0;", "SH1;", "IS0;",
                 "IS1;", "SM0;", "PS;", "PC;", "MG;", "AC;", "RT;", "XT;", "NB0;", "NR0;", "BC0;",
-                "NA0;", "NL0;", "NL1;", "RL0;", "RL1;", "GT0;", "PA0;", "PA1;", "RA0;", "RA1;",
+                "NA0;", "RF0;", "NL0;", "NL1;", "RL0;", "RL1;", "GT0;", "PA0;", "PA1;", "RA0;", "RA1;",
                 "RG0;", "SQ0;", "TX;", "AI1;", "SS05;", "SS06;",
             ] {
                 handle.send_cat(cmd);
@@ -1421,6 +1424,11 @@ impl ScuApp {
             "NA" => {
                 if let Some(on) = scu_cat::parse_narrow(text) {
                     self.narrow = on;
+                }
+            }
+            "RF" => {
+                if let Some(filter) = scu_cat::parse_roofing_filter(text) {
+                    self.roofing_filter = Some(filter);
                 }
             }
             "NL" => {
@@ -1907,6 +1915,13 @@ impl ScuApp {
         self.narrow = on;
         if let Some(handle) = &self.handle {
             handle.send_cat(&scu_cat::set_narrow(on));
+        }
+    }
+
+    fn set_roofing_filter(&mut self, filter: RoofingFilter) {
+        self.roofing_filter = Some(filter);
+        if let Some(handle) = &self.handle {
+            handle.send_cat(&scu_cat::set_roofing_filter(filter));
         }
     }
 
@@ -3360,6 +3375,23 @@ impl ScuApp {
         }
 
         theme::section(ui, "Filter");
+        let current_roofing = self.roofing_filter;
+        let mut selected_roofing = current_roofing;
+        ui.horizontal(|ui| {
+            ui.label("Roofing filter");
+            egui::ComboBox::from_id_salt("roofing-filter")
+                .selected_text(current_roofing.map(|f| f.label()).unwrap_or("--"))
+                .show_ui(ui, |ui| {
+                    for filter in RoofingFilter::ALL {
+                        ui.selectable_value(&mut selected_roofing, Some(filter), filter.label());
+                    }
+                });
+        });
+        if selected_roofing != current_roofing {
+            if let Some(filter) = selected_roofing {
+                self.set_roofing_filter(filter);
+            }
+        }
         let options = self.current_if_width_options();
         let current_width = self.active_if_width();
         let width_label = self.if_width_label(current_width);
