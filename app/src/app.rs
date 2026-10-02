@@ -498,6 +498,10 @@ pub struct ScuApp {
     /// Whether split is wanted: set by the app's SPLIT control, and never by a
     /// split the radio turns on by itself.
     split_requested: bool,
+    /// Set when the app sends `VS`. A poll reply that left the radio before the
+    /// switch can arrive after it and flip the app's idea of the active VFO, so
+    /// `VS` replies are not trusted for a moment after the app switches.
+    vfo_reply_guard: Option<Instant>,
 
     /// Active palette (source of truth; mirrored into the theme module).
     theme: theme::Theme,
@@ -673,6 +677,7 @@ impl ScuApp {
             tx_sub: None,
             split_reply_guard: None,
             split_requested: false,
+            vfo_reply_guard: None,
             theme,
             applied_appearance: Some(appearance),
             layouts,
@@ -1391,6 +1396,12 @@ impl ScuApp {
                 }
             }
             "VS" => {
+                if self
+                    .vfo_reply_guard
+                    .is_some_and(|at| at.elapsed() < Duration::from_millis(500))
+                {
+                    return;
+                }
                 if let Some(sub) = scu_cat::parse_vfo(text) {
                     if sub != self.rx_sub {
                         tracing::info!(vfo_b = sub, "radio receive VFO changed");
@@ -1763,6 +1774,9 @@ impl ScuApp {
             tracing::info!(command, "app select VFO");
             self.push_log(format!("> {command}"));
         }
+        // `rx_sub` is set optimistically just below; ignore the `VS` replies
+        // that race the command so a stale one cannot flip it back.
+        self.vfo_reply_guard = Some(Instant::now());
         self.begin_vfo_switch(sub, true);
     }
 
