@@ -1229,8 +1229,8 @@ impl ScuApp {
                 // needs to be known to route the two answers.
                 "ID;", "FA;", "FB;", "VS;", "MD0;", "MD1;", "FT;", "ST;", "SH0;", "SH1;", "IS0;",
                 "IS1;", "SM0;", "PS;", "PC;", "MG;", "AC;", "RT;", "XT;", "NB0;", "NR0;", "BC0;",
-                "NA0;", "RF0;", "NL0;", "NL1;", "RL0;", "RL1;", "GT0;", "PA0;", "PA1;", "RA0;", "RA1;",
-                "RG0;", "SQ0;", "TX;", "AI1;", "SS05;", "SS06;",
+                "NA0;", "RF0;", "NL0;", "NL1;", "RL0;", "RL1;", "GT0;", "PA0;", "PA1;", "RA0;",
+                "RA1;", "RG0;", "SQ0;", "TX;", "AI1;", "SS05;", "SS06;",
             ] {
                 handle.send_cat(cmd);
             }
@@ -1381,6 +1381,7 @@ impl ScuApp {
             "VS" => {
                 if let Some(sub) = scu_cat::parse_vfo(text) {
                     if sub != self.rx_sub {
+                        tracing::info!(vfo_b = sub, "radio receive VFO changed");
                         // Switched by the radio or a rigctld client, not by us.
                         self.begin_vfo_switch(sub, false);
                     }
@@ -1388,6 +1389,14 @@ impl ScuApp {
             }
             "ST" => {
                 if let Some(on) = scu_cat::parse_split(text) {
+                    if on != self.split {
+                        // A split change came from the radio, the front panel
+                        // or another client: log it so a surprise split is
+                        // visible in the log rather than only as an audio
+                        // offset at transmit time.
+                        tracing::info!(split = on, "radio split changed");
+                        self.push_log(format!("< {text}"));
+                    }
                     self.split = on;
                 }
             }

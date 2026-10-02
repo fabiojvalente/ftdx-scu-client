@@ -65,12 +65,6 @@ pub struct RadioState {
     pub nr: bool,
     pub auto_notch: bool,
     pub narrow: bool,
-    /// Split state a client asked for while real split control is disabled. It
-    /// is remembered so the client sees consistent answers, but never reaches
-    /// the radio (see `Rigctld::set_split_control`).
-    pub soft_split: bool,
-    pub soft_split_freq: u64,
-    pub soft_split_mode: Option<Mode>,
     /// Bumped on every client-initiated frequency change, so deferred
     /// re-sends can tell whether a newer `set_freq` superseded them.
     freq_seq: u64,
