@@ -489,6 +489,12 @@ pub struct ScuApp {
     /// Set after a switch we did not initiate: once a fresh `FA`/`FB` reply for
     /// the active VFO arrives, that value is written back to recentre the scope.
     recentre_pending: Option<Instant>,
+    /// Transmit VFO reported by the radio's `FT` reply (`true` = VFO-B / Sub).
+    tx_sub: Option<bool>,
+    /// When the app last sent `ST0;`/`ST1;`. A poll reply that left the radio
+    /// before the set can arrive after it, so the split state is not trusted
+    /// for a moment after the app changes it.
+    split_reply_guard: Option<Instant>,
 
     /// Active palette (source of truth; mirrored into the theme module).
     theme: theme::Theme,
@@ -661,6 +667,8 @@ impl ScuApp {
             vfo_switch_refresh: false,
             vfo_switch_local: false,
             recentre_pending: None,
+            tx_sub: None,
+            split_reply_guard: None,
             theme,
             applied_appearance: Some(appearance),
             layouts,
@@ -1387,8 +1395,24 @@ impl ScuApp {
                     }
                 }
             }
+            "FT" => {
+                if let Some(tx_sub) = scu_cat::parse_tx_vfo(text) {
+                    if Some(tx_sub) != self.tx_sub {
+                        tracing::info!(tx_sub, "radio TX VFO changed");
+                        self.push_log(format!("< {text}"));
+                    }
+                    self.tx_sub = Some(tx_sub);
+                }
+            }
             "ST" => {
                 if let Some(on) = scu_cat::parse_split(text) {
+                    // Ignore a reply that raced the split command we just sent.
+                    if self
+                        .split_reply_guard
+                        .is_some_and(|at| at.elapsed() < Duration::from_millis(500))
+                    {
+                        return;
+                    }
                     if on != self.split {
                         // A split change came from the radio, the front panel
                         // or another client: log it so a surprise split is
@@ -1740,6 +1764,7 @@ impl ScuApp {
     fn begin_vfo_switch(&mut self, sub: bool, local: bool) {
         self.rx_sub = sub;
         self.recentre_pending = None;
+        self.align_tx_vfo();
         self.vfo_switch_local = local;
         // The waterfall history belongs to the previous VFO's frequency; drop
         // it so the display doesn't look stuck on the old centre.
@@ -1767,7 +1792,7 @@ impl ScuApp {
         self.vfo_switch_ignore_until = None;
         let cf = if self.rx_sub { "CF101;" } else { "CF001;" };
         if let Some(handle) = &self.handle {
-            for command in ["MD0;", "MD1;", "SH0;", "SH1;", "IS0;", "IS1;", cf] {
+            for command in ["MD0;", "MD1;", "FT;", "SH0;", "SH1;", "IS0;", "IS1;", cf] {
                 handle.send_cat(command);
             }
             // The native scope follows a *tune*, not the CAT VFO select, so
@@ -1852,6 +1877,34 @@ impl ScuApp {
             handle.send_cat(command);
             tracing::info!(command, "app set split");
             self.push_log(format!("> {command}"));
+        }
+        self.split_reply_guard = Some(Instant::now());
+        if !on {
+            // Leaving split: the radio may still have the transmitter parked on
+            // the other VFO. Point it back at the receive VFO or the next key-up
+            // would key the wrong one.
+            self.align_tx_vfo();
+        }
+    }
+
+    /// Keep the radio's transmit VFO on the receive VFO while simplex.
+    ///
+    /// The FTDX10 can transmit on a different VFO than it receives. When it
+    /// does, keying turns that into split (reverse split when receiving on B),
+    /// which is invisible to a client that asked for no split. Sending `FT`
+    /// whenever the receive VFO moves keeps the two aligned, as the reference
+    /// client does.
+    fn align_tx_vfo(&mut self) {
+        if self.split || self.tx_keyed() {
+            return;
+        }
+        if self.tx_sub == Some(self.rx_sub) {
+            return;
+        }
+        if let Some(handle) = &self.handle {
+            let command = scu_cat::select_tx_vfo(self.rx_sub);
+            handle.send_cat(command);
+            tracing::info!(command, vfo_b = self.rx_sub, "app align TX VFO to RX");
         }
     }
 
@@ -2017,10 +2070,11 @@ impl ScuApp {
             let cf = if self.rx_sub { "CF101;" } else { "CF001;" };
             if let Some(handle) = &self.handle {
                 for cmd in [
-                    "FA;", "FB;", "VS;", "MD0;", "MD1;", "ST;", "SH0;", "SH1;", "IS0;", "IS1;", cf,
-                    "SM0;", "PC;", "MG;", "AC;", "RT;", "XT;", "NB0;", "NR0;", "BC0;", "NA0;",
-                    "NL0;", "NL1;", "RL0;", "RL1;", "GT0;", "PA0;", "PA1;", "RA0;", "RA1;", "RG0;",
-                    "SQ0;", "TX;", "SS05;", "RM3;", "RM4;", "RM5;", "RM6;", "RM7;", "RM8;", "RM9;",
+                    "FA;", "FB;", "VS;", "MD0;", "MD1;", "FT;", "ST;", "SH0;", "SH1;", "IS0;",
+                    "IS1;", cf, "SM0;", "PC;", "MG;", "AC;", "RT;", "XT;", "NB0;", "NR0;", "BC0;",
+                    "NA0;", "NL0;", "NL1;", "RL0;", "RL1;", "GT0;", "PA0;", "PA1;", "RA0;", "RA1;",
+                    "RG0;", "SQ0;", "TX;", "SS05;", "RM3;", "RM4;", "RM5;", "RM6;", "RM7;", "RM8;",
+                    "RM9;",
                 ] {
                     handle.send_cat(cmd);
                 }

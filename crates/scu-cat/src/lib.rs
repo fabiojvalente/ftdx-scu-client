@@ -66,8 +66,19 @@ pub fn read_tx_vfo() -> &'static str {
 }
 
 /// Parse the transmit VFO from an `FT` response (`true` = VFO-B / Sub).
+///
+/// The radio answers `FT0;` (MAIN/A) / `FT1;` (SUB/B), but the set form is
+/// `FT2;`/`FT3;`, so accept those too: `2` is MAIN/A (`false`).
 pub fn parse_tx_vfo(frame: &str) -> Option<bool> {
-    parse_on_off(frame, "FT")
+    let parsed = split(frame)?;
+    if parsed.command != "FT" {
+        return None;
+    }
+    match parsed.payload.chars().next()? {
+        '0' | '2' => Some(false),
+        '1' | '3' => Some(true),
+        _ => None,
+    }
 }
 
 /// Build a "split on/off" command (`ST1;` / `ST0;`).
@@ -2103,6 +2114,9 @@ mod tests {
         assert_eq!(read_tx_vfo(), "FT;");
         assert_eq!(parse_tx_vfo("FT0;"), Some(false));
         assert_eq!(parse_tx_vfo("FT1;"), Some(true));
+        assert_eq!(parse_tx_vfo("FT2;"), Some(false));
+        assert_eq!(parse_tx_vfo("FT3;"), Some(true));
+        assert_eq!(parse_tx_vfo("VS1;"), None);
     }
 
     #[test]
