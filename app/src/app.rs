@@ -495,6 +495,9 @@ pub struct ScuApp {
     /// before the set can arrive after it, so the split state is not trusted
     /// for a moment after the app changes it.
     split_reply_guard: Option<Instant>,
+    /// Whether split is wanted: set by the app's SPLIT control, and never by a
+    /// split the radio turns on by itself.
+    split_requested: bool,
 
     /// Active palette (source of truth; mirrored into the theme module).
     theme: theme::Theme,
@@ -669,6 +672,7 @@ impl ScuApp {
             recentre_pending: None,
             tx_sub: None,
             split_reply_guard: None,
+            split_requested: false,
             theme,
             applied_appearance: Some(appearance),
             layouts,
@@ -1413,11 +1417,22 @@ impl ScuApp {
                     {
                         return;
                     }
+                    // Split the operator did not ask for: on the FTDX10 that
+                    // sends transmit to the VFO opposite the receive one, which
+                    // is the surprise offset at transmit time. Clear it and do
+                    // not let it light the SPLIT control. Disabled while clients
+                    // are allowed to control split (for WSJT-X Rig split).
+                    if on && !self.split_requested && !self.settings.cat_server_split_control {
+                        if let Some(handle) = &self.handle {
+                            handle.send_cat(scu_cat::set_split(false));
+                            tracing::warn!("radio enabled split on its own; clearing it");
+                        }
+                        self.push_log(format!("< {text} (not requested; clearing)"));
+                        self.split = false;
+                        self.split_reply_guard = Some(Instant::now());
+                        return;
+                    }
                     if on != self.split {
-                        // A split change came from the radio, the front panel
-                        // or another client: log it so a surprise split is
-                        // visible in the log rather than only as an audio
-                        // offset at transmit time.
                         tracing::info!(split = on, "radio split changed");
                         self.push_log(format!("< {text}"));
                     }
@@ -1871,6 +1886,7 @@ impl ScuApp {
 
     fn set_split(&mut self, on: bool) {
         self.split = on;
+        self.split_requested = on;
         if let Some(handle) = &self.handle {
             let command = scu_cat::set_split(on);
             handle.send_cat(command);
