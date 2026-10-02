@@ -50,13 +50,15 @@ pub fn parse_vfo(frame: &str) -> Option<bool> {
 
 /// Build a "select transmit VFO" command (`FT`). `sub = true` selects VFO-B.
 ///
-/// The FTDX10 `FT` *set* form is `FT2;` (MAIN transmits) / `FT3;` (SUB
-/// transmits); the answer is `FT0;`/`FT1;`.
+/// `FT0;`/`FT1;` select MAIN/SUB directly, the same form the radio answers with
+/// and the form the proven reference client uses on the FTDX10. (The alternate
+/// `FT2;`/`FT3;` form was observed to also engage split on this radio, so it is
+/// not used here.)
 pub fn select_tx_vfo(sub: bool) -> &'static str {
     if sub {
-        "FT3;"
+        "FT1;"
     } else {
-        "FT2;"
+        "FT0;"
     }
 }
 
@@ -2109,8 +2111,8 @@ mod tests {
         assert_eq!(parse_vfo("VS0;"), Some(false));
         assert_eq!(parse_vfo("FT1;"), None);
 
-        assert_eq!(select_tx_vfo(false), "FT2;");
-        assert_eq!(select_tx_vfo(true), "FT3;");
+        assert_eq!(select_tx_vfo(false), "FT0;");
+        assert_eq!(select_tx_vfo(true), "FT1;");
         assert_eq!(read_tx_vfo(), "FT;");
         assert_eq!(parse_tx_vfo("FT0;"), Some(false));
         assert_eq!(parse_tx_vfo("FT1;"), Some(true));
