@@ -495,6 +495,8 @@ pub struct ScuApp {
     /// before the set can arrive after it, so the split state is not trusted
     /// for a moment after the app changes it.
     split_reply_guard: Option<Instant>,
+    /// Rate limit for realigning the radio's transmit VFO to the receive VFO.
+    tx_align_guard: Option<Instant>,
 
     /// Active palette (source of truth; mirrored into the theme module).
     theme: theme::Theme,
@@ -669,6 +671,7 @@ impl ScuApp {
             recentre_pending: None,
             tx_sub: None,
             split_reply_guard: None,
+            tx_align_guard: None,
             theme,
             applied_appearance: Some(appearance),
             layouts,
@@ -1402,6 +1405,7 @@ impl ScuApp {
                         self.push_log(format!("< {text}"));
                     }
                     self.tx_sub = Some(tx_sub);
+                    self.align_tx_vfo();
                 }
             }
             "ST" => {
@@ -1764,6 +1768,7 @@ impl ScuApp {
     fn begin_vfo_switch(&mut self, sub: bool, local: bool) {
         self.rx_sub = sub;
         self.recentre_pending = None;
+        self.align_tx_vfo();
         self.vfo_switch_local = local;
         // The waterfall history belongs to the previous VFO's frequency; drop
         // it so the display doesn't look stuck on the old centre.
@@ -1878,6 +1883,46 @@ impl ScuApp {
             self.push_log(format!("> {command}"));
         }
         self.split_reply_guard = Some(Instant::now());
+        if !on {
+            // Leaving split: make the transmitter follow the receiver again.
+            self.align_tx_vfo();
+        }
+    }
+
+    /// Put the radio's transmit VFO on the receive VFO while simplex.
+    ///
+    /// The FTDX10 can transmit on a different VFO than it receives, and keying
+    /// then turns that into split (reverse split when receiving on B). Selecting
+    /// the transmit VFO with `FT` also lights the radio's split, so `ST0` is
+    /// sent in the same breath to clear it. This mirrors the reference client,
+    /// which always pairs `FT` with `ST`. Nothing is sent when the radio is
+    /// already aligned, or while transmitting, or while split is deliberate.
+    fn align_tx_vfo(&mut self) {
+        if self.split || self.tx_keyed() {
+            return;
+        }
+        let Some(tx_sub) = self.tx_sub else {
+            return;
+        };
+        if tx_sub == self.rx_sub {
+            return;
+        }
+        if self
+            .tx_align_guard
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(2))
+        {
+            return;
+        }
+        self.tx_align_guard = Some(Instant::now());
+        // `FT` lights split; shield the split state from the replies that race
+        // the `ST0` that follows.
+        self.split_reply_guard = Some(Instant::now());
+        if let Some(handle) = &self.handle {
+            let ft = scu_cat::select_tx_vfo(self.rx_sub);
+            handle.send_cat(ft);
+            handle.send_cat(scu_cat::set_split(false));
+            tracing::info!(%ft, vfo_b = self.rx_sub, "app align TX VFO to RX and clear split");
+        }
     }
 
     fn copy_a_to_b(&mut self) {

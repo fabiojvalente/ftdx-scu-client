@@ -50,13 +50,15 @@ pub fn parse_vfo(frame: &str) -> Option<bool> {
 
 /// Build a "select transmit VFO" command (`FT`). `sub = true` selects VFO-B.
 ///
-/// Note: the FTDX10 appears to treat *any* `FT` set as engaging split, so this
-/// must not be used to keep the transmitter on the receive VFO while simplex.
+/// `FT0;`/`FT1;` select MAIN/SUB directly, the form the radio answers with and
+/// the form the reference client sends on the FTDX10. Selecting the Sub VFO also
+/// lights split on this radio, so callers must pair it with `ST0;` when simplex
+/// is wanted.
 pub fn select_tx_vfo(sub: bool) -> &'static str {
     if sub {
-        "FT3;"
+        "FT1;"
     } else {
-        "FT2;"
+        "FT0;"
     }
 }
 
@@ -2109,8 +2111,8 @@ mod tests {
         assert_eq!(parse_vfo("VS0;"), Some(false));
         assert_eq!(parse_vfo("FT1;"), None);
 
-        assert_eq!(select_tx_vfo(false), "FT2;");
-        assert_eq!(select_tx_vfo(true), "FT3;");
+        assert_eq!(select_tx_vfo(false), "FT0;");
+        assert_eq!(select_tx_vfo(true), "FT1;");
         assert_eq!(read_tx_vfo(), "FT;");
         assert_eq!(parse_tx_vfo("FT0;"), Some(false));
         assert_eq!(parse_tx_vfo("FT1;"), Some(true));
