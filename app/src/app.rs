@@ -1764,7 +1764,6 @@ impl ScuApp {
     fn begin_vfo_switch(&mut self, sub: bool, local: bool) {
         self.rx_sub = sub;
         self.recentre_pending = None;
-        self.align_tx_vfo();
         self.vfo_switch_local = local;
         // The waterfall history belongs to the previous VFO's frequency; drop
         // it so the display doesn't look stuck on the old centre.
@@ -1879,33 +1878,6 @@ impl ScuApp {
             self.push_log(format!("> {command}"));
         }
         self.split_reply_guard = Some(Instant::now());
-        if !on {
-            // Leaving split: the radio may still have the transmitter parked on
-            // the other VFO. Point it back at the receive VFO or the next key-up
-            // would key the wrong one.
-            self.align_tx_vfo();
-        }
-    }
-
-    /// Keep the radio's transmit VFO on the receive VFO while simplex.
-    ///
-    /// The FTDX10 can transmit on a different VFO than it receives. When it
-    /// does, keying turns that into split (reverse split when receiving on B),
-    /// which is invisible to a client that asked for no split. Sending `FT`
-    /// whenever the receive VFO moves keeps the two aligned, as the reference
-    /// client does.
-    fn align_tx_vfo(&mut self) {
-        if self.split || self.tx_keyed() {
-            return;
-        }
-        if self.tx_sub == Some(self.rx_sub) {
-            return;
-        }
-        if let Some(handle) = &self.handle {
-            let command = scu_cat::select_tx_vfo(self.rx_sub);
-            handle.send_cat(command);
-            tracing::info!(command, vfo_b = self.rx_sub, "app align TX VFO to RX");
-        }
     }
 
     fn copy_a_to_b(&mut self) {
