@@ -13,9 +13,11 @@ use scu_audio::input::{MicConfig, MicInput, TxAudioSink};
 use scu_audio::output::{AudioOutput, AudioSink};
 #[cfg(not(target_arch = "wasm32"))]
 use scu_audio::vox::{Vox, VoxConfig};
-use scu_cat::{self, Agc, MeterKind, Mode, Preamp, RadioModel, ScopeMode};
+use scu_cat::{
+    self, Agc, MeterKind, Mode, Preamp, RadioModel, RoofingFilter, ScopeCenter, ScopeMode,
+};
 use scu_client::{ConnectConfig, Event, ScuClient, ScuHandle};
-use scu_scope::{BinInterleave, Colormap, FrequencyAxis};
+use scu_scope::Colormap;
 use serde::{Deserialize, Serialize};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -60,6 +62,10 @@ pub struct AppSettings {
     pub cat_server_enabled: bool,
     #[serde(default = "default_rigctld_port")]
     pub cat_server_port: u16,
+    /// Let rigctld clients change the radio's VFO selection and split state.
+    /// Off by default: needed only for WSJT-X *Split Operation: Rig*.
+    #[serde(default)]
+    pub cat_server_split_control: bool,
     /// Route RX to a loopback device for external software.
     #[serde(default)]
     pub rx_stream_enabled: bool,
@@ -121,9 +127,6 @@ pub struct AppSettings {
     /// Show the waterfall in the panadapter.
     #[serde(default = "default_true")]
     pub show_waterfall: bool,
-    /// Scope bin extraction rule.
-    #[serde(default = "default_scope_bins")]
-    pub scope_bins: BinInterleave,
     /// Waterfall colour palette.
     #[serde(default = "default_colormap")]
     pub waterfall_colormap: Colormap,
@@ -133,6 +136,10 @@ pub struct AppSettings {
     /// Waterfall contrast gain above the black level.
     #[serde(default = "default_waterfall_gain")]
     pub waterfall_gain: f32,
+    /// Fraction of the panadapter body given to the spectrum trace when both
+    /// the spectrum and the waterfall are visible.
+    #[serde(default = "default_panadapter_split")]
+    pub panadapter_split: f32,
     /// Drive an external LAN antenna switch from the Operate pane.
     #[serde(default)]
     pub antenna_enabled: bool,
@@ -167,6 +174,7 @@ impl Default for AppSettings {
             show_cat_console: true,
             cat_server_enabled: false,
             cat_server_port: default_rigctld_port(),
+            cat_server_split_control: false,
             rx_stream_enabled: false,
             rx_stream_device: None,
             tx_stream_enabled: false,
@@ -189,10 +197,10 @@ impl Default for AppSettings {
             follow_vfo: true,
             show_spectrum: true,
             show_waterfall: true,
-            scope_bins: default_scope_bins(),
             waterfall_colormap: default_colormap(),
             waterfall_black_level: default_black_level(),
             waterfall_gain: default_waterfall_gain(),
+            panadapter_split: default_panadapter_split(),
             antenna_enabled: false,
             antenna_host: default_antenna_host(),
             antenna_port: default_antenna_port(),
@@ -233,10 +241,6 @@ fn default_freq_step() -> u64 {
     1_000
 }
 
-fn default_scope_bins() -> BinInterleave {
-    BinInterleave::Split
-}
-
 fn default_colormap() -> Colormap {
     Colormap::Turbo
 }
@@ -247,6 +251,10 @@ fn default_black_level() -> f32 {
 
 fn default_waterfall_gain() -> f32 {
     1.4
+}
+
+fn default_panadapter_split() -> f32 {
+    SPECTRUM_SHARE
 }
 
 fn default_antenna_host() -> String {
@@ -286,6 +294,19 @@ const PASSBAND_GREEN_MIN_PX: f32 = 40.0;
 
 /// Height of the frequency ribbon drawn above the waterfall, in pixels.
 const SCALE_BAR_H: f32 = 34.0;
+
+/// The raw scope sweep covers about 7.5% more RF bandwidth than the span
+/// reported by `SS05`. Measured with the radio in waterfall/CENTER mode and
+/// `SCOPE CTR = CARRIER`: a known 7.074 MHz signal at a 7.030 MHz VFO and
+/// reported 100 kHz span appears at a raw +40.9 kHz position.
+///
+/// Keep this a uniform scale until measurements at several positions and spans
+/// establish a reproducible non-linear response.
+const SCOPE_AXIS_SCALE: f64 = 1.075;
+
+fn scope_axis_span_hz(reported_span_hz: f64) -> f64 {
+    reported_span_hz * SCOPE_AXIS_SCALE
+}
 
 /// Default fraction of the panadapter body given to the spectrum trace when
 /// both the spectrum and the waterfall are visible.
@@ -394,6 +415,10 @@ pub struct ScuApp {
     noise_reduction: bool,
     auto_notch: bool,
     narrow: bool,
+    /// Roofing filter (`RF`) last reported by the radio.
+    roofing_filter: Option<RoofingFilter>,
+    /// Scope screen centre reference (`SCOPE CTR`, `EX040202`).
+    scope_center: Option<ScopeCenter>,
     /// Noise blanker level (`NL`, 1-20) per VFO (0 = A/Main, 1 = B/Sub).
     noise_blanker_level: [u8; 2],
     /// Noise reduction (DNR) level (`RL`, 1-15) per VFO.
@@ -468,6 +493,24 @@ pub struct ScuApp {
     vfo_switch_ignore_until: Option<Instant>,
     /// A post-switch per-VFO re-read is pending once the settle window closes.
     vfo_switch_refresh: bool,
+    /// Whether the pending VFO-switch refresh follows a switch this app made.
+    vfo_switch_local: bool,
+    /// Set after a switch we did not initiate: once a fresh `FA`/`FB` reply for
+    /// the active VFO arrives, that value is written back to recentre the scope.
+    recentre_pending: Option<Instant>,
+    /// Transmit VFO reported by the radio's `FT` reply (`true` = VFO-B / Sub).
+    tx_sub: Option<bool>,
+    /// When the app last sent `ST0;`/`ST1;`. A poll reply that left the radio
+    /// before the set can arrive after it, so the split state is not trusted
+    /// for a moment after the app changes it.
+    split_reply_guard: Option<Instant>,
+    /// Whether split is wanted: set by the app's SPLIT control, and never by a
+    /// split the radio turns on by itself.
+    split_requested: bool,
+    /// Set when the app sends `VS`. A poll reply that left the radio before the
+    /// switch can arrive after it and flip the app's idea of the active VFO, so
+    /// `VS` replies are not trusted for a moment after the app switches.
+    vfo_reply_guard: Option<Instant>,
 
     /// Active palette (source of truth; mirrored into the theme module).
     theme: theme::Theme,
@@ -490,6 +533,9 @@ pub struct ScuApp {
     ptt_held: bool,
     /// Panes asked to pop out this frame (processed after the tree render).
     popout_requests: Vec<Pane>,
+    /// Panes whose tab was closed this frame; hidden in place after the render
+    /// so they can be reopened in the same slot.
+    close_requests: Vec<Pane>,
 
     /// External LAN antenna switch (status + command worker).
     #[cfg(not(target_arch = "wasm32"))]
@@ -591,6 +637,8 @@ impl ScuApp {
             noise_reduction: false,
             auto_notch: false,
             narrow: false,
+            roofing_filter: None,
+            scope_center: None,
             noise_blanker_level: [10, 10],
             noise_reduction_level: [1, 1],
             preamp: [None, None],
@@ -634,6 +682,12 @@ impl ScuApp {
             if_shift_hz: [0, 0],
             vfo_switch_ignore_until: None,
             vfo_switch_refresh: false,
+            vfo_switch_local: false,
+            recentre_pending: None,
+            tx_sub: None,
+            split_reply_guard: None,
+            split_requested: false,
+            vfo_reply_guard: None,
             theme,
             applied_appearance: Some(appearance),
             layouts,
@@ -644,6 +698,7 @@ impl ScuApp {
             layout_prompt_focus: false,
             ptt_held: false,
             popout_requests: Vec::new(),
+            close_requests: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             antenna: antenna::AntennaState::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -847,6 +902,22 @@ impl ScuApp {
                 save_settings(&self.settings);
             }
         });
+
+        let mut split_control = self.settings.cat_server_split_control;
+        if ui
+            .checkbox(&mut split_control, "Allow clients to control split / VFO")
+            .on_hover_text(
+                "Off (default): clients can tune and key the radio, but VFO and split \
+                 requests are not sent to it. Fine for WSJT-X with Split Operation set \
+                 to None or Fake It.\nOn: forward them to the radio. Needed for WSJT-X \
+                 Split Operation: Rig.",
+            )
+            .changed()
+        {
+            self.settings.cat_server_split_control = split_control;
+            save_settings(&self.settings);
+            self.cat_server.set_split_control(split_control);
+        }
 
         let status = self.cat_server.status();
         if status.running {
@@ -1183,10 +1254,46 @@ impl ScuApp {
                 // `VS;` first, then `MD0;`/`MD1;`: on the FTDX10 the `MD` P1
                 // digit is relative to the operating VFO, so the active VFO
                 // needs to be known to route the two answers.
-                "ID;", "FA;", "FB;", "VS;", "MD0;", "MD1;", "FT;", "ST;", "SH0;", "SH1;", "IS0;",
-                "IS1;", "SM0;", "PS;", "PC;", "MG;", "AC;", "RT;", "XT;", "NB0;", "NR0;", "BC0;",
-                "NA0;", "NL0;", "NL1;", "RL0;", "RL1;", "GT0;", "PA0;", "PA1;", "RA0;", "RA1;",
-                "RG0;", "SQ0;", "TX;", "AI1;", "SS05;", "SS06;",
+                "ID;",
+                "FA;",
+                "FB;",
+                "VS;",
+                "MD0;",
+                "MD1;",
+                "FT;",
+                "ST;",
+                "SH0;",
+                "SH1;",
+                "IS0;",
+                "IS1;",
+                "SM0;",
+                "PS;",
+                "PC;",
+                "MG;",
+                "AC;",
+                "RT;",
+                "XT;",
+                "NB0;",
+                "NR0;",
+                "BC0;",
+                "NA0;",
+                "RF0;",
+                "NL0;",
+                "NL1;",
+                "RL0;",
+                "RL1;",
+                "GT0;",
+                "PA0;",
+                "PA1;",
+                "RA0;",
+                "RA1;",
+                "RG0;",
+                "SQ0;",
+                "TX;",
+                "AI1;",
+                "SS05;",
+                "SS06;",
+                "EX040202;",
             ] {
                 handle.send_cat(cmd);
             }
@@ -1267,7 +1374,7 @@ impl ScuApp {
             Event::Cat(text) => self.on_cat(&text),
             Event::Audio(_) => {}
             Event::Scope(body) => {
-                let line = scu_scope::decode_with(&body, self.settings.scope_bins);
+                let line = scu_scope::decode(&body);
                 self.waterfall.push(&line.bins);
                 self.update_spectrum_range(&line.bins);
                 self.latest_bins = line.bins;
@@ -1322,6 +1429,7 @@ impl ScuApp {
                     if !self.freq_editing[0] {
                         self.freq_input[0] = freq_input_text(hz);
                     }
+                    self.finish_recentre(false);
                 }
             }
             "FB" => {
@@ -1330,17 +1438,61 @@ impl ScuApp {
                     if !self.freq_editing[1] {
                         self.freq_input[1] = freq_input_text(hz);
                     }
+                    self.finish_recentre(true);
                 }
             }
             "VS" => {
+                if self
+                    .vfo_reply_guard
+                    .is_some_and(|at| at.elapsed() < Duration::from_millis(500))
+                {
+                    return;
+                }
                 if let Some(sub) = scu_cat::parse_vfo(text) {
                     if sub != self.rx_sub {
-                        self.begin_vfo_switch(sub);
+                        tracing::info!(vfo_b = sub, "radio receive VFO changed");
+                        // Switched by the radio or a rigctld client, not by us.
+                        self.begin_vfo_switch(sub, false);
                     }
+                }
+            }
+            "FT" => {
+                if let Some(tx_sub) = scu_cat::parse_tx_vfo(text) {
+                    if Some(tx_sub) != self.tx_sub {
+                        tracing::info!(tx_sub, "radio TX VFO changed");
+                        self.push_log(format!("< {text}"));
+                    }
+                    self.tx_sub = Some(tx_sub);
                 }
             }
             "ST" => {
                 if let Some(on) = scu_cat::parse_split(text) {
+                    // Ignore a reply that raced the split command we just sent.
+                    if self
+                        .split_reply_guard
+                        .is_some_and(|at| at.elapsed() < Duration::from_millis(500))
+                    {
+                        return;
+                    }
+                    // Split the operator did not ask for: on the FTDX10 that
+                    // sends transmit to the VFO opposite the receive one, which
+                    // is the surprise offset at transmit time. Clear it and do
+                    // not let it light the SPLIT control. Disabled while clients
+                    // are allowed to control split (for WSJT-X Rig split).
+                    if on && !self.split_requested && !self.settings.cat_server_split_control {
+                        if let Some(handle) = &self.handle {
+                            handle.send_cat(scu_cat::set_split(false));
+                            tracing::warn!("radio enabled split on its own; clearing it");
+                        }
+                        self.push_log(format!("< {text} (not requested; clearing)"));
+                        self.split = false;
+                        self.split_reply_guard = Some(Instant::now());
+                        return;
+                    }
+                    if on != self.split {
+                        tracing::info!(split = on, "radio split changed");
+                        self.push_log(format!("< {text}"));
+                    }
                     self.split = on;
                 }
             }
@@ -1377,6 +1529,11 @@ impl ScuApp {
             "NA" => {
                 if let Some(on) = scu_cat::parse_narrow(text) {
                     self.narrow = on;
+                }
+            }
+            "RF" => {
+                if let Some(filter) = scu_cat::parse_roofing_filter(text) {
+                    self.roofing_filter = Some(filter);
                 }
             }
             "NL" => {
@@ -1479,6 +1636,14 @@ impl ScuApp {
                 }
             }
             "SS" => self.on_scope_settings(text),
+            "EX" => {
+                if let Some(center) = scu_cat::parse_scope_center(text) {
+                    if self.scope_center != Some(center) {
+                        tracing::info!(center = center.label(), "scope centre reference");
+                    }
+                    self.scope_center = Some(center);
+                }
+            }
             _ => {}
         }
     }
@@ -1627,6 +1792,13 @@ impl ScuApp {
         self.if_width[self.rx_sub as usize]
     }
 
+    /// Resolved IF bandwidth of the active VFO in Hz, honouring the mode
+    /// default when the radio reports the `SH` code as `0`.
+    fn active_if_width_hz(&self) -> Option<u16> {
+        let model = self.radio.unwrap_or(RadioModel::Ftdx10);
+        scu_cat::if_width_hz(model, self.active_mode()?, self.active_if_width())
+    }
+
     /// IF shift (Hz) of the active receive VFO.
     fn active_if_shift_hz(&self) -> i32 {
         self.if_shift_hz[self.rx_sub as usize]
@@ -1644,6 +1816,18 @@ impl ScuApp {
         )
     }
 
+    /// How far the scope screen's centre sits from the VFO carrier, in Hz.
+    /// Carrier-centred scope data is RF-referenced, so its centre is the VFO
+    /// itself. Filter-centred data is offset by the active filter's centre.
+    fn scope_center_offset_hz(&self) -> f64 {
+        if self.scope_center == Some(ScopeCenter::Filter) {
+            if let Some((low, high)) = self.active_passband_hz() {
+                return (low + high) as f64 / 2.0;
+            }
+        }
+        0.0
+    }
+
     /// Frequency of the VFO currently selected for receive.
     fn active_frequency(&self) -> u64 {
         if self.rx_sub {
@@ -1658,17 +1842,31 @@ impl ScuApp {
             return;
         }
         if let Some(handle) = &self.handle {
-            handle.send_cat(scu_cat::select_vfo(sub));
+            let command = scu_cat::select_vfo(sub);
+            handle.send_cat(command);
+            tracing::info!(command, "app select VFO");
+            self.push_log(format!("> {command}"));
         }
-        self.begin_vfo_switch(sub);
+        // `rx_sub` is set optimistically just below; ignore the `VS` replies
+        // that race the command so a stale one cannot flip it back.
+        self.vfo_reply_guard = Some(Instant::now());
+        self.begin_vfo_switch(sub, true);
     }
 
     /// Record that the operating VFO changed. `SH`/`IS` are P1=0-fixed on the
     /// FTDX10 and the radio broadcasts crossed values around the switch, so
     /// those frames are ignored for a short settle window and the per-VFO state
     /// is re-read afterwards (see [`Self::maybe_refresh_vfo`]).
-    fn begin_vfo_switch(&mut self, sub: bool) {
+    ///
+    /// `local` is `true` when this app initiated the switch. Only then is the
+    /// cached frequency re-sent afterwards; for a switch made by the radio or a
+    /// rigctld client (WSJT-X), the cached value may be older than what that
+    /// client just set, so the frequencies are re-read instead and the scope is
+    /// recentred from the fresh reply ([`Self::finish_recentre`]).
+    fn begin_vfo_switch(&mut self, sub: bool, local: bool) {
         self.rx_sub = sub;
+        self.recentre_pending = None;
+        self.vfo_switch_local = local;
         // The waterfall history belongs to the previous VFO's frequency; drop
         // it so the display doesn't look stuck on the old centre.
         self.waterfall.clear();
@@ -1695,13 +1893,22 @@ impl ScuApp {
         self.vfo_switch_ignore_until = None;
         let cf = if self.rx_sub { "CF101;" } else { "CF001;" };
         if let Some(handle) = &self.handle {
-            for command in ["MD0;", "MD1;", "SH0;", "SH1;", "IS0;", "IS1;", cf] {
+            for command in ["MD0;", "MD1;", "FT;", "SH0;", "SH1;", "IS0;", "IS1;", cf] {
                 handle.send_cat(command);
             }
             // The native scope follows a *tune*, not the CAT VFO select, so
             // re-asserting the active VFO's frequency forces it to recentre.
+            // Skipped for switches we did not initiate: our cached frequency
+            // may predate a change made by a rigctld client, and writing it back
+            // would detune the radio. Re-read both VFOs instead.
             let hz = self.active_frequency();
-            if hz != 0 {
+            if !self.vfo_switch_local {
+                // Re-read both VFOs; the scope is recentred from the fresh
+                // reply (see `finish_recentre`), never from our cached value.
+                handle.send_cat("FA;");
+                handle.send_cat("FB;");
+                self.recentre_pending = Some(Instant::now());
+            } else if hz != 0 {
                 let set = if self.rx_sub {
                     scu_cat::set_frequency_b(hz)
                 } else {
@@ -1715,6 +1922,39 @@ impl ScuApp {
                     handle.send_cat(&scu_cat::set_scope_mode(mode.with_center().code()));
                 }
             }
+        }
+    }
+
+    /// Complete a scope recentre queued by a switch we did not initiate.
+    ///
+    /// Called when a fresh `FA`/`FB` reply for VFO `sub` has just been stored.
+    /// The radio's scope follows a *tune*, so the active VFO's frequency is
+    /// written back, but only the value the radio itself just reported: a
+    /// cached value could predate a change made by a rigctld client and detune
+    /// the radio. Never done while transmitting.
+    fn finish_recentre(&mut self, sub: bool) {
+        let Some(since) = self.recentre_pending else {
+            return;
+        };
+        if since.elapsed() > Duration::from_secs(2) || self.tx_keyed() {
+            self.recentre_pending = None;
+            return;
+        }
+        if sub != self.rx_sub {
+            return;
+        }
+        self.recentre_pending = None;
+        let hz = self.active_frequency();
+        if hz == 0 {
+            return;
+        }
+        if let Some(handle) = &self.handle {
+            let set = if sub {
+                scu_cat::set_frequency_b(hz)
+            } else {
+                scu_cat::set_frequency(hz)
+            };
+            handle.send_cat(&set);
         }
     }
 
@@ -1733,9 +1973,14 @@ impl ScuApp {
 
     fn set_split(&mut self, on: bool) {
         self.split = on;
+        self.split_requested = on;
         if let Some(handle) = &self.handle {
-            handle.send_cat(scu_cat::set_split(on));
+            let command = scu_cat::set_split(on);
+            handle.send_cat(command);
+            tracing::info!(command, "app set split");
+            self.push_log(format!("> {command}"));
         }
+        self.split_reply_guard = Some(Instant::now());
     }
 
     fn copy_a_to_b(&mut self) {
@@ -1807,6 +2052,13 @@ impl ScuApp {
         self.narrow = on;
         if let Some(handle) = &self.handle {
             handle.send_cat(&scu_cat::set_narrow(on));
+        }
+    }
+
+    fn set_roofing_filter(&mut self, filter: RoofingFilter) {
+        self.roofing_filter = Some(filter);
+        if let Some(handle) = &self.handle {
+            handle.send_cat(&scu_cat::set_roofing_filter(filter));
         }
     }
 
@@ -1893,10 +2145,49 @@ impl ScuApp {
             let cf = if self.rx_sub { "CF101;" } else { "CF001;" };
             if let Some(handle) = &self.handle {
                 for cmd in [
-                    "FA;", "FB;", "VS;", "MD0;", "MD1;", "ST;", "SH0;", "SH1;", "IS0;", "IS1;", cf,
-                    "SM0;", "PC;", "MG;", "AC;", "RT;", "XT;", "NB0;", "NR0;", "BC0;", "NA0;",
-                    "NL0;", "NL1;", "RL0;", "RL1;", "GT0;", "PA0;", "PA1;", "RA0;", "RA1;", "RG0;",
-                    "SQ0;", "TX;", "SS05;", "RM3;", "RM4;", "RM5;", "RM6;", "RM7;", "RM8;", "RM9;",
+                    "FA;",
+                    "FB;",
+                    "VS;",
+                    "MD0;",
+                    "MD1;",
+                    "FT;",
+                    "ST;",
+                    "SH0;",
+                    "SH1;",
+                    "IS0;",
+                    "IS1;",
+                    cf,
+                    "SM0;",
+                    "PC;",
+                    "MG;",
+                    "AC;",
+                    "RT;",
+                    "XT;",
+                    "NB0;",
+                    "NR0;",
+                    "BC0;",
+                    "NA0;",
+                    "NL0;",
+                    "NL1;",
+                    "RL0;",
+                    "RL1;",
+                    "GT0;",
+                    "PA0;",
+                    "PA1;",
+                    "RA0;",
+                    "RA1;",
+                    "RG0;",
+                    "SQ0;",
+                    "TX;",
+                    "SS05;",
+                    "EX040202;",
+                    "RM3;",
+                    "RM4;",
+                    "RM5;",
+                    "RM6;",
+                    "RM7;",
+                    "RM8;",
+                    "RM9;",
                 ] {
                     handle.send_cat(cmd);
                 }
@@ -1980,8 +2271,15 @@ impl ScuApp {
             .request(self.antenna_config(), AntennaAction::Poll, ctx.clone());
     }
 
-    fn axis(&self) -> FrequencyAxis {
-        FrequencyAxis::new(self.active_frequency() as f64, self.span_hz)
+    /// Linear t (0..1 in the pane) for a true offset from the scope centre.
+    fn scope_pane_t(&self, true_offset_hz: f64) -> f32 {
+        (0.5 + true_offset_hz / scope_axis_span_hz(self.span_hz)) as f32
+    }
+
+    /// RF frequency (Hz) at pane position `t` (0..1).
+    fn scope_hz_at(&self, t: f64) -> f64 {
+        let center = self.active_frequency() as f64 + self.scope_center_offset_hz();
+        center + (t - 0.5) * scope_axis_span_hz(self.span_hz)
     }
 
     /// Update the auto-scale bounds from a fresh sweep. The floor drops fast and
@@ -2064,7 +2362,7 @@ impl ScuApp {
         }
         painter.add(egui::Shape::line(
             points,
-            egui::Stroke::new(1.2, theme::spectrum_green()),
+            egui::Stroke::new(1.2, theme::spectrum_orange()),
         ));
     }
 
@@ -2085,10 +2383,12 @@ impl ScuApp {
             return;
         }
 
-        let axis = self.axis();
-        let span = self.span_hz;
-        let left_hz = axis.hz_at(0.0);
-        let right_hz = axis.hz_at(1.0);
+        let center = self.active_frequency() as f64 + self.scope_center_offset_hz();
+        let left_hz = self.scope_hz_at(0.0);
+        let right_hz = self.scope_hz_at(1.0);
+        let span = (right_hz - left_hz).max(1.0);
+        let x_for =
+            |hz: f64| scale_rect.left() + scale_rect.width() * self.scope_pane_t(hz - center);
 
         let target = (scale_rect.width() / 100.0).max(2.0) as f64;
         let step = nice_step(span / target);
@@ -2096,10 +2396,33 @@ impl ScuApp {
         let font = egui::FontId::monospace(10.0);
         let tick = egui::Stroke::new(1.0, theme::text_faint());
 
+        // Minor ticks, close enough to read a value off a screenshot but never
+        // tighter than `MIN_MINOR_PX`. On a 100 kHz span this lands on 1 kHz.
+        const MIN_MINOR_PX: f32 = 10.0;
+        let max_minor = (scale_rect.width() / MIN_MINOR_PX).max(2.0) as f64;
+        let minor = nice_step_floor(span / max_minor);
+        if minor < step {
+            let minor_tick = egui::Stroke::new(1.0, theme::outline());
+            let mut hz = (left_hz / minor).ceil() * minor;
+            let mut guard = 0;
+            while hz <= right_hz + minor * 1e-3 && guard < 4096 {
+                let x = x_for(hz);
+                painter.line_segment(
+                    [
+                        egui::pos2(x, scale_rect.top() + 16.5),
+                        egui::pos2(x, scale_rect.top() + 19.0),
+                    ],
+                    minor_tick,
+                );
+                hz += minor;
+                guard += 1;
+            }
+        }
+
         let mut hz = first;
         let mut guard = 0;
         while hz <= right_hz + step * 1e-3 && guard < 128 {
-            let x = scale_rect.left() + scale_rect.width() * ((hz - left_hz) / span) as f32;
+            let x = x_for(hz);
             painter.line_segment(
                 [
                     egui::pos2(x, scale_rect.top() + 14.0),
@@ -2127,10 +2450,14 @@ impl ScuApp {
         if self.active_frequency() == 0 || self.span_hz <= 0.0 {
             return;
         }
+        // The carrier sits at the pane centre for a carrier-centred scope; for a
+        // filter-centred one it is offset by the scope centre reference.
+        let offset = self.scope_center_offset_hz();
+        let x = full_rect.left() + full_rect.width() * self.scope_pane_t(-offset);
         painter.line_segment(
             [
-                egui::pos2(full_rect.center().x, full_rect.top()),
-                egui::pos2(full_rect.center().x, full_rect.bottom()),
+                egui::pos2(x, full_rect.top()),
+                egui::pos2(x, full_rect.bottom()),
             ],
             egui::Stroke::new(1.0, theme::warn_amber()),
         );
@@ -2147,7 +2474,10 @@ impl ScuApp {
         if self.active_frequency() == 0 || self.span_hz <= 0.0 {
             return;
         }
-        let x_for = |hz: i32| rect.left() + rect.width() * (0.5 + hz as f64 / self.span_hz) as f32;
+        // `low_hz`/`high_hz` are relative to the carrier; the pane centre is the
+        // scope centre, which is offset from the carrier in FILTER mode.
+        let offset = self.scope_center_offset_hz();
+        let x_for = |hz: i32| rect.left() + rect.width() * self.scope_pane_t(hz as f64 - offset);
         let raw_left = x_for(low_hz);
         let raw_right = x_for(high_hz);
         if raw_right < rect.left() || raw_left > rect.right() {
@@ -2157,7 +2487,7 @@ impl ScuApp {
         let right = raw_right.min(rect.right());
 
         let color = if right - left >= PASSBAND_GREEN_MIN_PX {
-            theme::spectrum_green()
+            theme::spectrum_orange()
         } else {
             theme::warn_amber()
         };
@@ -2173,6 +2503,44 @@ impl ScuApp {
             [egui::pos2(right, y - cap), egui::pos2(right, y + cap)],
             stroke,
         );
+    }
+
+    /// Current IF width and roofing filter, overlaid in the waterfall corner so
+    /// the operator can see what the passband bracket represents.
+    fn paint_scope_info(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let width = match self.active_if_width_hz() {
+            Some(hz) if hz >= 1000 => format!("{:.1} kHz", hz as f64 / 1000.0),
+            Some(hz) => format!("{hz} Hz"),
+            None => "--".to_string(),
+        };
+        let rfil = self
+            .roofing_filter
+            .map(|filter| filter.label())
+            .unwrap_or("--");
+        if width == "--" && rfil == "--" {
+            return;
+        }
+        let span = if self.span_hz >= 1_000_000.0 {
+            format!("{:.1} MHz", self.span_hz / 1_000_000.0)
+        } else {
+            format!("{:.0} kHz", self.span_hz / 1_000.0)
+        };
+        let ctr = self
+            .scope_center
+            .map(|center| center.label())
+            .unwrap_or("--");
+        let text = format!("IF {width}   RFIL {rfil}   SPAN {span}   CTR {ctr}");
+
+        let font = egui::FontId::monospace(11.0);
+        let galley = painter.layout_no_wrap(text, font, theme::text());
+        let pad = egui::vec2(5.0, 3.0);
+        let chip = galley.size() + pad * 2.0;
+        let pos = egui::pos2(rect.left() + 6.0, rect.bottom() - 6.0 - chip.y);
+        let bg_rect = egui::Rect::from_min_size(pos, chip);
+        let bg = theme::card_bg();
+        let bg = egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), 210);
+        painter.rect_filled(bg_rect, 3.0, bg);
+        painter.galley(pos + pad, galley, theme::text());
     }
 
     fn ui_top(&mut self, root: &mut egui::Ui) {
@@ -2477,6 +2845,7 @@ impl ScuApp {
             egui::Rect::from_min_max(egui::pos2(full.left(), full.top() + scale_h), full.max);
 
         self.waterfall.paint(&painter, plot_rect);
+        self.paint_scope_info(&painter, plot_rect);
         self.paint_frequency_scale(&painter, scale_rect);
         self.paint_carrier(&painter, full);
         self.tune_interaction(&response, &painter, plot_rect);
@@ -2527,6 +2896,7 @@ impl ScuApp {
             let plot_rect =
                 egui::Rect::from_min_max(egui::pos2(rect.left(), rect.top() + scale_h), rect.max);
             self.waterfall.paint(&painter, plot_rect);
+            self.paint_scope_info(&painter, plot_rect);
             self.paint_frequency_scale(&painter, scale_rect);
             self.paint_carrier(&painter, rect);
             self.tune_interaction(&response, &painter, plot_rect);
@@ -2539,9 +2909,10 @@ impl ScuApp {
         let panel_id = ui.id().with("panadapter-waterfall");
         let min_h = (SCALE_BAR_H + 40.0).min(full.height() * 0.5);
         let max_h = (full.height() - 40.0).max(min_h);
-        let default_h = (full.height() * (1.0 - SPECTRUM_SHARE)).clamp(min_h, max_h);
+        let split = self.settings.panadapter_split.clamp(0.0, 1.0);
+        let default_h = (full.height() * (1.0 - split)).clamp(min_h, max_h);
 
-        egui::Panel::bottom(panel_id)
+        let panel = egui::Panel::bottom(panel_id)
             .resizable(true)
             .default_size(default_h)
             .min_size(min_h)
@@ -2562,9 +2933,24 @@ impl ScuApp {
                     rect.max,
                 );
                 self.waterfall.paint(&painter, plot_rect);
+                self.paint_scope_info(&painter, plot_rect);
                 self.paint_frequency_scale(&painter, scale_rect);
                 self.tune_interaction(&response, &painter, plot_rect);
             });
+
+        // Persist the divider position once the separator drag ends, so the
+        // split is restored on the next launch.
+        if panel.response.rect.height() > 0.0
+            && ctx
+                .read_response(panel_id.with("__resize"))
+                .is_some_and(|r| r.drag_stopped())
+        {
+            let share = (1.0 - panel.response.rect.height() / full.height()).clamp(0.0, 1.0);
+            if (share - self.settings.panadapter_split).abs() > f32::EPSILON {
+                self.settings.panadapter_split = share;
+                save_settings(&self.settings);
+            }
+        }
 
         let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::click());
         self.paint_spectrum(&painter, response.rect);
@@ -2647,6 +3033,9 @@ impl ScuApp {
                 self.pane_antenna(ui);
                 #[cfg(target_arch = "wasm32")]
                 ui.label("Not available in the browser build.");
+            }
+            Pane::Unsupported => {
+                ui.label("This panel is no longer supported.");
             }
         }
     }
@@ -3242,6 +3631,23 @@ impl ScuApp {
         }
 
         theme::section(ui, "Filter");
+        let current_roofing = self.roofing_filter;
+        let mut selected_roofing = current_roofing;
+        ui.horizontal(|ui| {
+            ui.label("Roofing filter");
+            egui::ComboBox::from_id_salt("roofing-filter")
+                .selected_text(current_roofing.map(|f| f.label()).unwrap_or("--"))
+                .show_ui(ui, |ui| {
+                    for filter in RoofingFilter::ALL {
+                        ui.selectable_value(&mut selected_roofing, Some(filter), filter.label());
+                    }
+                });
+        });
+        if selected_roofing != current_roofing {
+            if let Some(filter) = selected_roofing {
+                self.set_roofing_filter(filter);
+            }
+        }
         let options = self.current_if_width_options();
         let current_width = self.active_if_width();
         let width_label = self.if_width_label(current_width);
@@ -3434,24 +3840,9 @@ impl ScuApp {
             self.settings.waterfall_gain = self.waterfall.gain;
             save_settings(&self.settings);
         }
-        ui.horizontal(|ui| {
-            ui.label("Bins");
-            let mut bins = self.settings.scope_bins;
-            egui::ComboBox::from_id_salt("bin-mode")
-                .selected_text(bins.label())
-                .show_ui(ui, |ui| {
-                    for mode in BinInterleave::ALL {
-                        ui.selectable_value(&mut bins, mode, mode.label());
-                    }
-                });
-            if bins != self.settings.scope_bins {
-                self.settings.scope_bins = bins;
-                save_settings(&self.settings);
-            }
-            if ui.button("Clear").clicked() {
-                self.waterfall.clear();
-            }
-        });
+        if ui.button("Clear").clicked() {
+            self.waterfall.clear();
+        }
     }
 
     /// Audio pane: mute, volume and stereo.
@@ -4024,20 +4415,16 @@ impl ScuApp {
     /// Panes tab: add/remove optional panels and reset the arrangement.
     fn settings_panes(&mut self, ui: &mut egui::Ui) {
         theme::section(ui, "Optional panes");
-        let mut show = layout::pane_tile(&self.layouts.draft, Pane::CatConsole).is_some();
+        let mut show = layout::pane_open(&self.layouts.draft, Pane::CatConsole)
+            || self.is_popped(Pane::CatConsole);
         if ui
             .checkbox(&mut show, "CAT console")
             .on_hover_text("Add or remove the CAT command log pane")
             .changed()
         {
-            if show {
-                layout::add_pane(&mut self.layouts.draft, Pane::CatConsole);
-            } else {
-                layout::remove_pane(&mut self.layouts.draft, Pane::CatConsole);
-            }
+            self.set_pane_shown(Pane::CatConsole, show);
             self.settings.show_cat_console = show;
             save_settings(&self.settings);
-            self.mark_layout_dirty();
         }
         ui.label(
             egui::RichText::new("Use the Panels menu in the toolbar for every other pane.")
@@ -4151,10 +4538,9 @@ impl ScuApp {
         if self.active_frequency() == 0 || rect.width() <= 0.0 {
             return;
         }
-        let axis = self.axis();
         let hz_at = |x: f32| {
             let t = ((x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
-            axis.hz_at(t)
+            self.scope_hz_at(t)
         };
 
         let shift = response.ctx.input(|i| i.modifiers.shift);
@@ -4222,6 +4608,9 @@ impl eframe::App for ScuApp {
         #[cfg(not(target_arch = "wasm32"))]
         self.poll_antenna(_ctx);
         self.maybe_refresh_vfo();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.cat_server
+            .set_split_control(self.settings.cat_server_split_control);
         self.poll();
         #[cfg(not(target_arch = "wasm32"))]
         self.reconcile_external_ptt();
@@ -4264,6 +4653,7 @@ impl eframe::App for ScuApp {
         // Pop-out requests were queued while the tree was borrowed; apply them
         // now, then draw the floating windows.
         self.process_popouts();
+        self.process_close_requests();
         self.render_popped(&ctx);
 
         let space = self.handle.is_some()
@@ -4361,6 +4751,7 @@ impl ScuApp {
             preset.tree = default.clone();
         }
         self.layouts.draft = default;
+        self.layouts.sync_popped_visibility();
         self.mark_layout_dirty();
     }
 
@@ -4378,6 +4769,7 @@ impl ScuApp {
         };
         self.layouts.active_id = preset.id.clone();
         self.layouts.draft = preset.tree.clone();
+        self.layouts.sync_popped_visibility();
         self.mark_layout_dirty();
     }
 
@@ -4406,6 +4798,7 @@ impl ScuApp {
 
     fn delete_preset(&mut self, id: &str) {
         self.layouts.presets.retain(|p| p.id != id);
+        layout::delete_user_layout(id);
         if self.layouts.active_id == id {
             self.switch_layout(layout::DEFAULT_ID);
         }
@@ -4424,25 +4817,49 @@ impl ScuApp {
         }
     }
 
+    /// Queue a pane to be hidden in place after the current tree render.
+    pub(crate) fn request_close_pane(&mut self, pane: Pane) {
+        if !self.close_requests.contains(&pane) {
+            self.close_requests.push(pane);
+        }
+    }
+
     /// Move a pane out of the dock tree and into its own window.
     fn process_popouts(&mut self) {
         if self.popout_requests.is_empty() {
             return;
         }
         for pane in std::mem::take(&mut self.popout_requests) {
-            layout::remove_pane(&mut self.layouts.draft, pane);
             if !self.layouts.popped.contains(&pane) {
                 self.layouts.popped.push(pane);
             }
         }
+        // The pane stays in the tree as a hidden tile; docking will reveal it
+        // again in the exact container it came from.
+        self.layouts.sync_popped_visibility();
         self.mark_layout_dirty();
     }
 
-    /// Return a floating pane to the dock tree.
-    fn dock_pane(&mut self, pane: Pane) {
+    /// Hide panes whose tab was closed, keeping their tile in the tree.
+    fn process_close_requests(&mut self) {
+        for pane in std::mem::take(&mut self.close_requests) {
+            self.set_pane_shown(pane, false);
+        }
+    }
+
+    /// Show or hide one pane. Showing a hidden pane restores the slot it had
+    /// before it was hidden; hiding keeps the tile so a later show returns to
+    /// the same place.
+    fn set_pane_shown(&mut self, pane: Pane, shown: bool) {
         self.layouts.popped.retain(|p| *p != pane);
-        layout::add_pane(&mut self.layouts.draft, pane);
+        layout::set_pane_open(&mut self.layouts.draft, pane, shown);
         self.mark_layout_dirty();
+    }
+
+    /// Return a floating pane to the dock tree, restoring the slot it occupied
+    /// before it was popped out.
+    fn dock_pane(&mut self, pane: Pane) {
+        self.set_pane_shown(pane, true);
     }
 
     /// Draw each floating pane in its own OS window (an embedded window on the
@@ -4560,7 +4977,7 @@ impl ScuApp {
                 continue;
             }
             let popped = self.is_popped(pane);
-            let open = popped || layout::pane_tile(&self.layouts.draft, pane).is_some();
+            let open = popped || layout::pane_open(&self.layouts.draft, pane);
             let label = if popped {
                 format!("{} (floating)", pane.title())
             } else {
@@ -4568,13 +4985,13 @@ impl ScuApp {
             };
             if ui.selectable_label(open, label).clicked() {
                 if popped {
+                    // Docking restores the slot the pane was popped from.
                     self.dock_pane(pane);
-                } else if open {
-                    layout::remove_pane(&mut self.layouts.draft, pane);
-                    self.mark_layout_dirty();
                 } else {
-                    layout::add_pane(&mut self.layouts.draft, pane);
-                    self.mark_layout_dirty();
+                    // Disabling keeps the pane's tile so re-enabling restores
+                    // its place; enabling a pane with no slot falls back to the
+                    // active tab set.
+                    self.set_pane_shown(pane, !open);
                 }
             }
         }
@@ -4944,18 +5361,15 @@ impl ScuApp {
         self.show_notice(format!("Span {}", span_label(self.span_hz)));
     }
 
-    /// Show or hide one dock pane (also docks it if it is floating).
+    /// Show or hide one dock pane (also docks it if it is floating), keeping a
+    /// hidden pane's slot so it can be shown again in the same place.
     fn toggle_pane(&mut self, pane: Pane) {
         if self.is_popped(pane) {
             self.dock_pane(pane);
             return;
         }
-        if layout::pane_tile(&self.layouts.draft, pane).is_some() {
-            layout::remove_pane(&mut self.layouts.draft, pane);
-        } else {
-            layout::add_pane(&mut self.layouts.draft, pane);
-        }
-        self.mark_layout_dirty();
+        let open = layout::pane_open(&self.layouts.draft, pane);
+        self.set_pane_shown(pane, !open);
     }
 
     fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
@@ -5342,6 +5756,24 @@ fn format_hz_label(hz: f64) -> String {
     scu_cat::format_hz(snap_hz(hz, 1))
 }
 
+/// Round `raw` down to the previous 1 / 2 / 5 x 10^n step, for minor ticks that
+/// always sit inside the labelled spacing.
+fn nice_step_floor(raw: f64) -> f64 {
+    if raw <= 0.0 {
+        return 1.0;
+    }
+    let base = 10f64.powf(raw.log10().floor());
+    let frac = raw / base;
+    let mult = if frac >= 5.0 {
+        5.0
+    } else if frac >= 2.0 {
+        2.0
+    } else {
+        1.0
+    };
+    mult * base
+}
+
 /// Round `raw` up to the next 1 / 2 / 5 x 10^n step, for readable tick spacing.
 fn nice_step(raw: f64) -> f64 {
     if raw <= 0.0 {
@@ -5468,7 +5900,12 @@ fn save_settings(settings: &AppSettings) {
 #[cfg(test)]
 mod tests {
     use super::parse_frequency_text as parse;
-    use super::{format_hz_label, frame_vfo_sub, md_vfo_sub, snap_hz};
+    use super::{format_hz_label, frame_vfo_sub, md_vfo_sub, scope_axis_span_hz, snap_hz};
+
+    #[test]
+    fn scope_axis_uses_measured_uniform_span() {
+        assert_eq!(scope_axis_span_hz(100_000.0), 107_500.0);
+    }
 
     #[test]
     fn cat_frames_route_to_their_vfo() {

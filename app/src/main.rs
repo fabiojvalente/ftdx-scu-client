@@ -29,11 +29,18 @@ fn main() -> eframe::Result<()> {
         let _ = handle.reload(tracing_subscriber::EnvFilter::new(level));
     }));
 
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../static/icon.png"))
+        .map(std::sync::Arc::new)
+        .ok();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 820.0])
+        .with_min_inner_size([900.0, 600.0])
+        .with_title("SCU-LAN10 Client");
+    if let Some(icon) = icon {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 820.0])
-            .with_min_inner_size([900.0, 600.0])
-            .with_title("SCU-LAN10 Client"),
+        viewport,
         ..Default::default()
     };
 

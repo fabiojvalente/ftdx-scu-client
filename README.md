@@ -38,17 +38,22 @@ Operation Reference manuals).
 The window is a thin connection/command bar over a dockable panel workspace
 (built on [`egui_tiles`](https://github.com/rerun-io/egui_tiles)). Drag a tab to
 move or split a panel, drag the gaps to resize, and use the tab close button or
-the **Panels** menu to show and hide panels.
+the **Panels** menu to show and hide panels. Hiding a panel keeps its slot, so
+showing it again returns it to where it was; a panel that has no remembered slot
+is added to the active tab set.
 
 - **Layouts** menu — switch between the built-in **Default** and **Dashboard**
   arrangements, save the current one as a named preset, rename or delete
-  presets, and reset to the default. The working arrangement and presets are
-  stored in `~/.config/scu-client/layouts.json` (native) or browser
-  `localStorage` (wasm) and restored on launch.
+  presets, and reset to the default. Each saved layout is stored as its own
+  file in `~/.config/scu-client/layouts/<id>.json`, while the working
+  arrangement and the built-in Default/Dashboard state live in
+  `~/.config/scu-client/layouts.json` (native) or browser `localStorage`
+  (wasm). Everything is restored on launch.
 - **Pop-out** — the **Pop** button in any tab bar moves that panel into its own
   OS window (native builds). Use **Dock** in the panel's title bar (or close the
-  window) to return it; floating panels are remembered across launches. On the
-  web build a pop-out falls back to an embedded floating window.
+  window) to return it to the exact container it came from; floating panels are
+  remembered across launches. On the web build a pop-out falls back to an
+  embedded floating window.
 - **Theme** menu — Dark, Light, Yaesu and Neon. The active palette is also
   selectable in Settings.
 - **Scale** menu — Extra small … Extra large. Scaling changes fonts, spacing and
@@ -157,7 +162,11 @@ The app can present the radio to third-party software. In the side rail:
   Hamlib binary, no serial port, no GPL dependency). Configure the other program
   as **Hamlib NET rigctl** at `127.0.0.1:4532`; several clients can share the one
   session. Getters are answered from a cached radio state and a TX safety
-  watchdog releases PTT if a client disappears mid-transmission.
+  watchdog releases PTT if a client disappears mid-transmission. By default
+  clients cannot change the radio's VFO selection or split state (those requests
+  are answered but not sent), which is right for WSJT-X with *Split Operation*
+  set to **None** or **Fake It**. For **Rig** split, tick *Allow clients to
+  control split / VFO* (headless: `--split-control`).
 - **Audio Streaming** — route RX to a loopback output device and take TX from a
   loopback input device (BlackHole, Loopback, Common-Radio, VB-Cable, …), so the
   external program's soundcard in/out is bridged to the radio.

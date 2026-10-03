@@ -19,12 +19,14 @@ struct Args {
     config: ConnectConfig,
     seconds: u64,
     port: u16,
+    split_control: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut config = ConnectConfig::default();
     let mut seconds = 0u64;
     let mut port = DEFAULT_PORT;
+    let mut split_control = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -53,6 +55,7 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "--rigctld-port must be a number")?
             }
+            "--split-control" => split_control = true,
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -64,6 +67,7 @@ fn parse_args() -> Result<Args, String> {
         config,
         seconds,
         port,
+        split_control,
     })
 }
 
@@ -81,6 +85,8 @@ OPTIONS:
     -P, --pass <PASS>        Password (default defaultuser)
     -s, --seconds <N>        How long to serve (default 0 = until Ctrl-C)
     -t, --rigctld-port <P>   rigctld TCP listen port (default 4532)
+        --split-control      Let clients change the radio's VFO / split state
+                             (needed for WSJT-X Split Operation: Rig)
     -h, --help               Show this help"
     );
 }
@@ -140,22 +146,35 @@ async fn serve(args: Args) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    server.set_split_control(args.split_control);
     println!(
         "rigctld listening on 0.0.0.0:{} — configure software as Hamlib NET rigctl",
         server.port()
     );
 
     // Populate the cache once, then keep it fresh from the response stream.
-    for command in [
-        "ID;", "FA;", "FB;", "FR;", "MD0;", "MD1;", "SM0;", "TX;", "PC;", "AC;",
-    ] {
+    // `VS;` precedes `MD0;`/`MD1;` because the FTDX10's `MD` P1 is relative to
+    // the operating VFO.
+    const POLL: [&str; 11] = [
+        "FA;", "FB;", "VS;", "MD0;", "MD1;", "ST;", "SM0;", "TX;", "PC;", "AC;", "FT;",
+    ];
+    client.handle().send_cat("ID;");
+    for command in POLL {
         client.handle().send_cat(command);
     }
+    let mut last_poll = Instant::now();
 
     let deadline = (args.seconds > 0).then(|| Instant::now() + Duration::from_secs(args.seconds));
     loop {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             break;
+        }
+        // Keep the VFO / split / frequency cache current, as the GUI does.
+        if last_poll.elapsed() >= Duration::from_secs(1) {
+            last_poll = Instant::now();
+            for command in POLL {
+                client.handle().send_cat(command);
+            }
         }
         match tokio::time::timeout(Duration::from_millis(250), client.recv()).await {
             Ok(Some(Event::Cat(frame))) => state.lock().unwrap().apply(&frame),

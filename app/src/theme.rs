@@ -124,7 +124,7 @@ pub struct Theme {
     pub tx_red: Color32,
     pub warn_amber: Color32,
     pub freq_cyan: Color32,
-    pub spectrum_green: Color32,
+    pub spectrum_orange: Color32,
     /// Text drawn on top of a bright accent fill.
     pub on_accent: Color32,
 
@@ -167,7 +167,7 @@ impl Theme {
             tx_red: rgb(207, 74, 68),
             warn_amber: rgb(226, 172, 72),
             freq_cyan: rgb(124, 201, 255),
-            spectrum_green: rgb(88, 224, 168),
+            spectrum_orange: rgb(245, 150, 40),
             on_accent: rgb(13, 18, 24),
             radius: 5,
         }
@@ -194,7 +194,7 @@ impl Theme {
             tx_red: rgb(220, 53, 69),
             warn_amber: rgb(255, 193, 7),
             freq_cyan: rgb(13, 110, 253),
-            spectrum_green: rgb(25, 135, 84),
+            spectrum_orange: rgb(230, 126, 34),
             on_accent: rgb(255, 255, 255),
             radius: 5,
         }
@@ -221,7 +221,7 @@ impl Theme {
             tx_red: rgb(220, 53, 69),
             warn_amber: rgb(255, 193, 7),
             freq_cyan: rgb(242, 163, 60),
-            spectrum_green: rgb(88, 207, 154),
+            spectrum_orange: rgb(242, 163, 60),
             on_accent: rgb(18, 18, 18),
             radius: 2,
         }
@@ -248,7 +248,7 @@ impl Theme {
             tx_red: rgb(255, 43, 94),
             warn_amber: rgb(255, 212, 0),
             freq_cyan: rgb(0, 240, 255),
-            spectrum_green: rgb(57, 255, 20),
+            spectrum_orange: rgb(255, 140, 0),
             on_accent: rgb(0, 16, 24),
             radius: 4,
         }
@@ -377,8 +377,8 @@ pub fn warn_amber() -> Color32 {
 pub fn freq_cyan() -> Color32 {
     current().freq_cyan
 }
-pub fn spectrum_green() -> Color32 {
-    current().spectrum_green
+pub fn spectrum_orange() -> Color32 {
+    current().spectrum_orange
 }
 pub fn on_accent() -> Color32 {
     current().on_accent

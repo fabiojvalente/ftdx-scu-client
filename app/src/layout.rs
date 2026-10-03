@@ -47,6 +47,11 @@ pub enum Pane {
     CatServer,
     Vox,
     Antenna,
+    /// Catch-all for a pane that this build no longer knows about. Layout
+    /// files that mention a removed panel still deserialize instead of failing
+    /// wholesale; the loader strips these before the tree is rendered.
+    #[serde(other)]
+    Unsupported,
 }
 
 impl Pane {
@@ -94,6 +99,7 @@ impl Pane {
             Pane::CatServer => "Radio Server (CAT)",
             Pane::Vox => "VOX",
             Pane::Antenna => "Antenna",
+            Pane::Unsupported => "Unsupported",
         }
     }
 
@@ -104,6 +110,9 @@ impl Pane {
 
     /// Whether this panel can be shown on the current host.
     pub fn available(self, dual_receiver: bool) -> bool {
+        if self == Pane::Unsupported {
+            return false;
+        }
         if self.native_only() && cfg!(target_arch = "wasm32") {
             return false;
         }
@@ -210,6 +219,11 @@ pub fn dashboard_tree() -> Tree<Pane> {
 }
 
 // ---- Persistence --------------------------------------------------------
+//
+// User layouts are stored one file per layout under `$CONFIG/layouts/<id>.json`
+// so they are never entangled with the built-in arrangements. The remaining
+// live state (the working draft, the active selection and the last state of the
+// two built-ins) lives in `layouts.json`.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Preset {
@@ -218,8 +232,8 @@ pub struct Preset {
     pub tree: Tree<Pane>,
 }
 
-/// The on-disk layout file: the working draft, the active selection and any
-/// user-saved presets.
+/// The full in-memory layout state: the working draft, the active selection and
+/// every preset (built-in Default/Dashboard plus user layouts).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayoutsFile {
     #[serde(default = "layout_version")]
@@ -232,6 +246,29 @@ pub struct LayoutsFile {
     /// Panes floating in their own OS windows (native only), restored on launch.
     #[serde(default)]
     pub popped: Vec<Pane>,
+}
+
+/// The `layouts.json` workspace: the live draft plus the two built-in
+/// arrangements. User layouts are deliberately absent — their own files are the
+/// source of truth, so changing the built-ins can never clobber them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Workspace {
+    #[serde(default = "layout_version")]
+    version: u32,
+    #[serde(default = "default_active_id")]
+    active_id: String,
+    #[serde(default = "default_tree")]
+    draft: Tree<Pane>,
+    #[serde(default = "default_tree")]
+    default_layout: Tree<Pane>,
+    #[serde(default = "dashboard_tree")]
+    dashboard_layout: Tree<Pane>,
+    #[serde(default)]
+    popped: Vec<Pane>,
+    /// User presets were once embedded in this file. Read once for migration
+    /// and never written back.
+    #[serde(default, rename = "presets", skip_serializing)]
+    legacy_presets: Vec<Preset>,
 }
 
 fn layout_version() -> u32 {
@@ -259,15 +296,90 @@ impl Default for LayoutsFile {
 impl LayoutsFile {
     /// Load from disk/localStorage, falling back to the default arrangement.
     pub fn load() -> Self {
-        match storage_load() {
-            Some(text) => match serde_json::from_str::<LayoutsFile>(&text) {
-                Ok(mut file) if file.version == LAYOUT_VERSION => {
-                    file.ensure_builtins();
-                    file
+        let (mut file, legacy) = match workspace_load() {
+            Some(text) => Self::from_workspace(&text),
+            None => (Self::default(), Vec::new()),
+        };
+        // Individual user layout files win over anything still embedded in the
+        // workspace, then adopt legacy presets that have no file yet.
+        file.load_user_layouts();
+        file.adopt_user_presets(legacy);
+        file.ensure_builtins();
+        // Strip panels this build no longer supports, then write the cleaned
+        // user layouts back so a stale panel is dropped without the layout
+        // itself ever being discarded.
+        file.sanitize();
+        // Floating panes are stored as hidden tiles so docking can restore
+        // their original slot; make an older file (where they were removed)
+        // match before persisting.
+        file.sync_popped_visibility();
+        file.write_user_layouts();
+        // Rewriting the workspace drops any legacy embedded presets now that
+        // they have their own files.
+        file.save_workspace();
+        file
+    }
+
+    fn from_workspace(text: &str) -> (Self, Vec<Preset>) {
+        let Ok(ws) = serde_json::from_str::<Workspace>(text) else {
+            return (Self::default(), Vec::new());
+        };
+        if ws.version != LAYOUT_VERSION {
+            return (Self::default(), Vec::new());
+        }
+        let mut file = Self {
+            version: LAYOUT_VERSION,
+            active_id: ws.active_id,
+            draft: ws.draft,
+            popped: ws.popped,
+            presets: vec![
+                Preset {
+                    id: DEFAULT_ID.to_string(),
+                    name: "Default".to_string(),
+                    tree: ws.default_layout,
+                },
+                Preset {
+                    id: DASHBOARD_ID.to_string(),
+                    name: "Dashboard".to_string(),
+                    tree: ws.dashboard_layout,
+                },
+            ],
+        };
+        let mut legacy = Vec::new();
+        for preset in ws.legacy_presets {
+            match preset.id.as_str() {
+                DEFAULT_ID => {
+                    if let Some(slot) = file.presets.iter_mut().find(|p| p.id == DEFAULT_ID) {
+                        slot.tree = preset.tree;
+                    }
                 }
-                _ => Self::default(),
-            },
-            None => Self::default(),
+                DASHBOARD_ID => {
+                    if let Some(slot) = file.presets.iter_mut().find(|p| p.id == DASHBOARD_ID) {
+                        slot.tree = preset.tree;
+                    }
+                }
+                _ => legacy.push(preset),
+            }
+        }
+        (file, legacy)
+    }
+
+    fn adopt_user_presets(&mut self, presets: Vec<Preset>) {
+        for preset in presets {
+            if !self.presets.iter().any(|p| p.id == preset.id) {
+                self.presets.push(preset);
+            }
+        }
+    }
+
+    fn load_user_layouts(&mut self) {
+        for preset in read_user_layouts() {
+            if preset.id == DEFAULT_ID || preset.id == DASHBOARD_ID {
+                continue;
+            }
+            if !self.presets.iter().any(|p| p.id == preset.id) {
+                self.presets.push(preset);
+            }
         }
     }
 
@@ -301,27 +413,135 @@ impl LayoutsFile {
             .filter(|p| p.id != DEFAULT_ID && p.id != DASHBOARD_ID)
     }
 
+    /// Drop panes this build can no longer show from every tree. A pane the
+    /// code no longer knows about deserializes as [`Pane::Unsupported`];
+    /// host-only panes (native panels on the web) are unavailable too.
+    fn sanitize(&mut self) {
+        sanitize_tree(&mut self.draft);
+        for preset in &mut self.presets {
+            sanitize_tree(&mut preset.tree);
+        }
+    }
+
+    /// Reconcile the working tree with the floating-pane list: every floating
+    /// pane is present in the tree but hidden. Keeping a popped pane as a hidden
+    /// tile is what lets docking put it back in exactly the container it left.
+    /// A pane missing from an older layout is re-added first so it still has a
+    /// slot to return to. Panes hidden for any other reason (closed from the
+    /// Panels menu, the tab close button, or their own toggle) are left hidden,
+    /// so their slot survives until they are shown again.
+    pub fn sync_popped_visibility(&mut self) {
+        self.popped.retain(|pane| pane.available(true));
+        for pane in self.popped.clone() {
+            if !set_pane_visible(&mut self.draft, pane, false) {
+                add_pane(&mut self.draft, pane);
+                set_pane_visible(&mut self.draft, pane, false);
+            }
+        }
+    }
+
     pub fn save(&self) {
-        if let Ok(text) = serde_json::to_string_pretty(self) {
-            storage_save(&text);
+        self.save_workspace();
+        self.write_user_layouts();
+    }
+
+    fn save_workspace(&self) {
+        let default_layout = self
+            .presets
+            .iter()
+            .find(|p| p.id == DEFAULT_ID)
+            .map(|p| p.tree.clone())
+            .unwrap_or_else(default_tree);
+        let dashboard_layout = self
+            .presets
+            .iter()
+            .find(|p| p.id == DASHBOARD_ID)
+            .map(|p| p.tree.clone())
+            .unwrap_or_else(dashboard_tree);
+        let workspace = Workspace {
+            version: LAYOUT_VERSION,
+            active_id: self.active_id.clone(),
+            draft: self.draft.clone(),
+            default_layout,
+            dashboard_layout,
+            popped: self.popped.clone(),
+            legacy_presets: Vec::new(),
+        };
+        if let Ok(text) = serde_json::to_string_pretty(&workspace) {
+            workspace_save(&text);
+        }
+    }
+
+    fn write_user_layouts(&self) {
+        for preset in self.user_presets() {
+            if let Ok(text) = serde_json::to_string_pretty(preset) {
+                user_layout_write(&preset.id, &text);
+            }
         }
     }
 }
 
+/// Remove every pane this host cannot show from the tree.
+fn sanitize_tree(tree: &mut Tree<Pane>) {
+    let stale: Vec<Pane> = tree
+        .tiles
+        .iter()
+        .filter_map(|(_, tile)| match tile {
+            Tile::Pane(pane) if !pane.available(true) => Some(*pane),
+            _ => None,
+        })
+        .collect();
+    for pane in stale {
+        remove_pane(tree, pane);
+    }
+}
+
+/// Turn a preset id into a safe file name. Reading uses the id stored inside
+/// the file, so a lossy mapping is fine.
 #[cfg(not(target_arch = "wasm32"))]
-fn layouts_path() -> Option<std::path::PathBuf> {
+fn file_stem(id: &str) -> String {
+    id.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Delete a user layout's file (native) or localStorage entry (web).
+pub fn delete_user_layout(id: &str) {
+    user_layout_delete(id)
+}
+
+// ---- Native storage -----------------------------------------------------
+
+#[cfg(not(target_arch = "wasm32"))]
+fn config_dir() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(std::path::PathBuf::from(home).join(".config/scu-client/layouts.json"))
+    Some(std::path::PathBuf::from(home).join(".config/scu-client"))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn storage_load() -> Option<String> {
-    std::fs::read_to_string(layouts_path()?).ok()
+fn workspace_path() -> Option<std::path::PathBuf> {
+    Some(config_dir()?.join("layouts.json"))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn storage_save(text: &str) {
-    let Some(path) = layouts_path() else {
+fn user_layouts_dir() -> Option<std::path::PathBuf> {
+    Some(config_dir()?.join("layouts"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn workspace_load() -> Option<String> {
+    std::fs::read_to_string(workspace_path()?).ok()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn workspace_save(text: &str) {
+    let Some(path) = workspace_path() else {
         return;
     };
     if let Some(parent) = path.parent() {
@@ -330,25 +550,109 @@ fn storage_save(text: &str) {
     let _ = std::fs::write(path, text);
 }
 
-#[cfg(target_arch = "wasm32")]
-const LAYOUTS_KEY: &str = "scu-client-layouts";
+#[cfg(not(target_arch = "wasm32"))]
+fn read_user_layouts() -> Vec<Preset> {
+    let Some(dir) = user_layouts_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                return None;
+            }
+            let text = std::fs::read_to_string(&path).ok()?;
+            serde_json::from_str::<Preset>(&text).ok()
+        })
+        .collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn user_layout_write(id: &str, text: &str) {
+    let Some(dir) = user_layouts_dir() else {
+        return;
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let _ = std::fs::write(dir.join(format!("{}.json", file_stem(id))), text);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn user_layout_delete(id: &str) {
+    let Some(dir) = user_layouts_dir() else {
+        return;
+    };
+    let _ = std::fs::remove_file(dir.join(format!("{}.json", file_stem(id))));
+}
+
+// ---- Web storage --------------------------------------------------------
 
 #[cfg(target_arch = "wasm32")]
-fn storage_load() -> Option<String> {
-    let window = web_sys::window()?;
-    let storage = window.local_storage().ok()??;
-    storage.get_item(LAYOUTS_KEY).ok()?
+const WORKSPACE_KEY: &str = "scu-client-layouts";
+
+#[cfg(target_arch = "wasm32")]
+const USER_LAYOUT_PREFIX: &str = "scu-client-layout-";
+
+#[cfg(target_arch = "wasm32")]
+fn local_storage() -> Option<web_sys::Storage> {
+    web_sys::window()?.local_storage().ok()?
 }
 
 #[cfg(target_arch = "wasm32")]
-fn storage_save(text: &str) {
-    let Some(window) = web_sys::window() else {
+fn workspace_load() -> Option<String> {
+    local_storage()?.get_item(WORKSPACE_KEY).ok()?
+}
+
+#[cfg(target_arch = "wasm32")]
+fn workspace_save(text: &str) {
+    let Some(storage) = local_storage() else {
         return;
     };
-    let Ok(Some(storage)) = window.local_storage() else {
+    let _ = storage.set_item(WORKSPACE_KEY, text);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn read_user_layouts() -> Vec<Preset> {
+    let Some(storage) = local_storage() else {
+        return Vec::new();
+    };
+    let len = storage.length().unwrap_or(0);
+    let mut presets = Vec::new();
+    for i in 0..len {
+        let Ok(Some(key)) = storage.key(i) else {
+            continue;
+        };
+        if !key.starts_with(USER_LAYOUT_PREFIX) {
+            continue;
+        }
+        if let Ok(Some(text)) = storage.get_item(&key) {
+            if let Ok(preset) = serde_json::from_str::<Preset>(&text) {
+                presets.push(preset);
+            }
+        }
+    }
+    presets
+}
+
+#[cfg(target_arch = "wasm32")]
+fn user_layout_write(id: &str, text: &str) {
+    let Some(storage) = local_storage() else {
         return;
     };
-    let _ = storage.set_item(LAYOUTS_KEY, text);
+    let _ = storage.set_item(&format!("{USER_LAYOUT_PREFIX}{id}"), text);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn user_layout_delete(id: &str) {
+    let Some(storage) = local_storage() else {
+        return;
+    };
+    let _ = storage.remove_item(&format!("{USER_LAYOUT_PREFIX}{id}"));
 }
 
 // ---- Row/col helpers for the Panels menu --------------------------------
@@ -406,6 +710,37 @@ pub fn add_pane(tree: &mut Tree<Pane>, pane: Pane) {
 pub fn remove_pane(tree: &mut Tree<Pane>, pane: Pane) {
     if let Some(id) = pane_tile(tree, pane) {
         tree.remove_recursively(id);
+    }
+}
+
+/// Show or hide `pane` without removing it from the tree. A hidden tile keeps
+/// its place in the hierarchy, so a pane that has been popped out into its own
+/// window returns to exactly the container (tab set or split) it came from when
+/// it is docked again. Returns `false` if the pane is not in the tree.
+pub fn set_pane_visible(tree: &mut Tree<Pane>, pane: Pane, visible: bool) -> bool {
+    let Some(id) = pane_tile(tree, pane) else {
+        return false;
+    };
+    tree.tiles.set_visible(id, visible);
+    true
+}
+
+/// Whether `pane` is currently shown (present and visible) in the tree.
+pub fn pane_open(tree: &Tree<Pane>, pane: Pane) -> bool {
+    pane_tile(tree, pane).is_some_and(|id| tree.tiles.is_visible(id))
+}
+
+/// Open or close `pane`, keeping its tile in the tree either way so that a
+/// closed pane reopens in the same place. Opening a pane that has no remembered
+/// slot (it was never in this arrangement, or the tile was removed) falls back
+/// to adding it to the active tab set, as before.
+pub fn set_pane_open(tree: &mut Tree<Pane>, pane: Pane, open: bool) {
+    if open {
+        if !set_pane_visible(tree, pane, true) {
+            add_pane(tree, pane);
+        }
+    } else {
+        set_pane_visible(tree, pane, false);
     }
 }
 
@@ -647,6 +982,18 @@ impl Behavior<Pane> for FlexBehavior<'_> {
         }
     }
 
+    /// Closing a pane's tab hides the pane in place (rather than deleting its
+    /// tile) so that re-enabling it from the Panels menu restores its slot.
+    /// Containers keep the default removal.
+    fn on_tab_close(&mut self, tiles: &mut Tiles<Pane>, tile_id: TileId) -> bool {
+        let pane = match tiles.get(tile_id) {
+            Some(Tile::Pane(pane)) => *pane,
+            _ => return true,
+        };
+        self.app.request_close_pane(pane);
+        false
+    }
+
     fn on_edit(&mut self, _action: EditAction) {
         self.app.mark_layout_dirty();
     }
@@ -698,6 +1045,118 @@ mod tests {
         assert_eq!(file.draft, dashboard_tree());
         assert!(file.presets.iter().any(|p| p.id == DEFAULT_ID));
         assert!(file.presets.iter().any(|p| p.id == DASHBOARD_ID));
+    }
+
+    #[test]
+    fn unknown_pane_deserializes_as_unsupported() {
+        // A layout written by a build that had a panel this one does not know
+        // about must still deserialize rather than collapsing to the default.
+        let pane: Pane = serde_json::from_str("\"SomeRemovedPanel\"").expect("deserialize");
+        assert_eq!(pane, Pane::Unsupported);
+        assert!(!pane.available(true));
+    }
+
+    #[test]
+    fn sanitize_drops_unsupported_panes() {
+        let mut tree = default_tree();
+        add_pane(&mut tree, Pane::Unsupported);
+        assert!(pane_tile(&tree, Pane::Unsupported).is_some());
+        sanitize_tree(&mut tree);
+        assert!(pane_tile(&tree, Pane::Unsupported).is_none());
+        // The supported panes are untouched.
+        assert!(pane_tile(&tree, Pane::Panadapter).is_some());
+    }
+
+    #[test]
+    fn legacy_user_presets_migrate_out_of_the_workspace() {
+        let default = serde_json::to_value(default_tree()).expect("value");
+        let dashboard = serde_json::to_value(dashboard_tree()).expect("value");
+        let legacy = serde_json::json!({
+            "version": LAYOUT_VERSION,
+            "active_id": DEFAULT_ID,
+            "draft": default.clone(),
+            "presets": [
+                { "id": DEFAULT_ID, "name": "Default", "tree": default },
+                { "id": "layout-1", "name": "Mine", "tree": dashboard },
+            ],
+            "popped": [],
+        });
+        let text = serde_json::to_string(&legacy).expect("serialize");
+        let (file, migrated) = LayoutsFile::from_workspace(&text);
+        assert_eq!(migrated.len(), 1);
+        assert_eq!(migrated[0].id, "layout-1");
+        // Built-ins are always rebuilt in memory from the workspace fields.
+        assert!(file.presets.iter().any(|p| p.id == DEFAULT_ID));
+        assert!(file.presets.iter().any(|p| p.id == DASHBOARD_ID));
+    }
+
+    #[test]
+    fn hiding_a_popped_pane_keeps_its_slot() {
+        let mut tree = default_tree();
+        // Tuning shares a tab set with Radio and Clarifier in the default tree.
+        let slot = pane_tile(&tree, Pane::Tuning).expect("Tuning present");
+        assert!(set_pane_visible(&mut tree, Pane::Tuning, false));
+        assert!(!tree.tiles.is_visible(slot));
+        // Simplifying must not prune the hidden pane or collapse its tab set.
+        tree.simplify(&egui_tiles::SimplificationOptions {
+            all_panes_must_have_tabs: true,
+            ..Default::default()
+        });
+        assert_eq!(pane_tile(&tree, Pane::Tuning), Some(slot));
+        // Docking is exactly making it visible again, in the same slot.
+        assert!(set_pane_visible(&mut tree, Pane::Tuning, true));
+        assert!(tree.tiles.is_visible(slot));
+    }
+
+    #[test]
+    fn sync_rehides_popped_panes_and_leaves_closed_ones_hidden() {
+        let mut file = LayoutsFile::default();
+        // Tuning was removed outright by an older layout, yet is still floating.
+        remove_pane(&mut file.draft, Pane::Tuning);
+        file.popped.push(Pane::Tuning);
+        // Meters was closed from the menu (hidden, not floating); it must stay
+        // hidden so reopening it later can restore its slot.
+        set_pane_visible(&mut file.draft, Pane::Meters, false);
+        file.sync_popped_visibility();
+        let tuning = pane_tile(&file.draft, Pane::Tuning).expect("re-added");
+        assert!(!file.draft.tiles.is_visible(tuning));
+        let meters = pane_tile(&file.draft, Pane::Meters).expect("present");
+        assert!(!file.draft.tiles.is_visible(meters));
+    }
+
+    #[test]
+    fn closing_a_pane_keeps_its_slot_for_reopening() {
+        let mut tree = default_tree();
+        // Tuning shares a tab set with Radio and Clarifier in the default tree.
+        let slot = pane_tile(&tree, Pane::Tuning).expect("Tuning present");
+        assert!(pane_open(&tree, Pane::Tuning));
+        set_pane_open(&mut tree, Pane::Tuning, false);
+        assert!(!pane_open(&tree, Pane::Tuning));
+        assert_eq!(pane_tile(&tree, Pane::Tuning), Some(slot));
+        // A closed pane is not pruned by normalization.
+        tree.simplify(&egui_tiles::SimplificationOptions {
+            all_panes_must_have_tabs: true,
+            ..Default::default()
+        });
+        set_pane_open(&mut tree, Pane::Tuning, true);
+        assert!(pane_open(&tree, Pane::Tuning));
+        assert_eq!(pane_tile(&tree, Pane::Tuning), Some(slot));
+    }
+
+    #[test]
+    fn opening_a_pane_without_a_slot_adds_it() {
+        let mut tree = default_tree();
+        remove_pane(&mut tree, Pane::Vox);
+        assert!(!pane_open(&tree, Pane::Vox));
+        set_pane_open(&mut tree, Pane::Vox, true);
+        assert!(pane_open(&tree, Pane::Vox));
+    }
+
+    #[test]
+    fn file_stem_keeps_ids_inside_the_directory() {
+        assert_eq!(file_stem("layout-1"), "layout-1");
+        assert_eq!(file_stem("../escape"), "___escape");
+        assert_eq!(file_stem("a/b c"), "a_b_c");
     }
 
     #[test]

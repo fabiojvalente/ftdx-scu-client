@@ -26,6 +26,7 @@ pub struct CatServerState {
     state: Arc<Mutex<RadioState>>,
     port: u16,
     error: Option<String>,
+    split_control: bool,
 }
 
 impl CatServerState {
@@ -35,6 +36,7 @@ impl CatServerState {
             state: Arc::new(Mutex::new(RadioState::default())),
             port: DEFAULT_PORT,
             error: None,
+            split_control: false,
         }
     }
 
@@ -50,10 +52,20 @@ impl CatServerState {
         self.state = Arc::new(Mutex::new(RadioState::default()));
         match Rigctld::start(handle, Arc::clone(&self.state), port) {
             Ok(server) => {
+                server.set_split_control(self.split_control);
                 self.port = server.port();
                 self.server = Some(server);
             }
             Err(error) => self.error = Some(format!("rigctld server failed: {error}")),
+        }
+    }
+
+    /// Whether rigctld clients may change the radio's VFO selection and split
+    /// state. Applied immediately, and re-applied whenever the server restarts.
+    pub fn set_split_control(&mut self, allow: bool) {
+        self.split_control = allow;
+        if let Some(server) = &self.server {
+            server.set_split_control(allow);
         }
     }
 

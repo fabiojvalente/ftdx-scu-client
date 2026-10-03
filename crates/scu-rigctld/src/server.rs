@@ -113,6 +113,9 @@ struct Context {
     external_ptt: Arc<AtomicBool>,
     watchdog: Arc<Watchdog>,
     clients: Arc<AtomicUsize>,
+    /// Whether clients may change the radio's VFO selection and split state.
+    /// When `false`, `V` is ignored and `S`/`I`/`X` only update a soft state.
+    split_control: Arc<AtomicBool>,
 }
 
 /// A running rigctld server on its own thread/runtime.
@@ -122,6 +125,7 @@ pub struct Rigctld {
     notify: Arc<Notify>,
     clients: Arc<AtomicUsize>,
     external_ptt: Arc<AtomicBool>,
+    split_control: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -146,12 +150,14 @@ impl Rigctld {
         let notify = Arc::new(Notify::new());
         let clients = Arc::new(AtomicUsize::new(0));
         let external_ptt = Arc::new(AtomicBool::new(false));
+        let split_control = Arc::new(AtomicBool::new(false));
 
         let thread = {
             let running = Arc::clone(&running);
             let notify = Arc::clone(&notify);
             let clients = Arc::clone(&clients);
             let external_ptt = Arc::clone(&external_ptt);
+            let split_control = Arc::clone(&split_control);
             std::thread::Builder::new()
                 .name("scu-rigctld".into())
                 .spawn(move || {
@@ -171,6 +177,7 @@ impl Rigctld {
                         link,
                         state,
                         external_ptt,
+                        split_control,
                         clients,
                         notify,
                         running,
@@ -185,6 +192,7 @@ impl Rigctld {
             notify,
             clients,
             external_ptt,
+            split_control,
             thread: Some(thread),
         })
     }
@@ -196,6 +204,18 @@ impl Rigctld {
     /// Flag set while an external client owns PTT, so the app can gate TX audio.
     pub fn external_ptt(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.external_ptt)
+    }
+
+    /// Allow (`true`) or forbid (`false`, the default) clients to change the
+    /// radio's receive-VFO selection and split state.
+    ///
+    /// Forbidden, `V` is ignored and `S`/`I`/`X` only update a soft state that
+    /// is reported back to the client; nothing is sent to the radio. That is
+    /// enough for WSJT-X with *Split Operation: None* or *Fake It*, and it means
+    /// a client cannot flip the radio into split by accident. Enable it for
+    /// *Split Operation: Rig*.
+    pub fn set_split_control(&self, allow: bool) {
+        self.split_control.store(allow, Ordering::Relaxed);
     }
 
     pub fn status(&self) -> RigctldStatus {
@@ -221,11 +241,14 @@ impl Drop for Rigctld {
     }
 }
 
+// Each argument is a distinct piece of shared server state handed to the thread.
+#[allow(clippy::too_many_arguments)]
 async fn run_server(
     listener: std::net::TcpListener,
     link: Arc<dyn RadioLink>,
     state: SharedState,
     external_ptt: Arc<AtomicBool>,
+    split_control: Arc<AtomicBool>,
     clients: Arc<AtomicUsize>,
     notify: Arc<Notify>,
     running: Arc<AtomicBool>,
@@ -246,6 +269,7 @@ async fn run_server(
         external_ptt,
         watchdog: Arc::clone(&watchdog),
         clients: Arc::clone(&clients),
+        split_control,
     });
     tracing::info!(
         port = listener.local_addr().map(|addr| addr.port()).unwrap_or(0),
@@ -358,15 +382,17 @@ fn process_command(command: &str, ctx: &Context, client_id: &str) -> (String, bo
             "m" => get_mode(ctx),
             "M" => arg(1).map_or_else(rprt_fail, |mode| set_mode(ctx, mode)),
             "v" => get_vfo(ctx),
-            "V" => set_vfo(ctx, arg(1).unwrap_or_default()),
+            "V" => set_vfo(ctx, arg(1).unwrap_or_default(), client_id),
             "t" => get_ptt(ctx),
             "T" => arg(1).map_or_else(rprt_fail, |value| set_ptt(ctx, value, client_id)),
             "s" => get_split_vfo(ctx),
-            "S" => arg(1).map_or_else(rprt_fail, |value| set_split(ctx, value)),
+            "S" => arg(1).map_or_else(rprt_fail, |value| set_split(ctx, value, arg(2), client_id)),
             "i" => get_split_frequency(ctx),
-            "I" => arg(1).map_or_else(rprt_fail, |value| set_split_frequency(ctx, value)),
+            "I" => arg(1).map_or_else(rprt_fail, |value| {
+                set_split_frequency(ctx, value, client_id)
+            }),
             "x" => get_split_mode(ctx),
-            "X" => arg(1).map_or_else(rprt_fail, |mode| set_split_mode(ctx, mode)),
+            "X" => arg(1).map_or_else(rprt_fail, |mode| set_split_mode(ctx, mode, client_id)),
             "j" => get_rit(ctx),
             "J" => arg(1).map_or_else(rprt_fail, |value| set_rit(ctx, value)),
             "z" => get_xit(ctx),
@@ -398,15 +424,21 @@ fn process_command(command: &str, ctx: &Context, client_id: &str) -> (String, bo
         "get_mode" => get_mode(ctx),
         "set_mode" => arg(1).map_or_else(rprt_fail, |mode| set_mode(ctx, mode)),
         "get_vfo" => get_vfo(ctx),
-        "set_vfo" => set_vfo(ctx, arg(1).unwrap_or_default()),
+        "set_vfo" => set_vfo(ctx, arg(1).unwrap_or_default(), client_id),
         "get_ptt" => get_ptt(ctx),
         "set_ptt" => arg(1).map_or_else(rprt_fail, |value| set_ptt(ctx, value, client_id)),
         "get_split_vfo" => get_split_vfo(ctx),
-        "set_split_vfo" => arg(1).map_or_else(rprt_fail, |value| set_split(ctx, value)),
+        "set_split_vfo" => {
+            arg(1).map_or_else(rprt_fail, |value| set_split(ctx, value, arg(2), client_id))
+        }
         "get_split_freq" => get_split_frequency(ctx),
-        "set_split_freq" => arg(1).map_or_else(rprt_fail, |value| set_split_frequency(ctx, value)),
+        "set_split_freq" => arg(1).map_or_else(rprt_fail, |value| {
+            set_split_frequency(ctx, value, client_id)
+        }),
         "get_split_mode" => get_split_mode(ctx),
-        "set_split_mode" => arg(1).map_or_else(rprt_fail, |mode| set_split_mode(ctx, mode)),
+        "set_split_mode" => {
+            arg(1).map_or_else(rprt_fail, |mode| set_split_mode(ctx, mode, client_id))
+        }
         "get_rit" => get_rit(ctx),
         "set_rit" => arg(1).map_or_else(rprt_fail, |value| set_rit(ctx, value)),
         "get_xit" => get_xit(ctx),
@@ -459,11 +491,16 @@ fn set_frequency(ctx: &Context, value: &str) -> String {
     if hz == 0 || hz > 999_999_990 {
         return rprt_fail();
     }
-    let sub = ctx.state.lock().unwrap().sub_vfo;
-    let command = frequency_command(sub, hz);
-    tracing::info!(hz, %command, "rigctld set_freq");
+    // Read the target VFO and update the cache under one lock so a concurrent
+    // VFO change cannot split the "which VFO" decision from the cache write.
+    let (sub, command) = {
+        let mut state = ctx.state.lock().unwrap();
+        let sub = state.sub_vfo;
+        state.set_frequency(hz);
+        (sub, frequency_command(sub, hz))
+    };
+    tracing::info!(hz, sub, %command, "rigctld set_freq");
     ctx.link.send(&command);
-    ctx.state.lock().unwrap().set_frequency(hz);
     "RPRT 0".to_string()
 }
 
@@ -505,24 +542,27 @@ fn set_mode(ctx: &Context, value: &str) -> String {
     // `M <mode> -1`, so the shift lands after the frequency and leaves the rig
     // off-channel; Wavelog then never confirms the spot and the DX Waterfall
     // click is lost.
-    let (sub, hz) = {
+    let (sub, hz, seq) = {
         let mut state = ctx.state.lock().unwrap();
         state.set_mode(mode);
-        (state.sub_vfo, state.frequency())
+        (state.sub_vfo, state.frequency(), state.freq_seq())
     };
     if hz > 0 {
         ctx.link.send(&frequency_command(sub, hz));
     }
 
+    // The deferred re-send uses the frequency captured now, and is dropped if
+    // the client has since changed the frequency or the VFO: re-reading the
+    // cache later could resurrect a stale value and detune RX from TX.
     let link = Arc::clone(&ctx.link);
     let state = Arc::clone(&ctx.state);
     std::thread::spawn(move || {
         std::thread::sleep(MODE_SETTLE_DELAY);
-        let (sub, hz) = {
+        let superseded = {
             let state = state.lock().unwrap();
-            (state.sub_vfo, state.frequency())
+            state.freq_seq() != seq || state.sub_vfo != sub
         };
-        if hz > 0 {
+        if hz > 0 && !superseded {
             link.send(&frequency_command(sub, hz));
         }
     });
@@ -537,10 +577,22 @@ fn get_vfo(ctx: &Context) -> String {
     }
 }
 
-fn set_vfo(ctx: &Context, vfo: &str) -> String {
+fn split_control_enabled(ctx: &Context) -> bool {
+    ctx.split_control.load(Ordering::Relaxed)
+}
+
+/// `set_vfo`. Selecting the operating VFO moves the radio's RX *and* TX, so it
+/// is only forwarded when split control is enabled; otherwise it is ignored
+/// (the client keeps working on whichever VFO the radio is already using).
+fn set_vfo(ctx: &Context, vfo: &str, client_id: &str) -> String {
     let sub = vfo.to_ascii_uppercase().contains('B') || vfo.eq_ignore_ascii_case("Sub");
+    if !split_control_enabled(ctx) {
+        tracing::info!(%client_id, vfo, "rigctld set_vfo ignored (split control disabled)");
+        return "RPRT 0".to_string();
+    }
+    tracing::info!(%client_id, vfo, sub, "rigctld set_vfo -> VS");
     ctx.link.send(scu_cat::select_vfo(sub));
-    ctx.state.lock().unwrap().sub_vfo = sub;
+    ctx.state.lock().unwrap().set_sub_vfo(sub);
     "RPRT 0".to_string()
 }
 
@@ -566,20 +618,79 @@ fn set_ptt(ctx: &Context, value: &str, client_id: &str) -> String {
     "RPRT 0".to_string()
 }
 
-fn get_split_vfo(ctx: &Context) -> String {
-    let split = ctx.state.lock().unwrap().split;
-    format!("{}\nVFOA", split as u8)
+fn vfo_name(sub: bool) -> &'static str {
+    if sub {
+        "VFOB"
+    } else {
+        "VFOA"
+    }
 }
 
-fn set_split(ctx: &Context, value: &str) -> String {
-    let on = value.trim() != "0";
+/// `get_split_vfo`: split state plus the VFO that transmits. With split on the
+/// transmitter is the VFO *not* used for receive, so it is VFO-B while
+/// receiving on A and VFO-A while receiving on B.
+/// Always reports the radio's *real* split state, whether or not clients may
+/// change it. Reporting a soft "off" while the radio was actually split would
+/// hide the very condition that makes TX land on the other VFO.
+fn get_split_vfo(ctx: &Context) -> String {
+    let state = ctx.state.lock().unwrap();
+    format!("{}\n{}", state.split as u8, vfo_name(state.tx_sub()))
+}
+
+/// Strictly parse a Hamlib split flag (`0` or `1`).
+fn parse_split_flag(value: &str) -> Option<bool> {
+    match value.trim() {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    }
+}
+
+/// `set_split_vfo <split> [<tx_vfo>]`. The FTDX10's `ST` always transmits on
+/// the VFO opposite the receive VFO, so a requested TX VFO that equals the
+/// receive VFO cannot be honoured; it is logged and treated as "the other VFO".
+///
+/// With split control disabled, enabling split is blocked but *disabling* it is
+/// forwarded: clearing split can only move the radio toward simplex, and it
+/// self-heals a split the app never asked for.
+fn set_split(ctx: &Context, value: &str, tx_vfo: Option<&str>, client_id: &str) -> String {
+    let Some(on) = parse_split_flag(value) else {
+        tracing::warn!(%client_id, value, "rigctld set_split_vfo rejected: split must be 0 or 1");
+        return rprt_fail();
+    };
+    if !split_control_enabled(ctx) {
+        if on {
+            tracing::info!(%client_id, "rigctld set_split_vfo ON ignored (split control disabled)");
+            return "RPRT 0".to_string();
+        }
+        if ctx.state.lock().unwrap().split {
+            tracing::info!(%client_id, "rigctld set_split_vfo OFF -> ST0 (clearing split)");
+            ctx.link.send(scu_cat::set_split(false));
+            ctx.state.lock().unwrap().set_split_on(false);
+        }
+        return "RPRT 0".to_string();
+    }
+    let rx_sub = ctx.state.lock().unwrap().sub_vfo;
+    if let Some(tx) = tx_vfo {
+        let tx_sub = tx.to_ascii_uppercase().contains('B') || tx.eq_ignore_ascii_case("Sub");
+        if on && tx_sub == rx_sub {
+            tracing::warn!(
+                %client_id,
+                tx,
+                rx = vfo_name(rx_sub),
+                "rigctld set_split_vfo asked to transmit on the receive VFO; using the other VFO"
+            );
+        }
+    }
+    tracing::info!(%client_id, on, "rigctld set_split_vfo -> ST");
     ctx.link.send(scu_cat::set_split(on));
-    ctx.state.lock().unwrap().split = on;
+    ctx.state.lock().unwrap().set_split_on(on);
     "RPRT 0".to_string()
 }
 
+/// Frequency of the split transmit VFO (the one not selected for receive).
 fn get_split_frequency(ctx: &Context) -> String {
-    let hz = ctx.state.lock().unwrap().freq_b;
+    let hz = ctx.state.lock().unwrap().other_frequency();
     if hz == 0 {
         rprt_fail()
     } else {
@@ -587,7 +698,7 @@ fn get_split_frequency(ctx: &Context) -> String {
     }
 }
 
-fn set_split_frequency(ctx: &Context, value: &str) -> String {
+fn set_split_frequency(ctx: &Context, value: &str, client_id: &str) -> String {
     let Ok(hz) = value.parse::<f64>() else {
         return rprt_fail();
     };
@@ -595,25 +706,47 @@ fn set_split_frequency(ctx: &Context, value: &str) -> String {
     if hz == 0 || hz > 999_999_990 {
         return rprt_fail();
     }
-    ctx.link.send(&scu_cat::set_frequency_b(hz));
-    ctx.state.lock().unwrap().freq_b = hz;
+    if !split_control_enabled(ctx) {
+        // Only meaningful in split, and client-initiated split is blocked.
+        tracing::info!(%client_id, hz, "rigctld set_split_freq ignored (split control disabled)");
+        return "RPRT 0".to_string();
+    }
+    // Target the VFO opposite the receive VFO: VFO-B normally, VFO-A when
+    // receiving on B. Always writing VFO-B would retune the receive VFO.
+    let (tx_sub, command) = {
+        let mut state = ctx.state.lock().unwrap();
+        let tx_sub = !state.sub_vfo;
+        state.set_other_frequency(hz);
+        (tx_sub, frequency_command(tx_sub, hz))
+    };
+    tracing::info!(%client_id, hz, tx_sub, %command, "rigctld set_split_freq");
+    ctx.link.send(&command);
     "RPRT 0".to_string()
 }
 
 fn get_split_mode(ctx: &Context) -> String {
     let mode = {
         let state = ctx.state.lock().unwrap();
-        state.mode_b.or(state.mode_a).unwrap_or(scu_cat::Mode::Usb)
+        state
+            .other_mode()
+            .or(state.mode())
+            .unwrap_or(scu_cat::Mode::Usb)
     };
     format!("{}\n0", mode_to_hamlib(mode))
 }
 
-fn set_split_mode(ctx: &Context, value: &str) -> String {
+fn set_split_mode(ctx: &Context, value: &str, client_id: &str) -> String {
     let Some(mode) = mode_from_hamlib(value) else {
         return rprt_fail();
     };
+    if !split_control_enabled(ctx) {
+        tracing::info!(%client_id, ?mode, "rigctld set_split_mode ignored (split control disabled)");
+        return "RPRT 0".to_string();
+    }
+    // `MD1` addresses the inactive VFO, i.e. the split transmit VFO.
+    tracing::info!(%client_id, ?mode, "rigctld set_split_mode -> MD1");
     ctx.link.send(&scu_cat::set_mode_vfo(true, mode));
-    ctx.state.lock().unwrap().mode_b = Some(mode);
+    ctx.state.lock().unwrap().set_other_mode(mode);
     "RPRT 0".to_string()
 }
 
@@ -870,8 +1003,16 @@ mod tests {
             external_ptt: Arc::new(AtomicBool::new(false)),
             watchdog: Arc::new(Watchdog::new()),
             clients: Arc::new(AtomicUsize::new(0)),
+            split_control: Arc::new(AtomicBool::new(false)),
         };
         Harness { ctx, link }
+    }
+
+    /// A harness where clients may change the radio's VFO and split state.
+    fn harness_with_split_control() -> Harness {
+        let h = harness();
+        h.ctx.split_control.store(true, Ordering::Relaxed);
+        h
     }
 
     fn run(h: &Harness, command: &str) -> (String, bool) {
@@ -927,15 +1068,145 @@ mod tests {
 
     #[test]
     fn split_and_clarifier() {
-        let h = harness();
-        assert_eq!(run(&h, "S 1 VFOA").0, "RPRT 0");
-        assert_eq!(run(&h, "s").0, "1\nVFOA");
+        let h = harness_with_split_control();
+        assert_eq!(run(&h, "S 1 VFOB").0, "RPRT 0");
+        assert_eq!(run(&h, "s").0, "1\nVFOB");
         assert_eq!(run(&h, "I 7074000").0, "RPRT 0");
         assert_eq!(run(&h, "i").0, "7074000");
         assert_eq!(run(&h, "J 100").0, "RPRT 0");
         assert_eq!(run(&h, "j").0, "100");
         assert_eq!(run(&h, "Z -50").0, "RPRT 0");
         assert_eq!(run(&h, "z").0, "-50");
+    }
+
+    #[test]
+    fn split_targets_the_vfo_opposite_receive() {
+        let h = harness_with_split_control();
+        // Receiving on A: split TX is VFO-B.
+        assert_eq!(run(&h, "S 1 VFOB").0, "RPRT 0");
+        assert_eq!(run(&h, "s").0, "1\nVFOB");
+        assert_eq!(run(&h, "I 14075000").0, "RPRT 0");
+        assert_eq!(h.link.sent.lock().unwrap().last().unwrap(), "FB014075000;");
+
+        // Receiving on B: split TX is VFO-A, and VFO-B (receive) is untouched.
+        h.link.sent.lock().unwrap().clear();
+        assert_eq!(run(&h, "F 7074000").0, "RPRT 0");
+        assert_eq!(run(&h, "V VFOB").0, "RPRT 0");
+        assert_eq!(run(&h, "F 7074000").0, "RPRT 0");
+        h.link.sent.lock().unwrap().clear();
+        assert_eq!(run(&h, "s").0, "1\nVFOA");
+        assert_eq!(run(&h, "I 7076000").0, "RPRT 0");
+        assert_eq!(h.link.sent.lock().unwrap().as_slice(), ["FA007076000;"]);
+        assert_eq!(run(&h, "i").0, "7076000");
+        assert_eq!(run(&h, "f").0, "7074000");
+    }
+
+    #[test]
+    fn split_is_blocked_but_reads_stay_truthful() {
+        let h = harness();
+        assert_eq!(run(&h, "F 14074000").0, "RPRT 0");
+        h.link.sent.lock().unwrap().clear();
+
+        // A client asking for split / another VFO is answered but never reaches
+        // the radio...
+        assert_eq!(run(&h, "S 1 VFOB").0, "RPRT 0");
+        assert_eq!(run(&h, "I 14075000").0, "RPRT 0");
+        assert_eq!(run(&h, "X PKTUSB 0").0, "RPRT 0");
+        assert_eq!(run(&h, "V VFOB").0, "RPRT 0");
+        assert!(h.link.sent.lock().unwrap().is_empty());
+        {
+            let state = h.ctx.state.lock().unwrap();
+            assert!(!state.sub_vfo && !state.split);
+            assert_eq!(state.freq_b, 0);
+        }
+
+        // ...and the getters report the radio's real (simplex) state, not a
+        // spoofed one.
+        assert_eq!(run(&h, "v").0, "VFOA");
+        assert_eq!(run(&h, "s").0, "0\nVFOA");
+
+        // Plain tuning still reaches the radio.
+        assert_eq!(run(&h, "F 14076000").0, "RPRT 0");
+        assert_eq!(h.link.sent.lock().unwrap().as_slice(), ["FA014076000;"]);
+    }
+
+    #[test]
+    fn a_stuck_split_is_visible_and_a_client_may_clear_it() {
+        let h = harness();
+        // The radio is split even though nothing in this server asked for it.
+        h.ctx.state.lock().unwrap().apply("ST1;");
+        h.ctx.state.lock().unwrap().apply("FA007074000;");
+        h.ctx.state.lock().unwrap().apply("FB014074000;");
+
+        // The client must be able to see it...
+        assert_eq!(run(&h, "s").0, "1\nVFOB");
+        // ...and clearing it is forwarded so a stale split can be undone.
+        h.link.sent.lock().unwrap().clear();
+        assert_eq!(run(&h, "S 0 VFOA").0, "RPRT 0");
+        assert_eq!(h.link.sent.lock().unwrap().as_slice(), ["ST0;"]);
+        assert!(!h.ctx.state.lock().unwrap().split);
+        assert_eq!(run(&h, "s").0, "0\nVFOA");
+    }
+
+    #[test]
+    fn split_flag_is_parsed_strictly() {
+        let h = harness_with_split_control();
+        for bad in [
+            "S 2 VFOB",
+            "S VFOA 1 VFOB",
+            "S on",
+            "set_split_vfo yes VFOB",
+        ] {
+            assert_eq!(run(&h, bad).0, "RPRT -1", "{bad}");
+        }
+        assert!(h.link.sent.lock().unwrap().is_empty());
+        assert!(!h.ctx.state.lock().unwrap().split);
+        assert_eq!(run(&h, "S 1 VFOB").0, "RPRT 0");
+        assert_eq!(h.link.sent.lock().unwrap().as_slice(), ["ST1;"]);
+    }
+
+    #[test]
+    fn split_mode_targets_the_other_vfo() {
+        let h = harness_with_split_control();
+        run(&h, "S 1 VFOB");
+        run(&h, "X PKTUSB 0");
+        assert_eq!(h.link.sent.lock().unwrap().last().unwrap(), "MD1C;");
+        assert_eq!(
+            h.ctx.state.lock().unwrap().mode_b,
+            Some(scu_cat::Mode::DataU)
+        );
+        assert_eq!(h.ctx.state.lock().unwrap().mode_a, None);
+        run(&h, "V VFOB");
+        run(&h, "X USB 0");
+        assert_eq!(h.ctx.state.lock().unwrap().mode_a, Some(scu_cat::Mode::Usb));
+    }
+
+    #[test]
+    fn stale_radio_replies_do_not_overwrite_a_fresh_set() {
+        let h = harness_with_split_control();
+        run(&h, "F 14074000");
+        // A poll reply that left the radio before our `FA` was applied.
+        h.ctx.state.lock().unwrap().apply("FA007074000;");
+        assert_eq!(run(&h, "f").0, "14074000");
+        // Same for a client-selected VFO and split state.
+        run(&h, "V VFOB");
+        run(&h, "S 1 VFOA");
+        h.ctx.state.lock().unwrap().apply("VS0;");
+        h.ctx.state.lock().unwrap().apply("ST0;");
+        assert_eq!(run(&h, "v").0, "VFOB");
+        assert_eq!(run(&h, "s").0, "1\nVFOA");
+    }
+
+    #[test]
+    fn deferred_mode_resend_is_dropped_when_superseded() {
+        let h = harness();
+        run(&h, "F 14062000");
+        run(&h, "M CW -1");
+        // A newer set_freq lands inside the settle window.
+        run(&h, "F 14074000");
+        std::thread::sleep(MODE_SETTLE_DELAY + Duration::from_millis(100));
+        let sent = h.link.sent.lock().unwrap().clone();
+        assert!(!sent[3..].iter().any(|c| c == "FA014062000;"), "{sent:?}");
     }
 
     #[test]
