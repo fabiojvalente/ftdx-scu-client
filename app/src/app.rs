@@ -13,9 +13,11 @@ use scu_audio::input::{MicConfig, MicInput, TxAudioSink};
 use scu_audio::output::{AudioOutput, AudioSink};
 #[cfg(not(target_arch = "wasm32"))]
 use scu_audio::vox::{Vox, VoxConfig};
-use scu_cat::{self, Agc, MeterKind, Mode, Preamp, RadioModel, RoofingFilter, ScopeMode};
+use scu_cat::{
+    self, Agc, MeterKind, Mode, Preamp, RadioModel, RoofingFilter, ScopeCenter, ScopeMode,
+};
 use scu_client::{ConnectConfig, Event, ScuClient, ScuHandle};
-use scu_scope::{BinInterleave, Colormap, FrequencyAxis};
+use scu_scope::Colormap;
 use serde::{Deserialize, Serialize};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -125,9 +127,6 @@ pub struct AppSettings {
     /// Show the waterfall in the panadapter.
     #[serde(default = "default_true")]
     pub show_waterfall: bool,
-    /// Scope bin extraction rule.
-    #[serde(default = "default_scope_bins")]
-    pub scope_bins: BinInterleave,
     /// Waterfall colour palette.
     #[serde(default = "default_colormap")]
     pub waterfall_colormap: Colormap,
@@ -198,7 +197,6 @@ impl Default for AppSettings {
             follow_vfo: true,
             show_spectrum: true,
             show_waterfall: true,
-            scope_bins: default_scope_bins(),
             waterfall_colormap: default_colormap(),
             waterfall_black_level: default_black_level(),
             waterfall_gain: default_waterfall_gain(),
@@ -241,10 +239,6 @@ fn default_mic_capture_gain() -> f32 {
 
 fn default_freq_step() -> u64 {
     1_000
-}
-
-fn default_scope_bins() -> BinInterleave {
-    BinInterleave::Split
 }
 
 fn default_colormap() -> Colormap {
@@ -300,6 +294,19 @@ const PASSBAND_GREEN_MIN_PX: f32 = 40.0;
 
 /// Height of the frequency ribbon drawn above the waterfall, in pixels.
 const SCALE_BAR_H: f32 = 34.0;
+
+/// The raw scope sweep covers about 7.5% more RF bandwidth than the span
+/// reported by `SS05`. Measured with the radio in waterfall/CENTER mode and
+/// `SCOPE CTR = CARRIER`: a known 7.074 MHz signal at a 7.030 MHz VFO and
+/// reported 100 kHz span appears at a raw +40.9 kHz position.
+///
+/// Keep this a uniform scale until measurements at several positions and spans
+/// establish a reproducible non-linear response.
+const SCOPE_AXIS_SCALE: f64 = 1.075;
+
+fn scope_axis_span_hz(reported_span_hz: f64) -> f64 {
+    reported_span_hz * SCOPE_AXIS_SCALE
+}
 
 /// Default fraction of the panadapter body given to the spectrum trace when
 /// both the spectrum and the waterfall are visible.
@@ -410,6 +417,8 @@ pub struct ScuApp {
     narrow: bool,
     /// Roofing filter (`RF`) last reported by the radio.
     roofing_filter: Option<RoofingFilter>,
+    /// Scope screen centre reference (`SCOPE CTR`, `EX040202`).
+    scope_center: Option<ScopeCenter>,
     /// Noise blanker level (`NL`, 1-20) per VFO (0 = A/Main, 1 = B/Sub).
     noise_blanker_level: [u8; 2],
     /// Noise reduction (DNR) level (`RL`, 1-15) per VFO.
@@ -629,6 +638,7 @@ impl ScuApp {
             auto_notch: false,
             narrow: false,
             roofing_filter: None,
+            scope_center: None,
             noise_blanker_level: [10, 10],
             noise_reduction_level: [1, 1],
             preamp: [None, None],
@@ -1244,10 +1254,46 @@ impl ScuApp {
                 // `VS;` first, then `MD0;`/`MD1;`: on the FTDX10 the `MD` P1
                 // digit is relative to the operating VFO, so the active VFO
                 // needs to be known to route the two answers.
-                "ID;", "FA;", "FB;", "VS;", "MD0;", "MD1;", "FT;", "ST;", "SH0;", "SH1;", "IS0;",
-                "IS1;", "SM0;", "PS;", "PC;", "MG;", "AC;", "RT;", "XT;", "NB0;", "NR0;", "BC0;",
-                "NA0;", "RF0;", "NL0;", "NL1;", "RL0;", "RL1;", "GT0;", "PA0;", "PA1;", "RA0;",
-                "RA1;", "RG0;", "SQ0;", "TX;", "AI1;", "SS05;", "SS06;",
+                "ID;",
+                "FA;",
+                "FB;",
+                "VS;",
+                "MD0;",
+                "MD1;",
+                "FT;",
+                "ST;",
+                "SH0;",
+                "SH1;",
+                "IS0;",
+                "IS1;",
+                "SM0;",
+                "PS;",
+                "PC;",
+                "MG;",
+                "AC;",
+                "RT;",
+                "XT;",
+                "NB0;",
+                "NR0;",
+                "BC0;",
+                "NA0;",
+                "RF0;",
+                "NL0;",
+                "NL1;",
+                "RL0;",
+                "RL1;",
+                "GT0;",
+                "PA0;",
+                "PA1;",
+                "RA0;",
+                "RA1;",
+                "RG0;",
+                "SQ0;",
+                "TX;",
+                "AI1;",
+                "SS05;",
+                "SS06;",
+                "EX040202;",
             ] {
                 handle.send_cat(cmd);
             }
@@ -1328,7 +1374,7 @@ impl ScuApp {
             Event::Cat(text) => self.on_cat(&text),
             Event::Audio(_) => {}
             Event::Scope(body) => {
-                let line = scu_scope::decode_with(&body, self.settings.scope_bins);
+                let line = scu_scope::decode(&body);
                 self.waterfall.push(&line.bins);
                 self.update_spectrum_range(&line.bins);
                 self.latest_bins = line.bins;
@@ -1590,6 +1636,14 @@ impl ScuApp {
                 }
             }
             "SS" => self.on_scope_settings(text),
+            "EX" => {
+                if let Some(center) = scu_cat::parse_scope_center(text) {
+                    if self.scope_center != Some(center) {
+                        tracing::info!(center = center.label(), "scope centre reference");
+                    }
+                    self.scope_center = Some(center);
+                }
+            }
             _ => {}
         }
     }
@@ -1738,6 +1792,13 @@ impl ScuApp {
         self.if_width[self.rx_sub as usize]
     }
 
+    /// Resolved IF bandwidth of the active VFO in Hz, honouring the mode
+    /// default when the radio reports the `SH` code as `0`.
+    fn active_if_width_hz(&self) -> Option<u16> {
+        let model = self.radio.unwrap_or(RadioModel::Ftdx10);
+        scu_cat::if_width_hz(model, self.active_mode()?, self.active_if_width())
+    }
+
     /// IF shift (Hz) of the active receive VFO.
     fn active_if_shift_hz(&self) -> i32 {
         self.if_shift_hz[self.rx_sub as usize]
@@ -1753,6 +1814,18 @@ impl ScuApp {
             self.active_if_width(),
             self.active_if_shift_hz(),
         )
+    }
+
+    /// How far the scope screen's centre sits from the VFO carrier, in Hz.
+    /// Carrier-centred scope data is RF-referenced, so its centre is the VFO
+    /// itself. Filter-centred data is offset by the active filter's centre.
+    fn scope_center_offset_hz(&self) -> f64 {
+        if self.scope_center == Some(ScopeCenter::Filter) {
+            if let Some((low, high)) = self.active_passband_hz() {
+                return (low + high) as f64 / 2.0;
+            }
+        }
+        0.0
     }
 
     /// Frequency of the VFO currently selected for receive.
@@ -2072,10 +2145,48 @@ impl ScuApp {
             let cf = if self.rx_sub { "CF101;" } else { "CF001;" };
             if let Some(handle) = &self.handle {
                 for cmd in [
-                    "FA;", "FB;", "VS;", "MD0;", "MD1;", "FT;", "ST;", "SH0;", "SH1;", "IS0;",
-                    "IS1;", cf, "SM0;", "PC;", "MG;", "AC;", "RT;", "XT;", "NB0;", "NR0;", "BC0;",
-                    "NA0;", "NL0;", "NL1;", "RL0;", "RL1;", "GT0;", "PA0;", "PA1;", "RA0;", "RA1;",
-                    "RG0;", "SQ0;", "TX;", "SS05;", "RM3;", "RM4;", "RM5;", "RM6;", "RM7;", "RM8;",
+                    "FA;",
+                    "FB;",
+                    "VS;",
+                    "MD0;",
+                    "MD1;",
+                    "FT;",
+                    "ST;",
+                    "SH0;",
+                    "SH1;",
+                    "IS0;",
+                    "IS1;",
+                    cf,
+                    "SM0;",
+                    "PC;",
+                    "MG;",
+                    "AC;",
+                    "RT;",
+                    "XT;",
+                    "NB0;",
+                    "NR0;",
+                    "BC0;",
+                    "NA0;",
+                    "NL0;",
+                    "NL1;",
+                    "RL0;",
+                    "RL1;",
+                    "GT0;",
+                    "PA0;",
+                    "PA1;",
+                    "RA0;",
+                    "RA1;",
+                    "RG0;",
+                    "SQ0;",
+                    "TX;",
+                    "SS05;",
+                    "EX040202;",
+                    "RM3;",
+                    "RM4;",
+                    "RM5;",
+                    "RM6;",
+                    "RM7;",
+                    "RM8;",
                     "RM9;",
                 ] {
                     handle.send_cat(cmd);
@@ -2160,8 +2271,15 @@ impl ScuApp {
             .request(self.antenna_config(), AntennaAction::Poll, ctx.clone());
     }
 
-    fn axis(&self) -> FrequencyAxis {
-        FrequencyAxis::new(self.active_frequency() as f64, self.span_hz)
+    /// Linear t (0..1 in the pane) for a true offset from the scope centre.
+    fn scope_pane_t(&self, true_offset_hz: f64) -> f32 {
+        (0.5 + true_offset_hz / scope_axis_span_hz(self.span_hz)) as f32
+    }
+
+    /// RF frequency (Hz) at pane position `t` (0..1).
+    fn scope_hz_at(&self, t: f64) -> f64 {
+        let center = self.active_frequency() as f64 + self.scope_center_offset_hz();
+        center + (t - 0.5) * scope_axis_span_hz(self.span_hz)
     }
 
     /// Update the auto-scale bounds from a fresh sweep. The floor drops fast and
@@ -2265,10 +2383,12 @@ impl ScuApp {
             return;
         }
 
-        let axis = self.axis();
-        let span = self.span_hz;
-        let left_hz = axis.hz_at(0.0);
-        let right_hz = axis.hz_at(1.0);
+        let center = self.active_frequency() as f64 + self.scope_center_offset_hz();
+        let left_hz = self.scope_hz_at(0.0);
+        let right_hz = self.scope_hz_at(1.0);
+        let span = (right_hz - left_hz).max(1.0);
+        let x_for =
+            |hz: f64| scale_rect.left() + scale_rect.width() * self.scope_pane_t(hz - center);
 
         let target = (scale_rect.width() / 100.0).max(2.0) as f64;
         let step = nice_step(span / target);
@@ -2276,10 +2396,33 @@ impl ScuApp {
         let font = egui::FontId::monospace(10.0);
         let tick = egui::Stroke::new(1.0, theme::text_faint());
 
+        // Minor ticks, close enough to read a value off a screenshot but never
+        // tighter than `MIN_MINOR_PX`. On a 100 kHz span this lands on 1 kHz.
+        const MIN_MINOR_PX: f32 = 10.0;
+        let max_minor = (scale_rect.width() / MIN_MINOR_PX).max(2.0) as f64;
+        let minor = nice_step_floor(span / max_minor);
+        if minor < step {
+            let minor_tick = egui::Stroke::new(1.0, theme::outline());
+            let mut hz = (left_hz / minor).ceil() * minor;
+            let mut guard = 0;
+            while hz <= right_hz + minor * 1e-3 && guard < 4096 {
+                let x = x_for(hz);
+                painter.line_segment(
+                    [
+                        egui::pos2(x, scale_rect.top() + 16.5),
+                        egui::pos2(x, scale_rect.top() + 19.0),
+                    ],
+                    minor_tick,
+                );
+                hz += minor;
+                guard += 1;
+            }
+        }
+
         let mut hz = first;
         let mut guard = 0;
         while hz <= right_hz + step * 1e-3 && guard < 128 {
-            let x = scale_rect.left() + scale_rect.width() * ((hz - left_hz) / span) as f32;
+            let x = x_for(hz);
             painter.line_segment(
                 [
                     egui::pos2(x, scale_rect.top() + 14.0),
@@ -2307,10 +2450,14 @@ impl ScuApp {
         if self.active_frequency() == 0 || self.span_hz <= 0.0 {
             return;
         }
+        // The carrier sits at the pane centre for a carrier-centred scope; for a
+        // filter-centred one it is offset by the scope centre reference.
+        let offset = self.scope_center_offset_hz();
+        let x = full_rect.left() + full_rect.width() * self.scope_pane_t(-offset);
         painter.line_segment(
             [
-                egui::pos2(full_rect.center().x, full_rect.top()),
-                egui::pos2(full_rect.center().x, full_rect.bottom()),
+                egui::pos2(x, full_rect.top()),
+                egui::pos2(x, full_rect.bottom()),
             ],
             egui::Stroke::new(1.0, theme::warn_amber()),
         );
@@ -2327,7 +2474,10 @@ impl ScuApp {
         if self.active_frequency() == 0 || self.span_hz <= 0.0 {
             return;
         }
-        let x_for = |hz: i32| rect.left() + rect.width() * (0.5 + hz as f64 / self.span_hz) as f32;
+        // `low_hz`/`high_hz` are relative to the carrier; the pane centre is the
+        // scope centre, which is offset from the carrier in FILTER mode.
+        let offset = self.scope_center_offset_hz();
+        let x_for = |hz: i32| rect.left() + rect.width() * self.scope_pane_t(hz as f64 - offset);
         let raw_left = x_for(low_hz);
         let raw_right = x_for(high_hz);
         if raw_right < rect.left() || raw_left > rect.right() {
@@ -2353,6 +2503,44 @@ impl ScuApp {
             [egui::pos2(right, y - cap), egui::pos2(right, y + cap)],
             stroke,
         );
+    }
+
+    /// Current IF width and roofing filter, overlaid in the waterfall corner so
+    /// the operator can see what the passband bracket represents.
+    fn paint_scope_info(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let width = match self.active_if_width_hz() {
+            Some(hz) if hz >= 1000 => format!("{:.1} kHz", hz as f64 / 1000.0),
+            Some(hz) => format!("{hz} Hz"),
+            None => "--".to_string(),
+        };
+        let rfil = self
+            .roofing_filter
+            .map(|filter| filter.label())
+            .unwrap_or("--");
+        if width == "--" && rfil == "--" {
+            return;
+        }
+        let span = if self.span_hz >= 1_000_000.0 {
+            format!("{:.1} MHz", self.span_hz / 1_000_000.0)
+        } else {
+            format!("{:.0} kHz", self.span_hz / 1_000.0)
+        };
+        let ctr = self
+            .scope_center
+            .map(|center| center.label())
+            .unwrap_or("--");
+        let text = format!("IF {width}   RFIL {rfil}   SPAN {span}   CTR {ctr}");
+
+        let font = egui::FontId::monospace(11.0);
+        let galley = painter.layout_no_wrap(text, font, theme::text());
+        let pad = egui::vec2(5.0, 3.0);
+        let chip = galley.size() + pad * 2.0;
+        let pos = egui::pos2(rect.left() + 6.0, rect.bottom() - 6.0 - chip.y);
+        let bg_rect = egui::Rect::from_min_size(pos, chip);
+        let bg = theme::card_bg();
+        let bg = egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), 210);
+        painter.rect_filled(bg_rect, 3.0, bg);
+        painter.galley(pos + pad, galley, theme::text());
     }
 
     fn ui_top(&mut self, root: &mut egui::Ui) {
@@ -2657,6 +2845,7 @@ impl ScuApp {
             egui::Rect::from_min_max(egui::pos2(full.left(), full.top() + scale_h), full.max);
 
         self.waterfall.paint(&painter, plot_rect);
+        self.paint_scope_info(&painter, plot_rect);
         self.paint_frequency_scale(&painter, scale_rect);
         self.paint_carrier(&painter, full);
         self.tune_interaction(&response, &painter, plot_rect);
@@ -2707,6 +2896,7 @@ impl ScuApp {
             let plot_rect =
                 egui::Rect::from_min_max(egui::pos2(rect.left(), rect.top() + scale_h), rect.max);
             self.waterfall.paint(&painter, plot_rect);
+            self.paint_scope_info(&painter, plot_rect);
             self.paint_frequency_scale(&painter, scale_rect);
             self.paint_carrier(&painter, rect);
             self.tune_interaction(&response, &painter, plot_rect);
@@ -2743,6 +2933,7 @@ impl ScuApp {
                     rect.max,
                 );
                 self.waterfall.paint(&painter, plot_rect);
+                self.paint_scope_info(&painter, plot_rect);
                 self.paint_frequency_scale(&painter, scale_rect);
                 self.tune_interaction(&response, &painter, plot_rect);
             });
@@ -3649,24 +3840,9 @@ impl ScuApp {
             self.settings.waterfall_gain = self.waterfall.gain;
             save_settings(&self.settings);
         }
-        ui.horizontal(|ui| {
-            ui.label("Bins");
-            let mut bins = self.settings.scope_bins;
-            egui::ComboBox::from_id_salt("bin-mode")
-                .selected_text(bins.label())
-                .show_ui(ui, |ui| {
-                    for mode in BinInterleave::ALL {
-                        ui.selectable_value(&mut bins, mode, mode.label());
-                    }
-                });
-            if bins != self.settings.scope_bins {
-                self.settings.scope_bins = bins;
-                save_settings(&self.settings);
-            }
-            if ui.button("Clear").clicked() {
-                self.waterfall.clear();
-            }
-        });
+        if ui.button("Clear").clicked() {
+            self.waterfall.clear();
+        }
     }
 
     /// Audio pane: mute, volume and stereo.
@@ -4362,10 +4538,9 @@ impl ScuApp {
         if self.active_frequency() == 0 || rect.width() <= 0.0 {
             return;
         }
-        let axis = self.axis();
         let hz_at = |x: f32| {
             let t = ((x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
-            axis.hz_at(t)
+            self.scope_hz_at(t)
         };
 
         let shift = response.ctx.input(|i| i.modifiers.shift);
@@ -5581,6 +5756,24 @@ fn format_hz_label(hz: f64) -> String {
     scu_cat::format_hz(snap_hz(hz, 1))
 }
 
+/// Round `raw` down to the previous 1 / 2 / 5 x 10^n step, for minor ticks that
+/// always sit inside the labelled spacing.
+fn nice_step_floor(raw: f64) -> f64 {
+    if raw <= 0.0 {
+        return 1.0;
+    }
+    let base = 10f64.powf(raw.log10().floor());
+    let frac = raw / base;
+    let mult = if frac >= 5.0 {
+        5.0
+    } else if frac >= 2.0 {
+        2.0
+    } else {
+        1.0
+    };
+    mult * base
+}
+
 /// Round `raw` up to the next 1 / 2 / 5 x 10^n step, for readable tick spacing.
 fn nice_step(raw: f64) -> f64 {
     if raw <= 0.0 {
@@ -5707,7 +5900,12 @@ fn save_settings(settings: &AppSettings) {
 #[cfg(test)]
 mod tests {
     use super::parse_frequency_text as parse;
-    use super::{format_hz_label, frame_vfo_sub, md_vfo_sub, snap_hz};
+    use super::{format_hz_label, frame_vfo_sub, md_vfo_sub, scope_axis_span_hz, snap_hz};
+
+    #[test]
+    fn scope_axis_uses_measured_uniform_span() {
+        assert_eq!(scope_axis_span_hz(100_000.0), 107_500.0);
+    }
 
     #[test]
     fn cat_frames_route_to_their_vfo() {

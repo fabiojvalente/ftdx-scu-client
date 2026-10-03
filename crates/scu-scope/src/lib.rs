@@ -1,24 +1,29 @@
 //! Spectrum-scope decoding and waterfall color mapping.
 //!
-//! Scope bodies are 4096 bytes with an inverted amplitude encoding
-//! (`0` = strongest signal, `255` = weakest). The active spectrum ends at a
-//! boundary marker (see [`find_spectrum_end`]).
+//! A decrypted scope body is 4096 bytes and uses the same layout the
+//! FTDX10 / FTDX101 / FT-710 expose over their SPI scope interface. The main
+//! receiver's spectrum is the first **850 bytes**, one amplitude byte per bin,
+//! with an inverted encoding (`0` = strongest, `255` = weakest):
 //!
-//! The active region holds **two bytes per visible bin** (an interleaved second
-//! stream / oversampling). The published spec rendered the first contiguous
-//! `boundary / 2` bytes, which covers only the left half of the span and makes
-//! a centered signal appear at the right edge. We take one byte per bin across
-//! the whole region ([`BinInterleave::Split`]) so bins span the full width.
+//! | Offset      | Length | Meaning                                             |
+//! |-------------|--------|-----------------------------------------------------|
+//! | `0..850`    | 850    | main receiver waterfall (`wf1`)                     |
+//! | `850..1700` | 850    | second receiver waterfall (`wf2`, unused on FTDX10) |
+//! | `1700..`    | —      | audio FFT / oscilloscope / scope metadata           |
+//!
+//! The bin count and offset are fixed and independent of the scope span, so no
+//! boundary search is needed. Earlier versions searched for a "boundary marker"
+//! and decoded two bytes per bin, which interleaved `wf1` with the unused `wf2`
+//! buffer and halved the frequency resolution.
 
-use scu_protocol::SCOPE_BODY_LEN;
+/// Bins in the main receiver waterfall (`wf1`), at the start of a scope body.
+pub const WF1_BINS: usize = 850;
 
 /// A single decoded sweep line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScopeLine {
     /// Normalized magnitudes in `0.0..=1.0` (1.0 = strongest).
     pub bins: Vec<f32>,
-    /// Position of the boundary marker within the raw body.
-    pub boundary: usize,
 }
 
 impl ScopeLine {
@@ -27,103 +32,20 @@ impl ScopeLine {
     }
 }
 
-/// Find the end of the active spectrum (boundary marker) in a scope body.
-pub fn find_spectrum_end(packet: &[u8]) -> usize {
-    let len = packet.len().min(SCOPE_BODY_LEN);
-    if len <= 500 {
-        return len.min(2000);
-    }
-
-    // Primary: first bin <= 1 after bin 500.
-    let upper = len.min(3000);
-    for (i, &value) in packet.iter().enumerate().take(upper).skip(500) {
-        if value <= 1 {
-            return i;
-        }
-    }
-
-    // Fallback: first 64-bin block with average > 225 (reference/calibration).
-    const BLOCK: usize = 64;
-    if len > BLOCK {
-        let upper = (len - BLOCK).min(3000);
-        let mut start = 500;
-        while start < upper {
-            let avg: u32 = packet[start..start + BLOCK]
-                .iter()
-                .map(|&b| b as u32)
-                .sum::<u32>()
-                / BLOCK as u32;
-            if avg > 225 {
-                return start.saturating_sub(100).max(100);
-            }
-            start += BLOCK;
-        }
-    }
-
-    len.min(2000)
-}
-
-/// Number of usable bins for a body (empirical `boundary // 2` rule).
-pub fn usable_bin_count(packet: &[u8]) -> usize {
-    (find_spectrum_end(packet) / 2).max(1)
-}
-
 /// Normalize a raw amplitude byte: `1.0 - raw / 255.0`.
 #[inline]
 pub fn normalize(raw: u8) -> f32 {
     1.0 - (raw as f32 / 255.0)
 }
 
-/// How to extract visible bins from the active (doubled) region.
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BinInterleave {
-    /// One byte per bin, stepping over the interleaved second stream. Covers the
-    /// full scope width and lines the center bin up with the VFO.
-    Split,
-    /// The first contiguous `boundary / 2` bytes (the published spec's rule).
-    Contiguous,
-}
-
-impl BinInterleave {
-    pub const ALL: [BinInterleave; 2] = [BinInterleave::Split, BinInterleave::Contiguous];
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            BinInterleave::Split => "Interleaved (full span)",
-            BinInterleave::Contiguous => "Contiguous (first half)",
-        }
-    }
-
-    fn stride(&self) -> usize {
-        match self {
-            BinInterleave::Split => 2,
-            BinInterleave::Contiguous => 1,
-        }
-    }
-}
-
-/// Decode a raw scope body using the default [`BinInterleave::Split`] rule.
+/// Decode a raw scope body into a sweep line.
+///
+/// The main receiver's spectrum is the first [`WF1_BINS`] bytes of the body,
+/// one bin per byte. Shorter bodies yield only the bytes present.
 pub fn decode(packet: &[u8]) -> ScopeLine {
-    decode_with(packet, BinInterleave::Split)
-}
-
-/// Decode a raw scope body into a sweep line using the given bin rule.
-pub fn decode_with(packet: &[u8], mode: BinInterleave) -> ScopeLine {
-    let boundary = find_spectrum_end(packet);
-    if packet.is_empty() {
-        return ScopeLine {
-            bins: Vec::new(),
-            boundary,
-        };
-    }
-    let active = boundary.min(packet.len());
-    let count = (active / 2).max(1);
-    let stride = mode.stride();
-    let bins = (0..count)
-        .map(|i| normalize(packet[(i * stride).min(packet.len() - 1)]))
-        .collect();
-    ScopeLine { bins, boundary }
+    let count = packet.len().min(WF1_BINS);
+    let bins = packet[..count].iter().map(|&raw| normalize(raw)).collect();
+    ScopeLine { bins }
 }
 
 /// Linear mapping from bin index to absolute frequency (Hz).
@@ -245,84 +167,28 @@ fn turbo(t: f32) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn flat_body(floor: u8) -> Vec<u8> {
-        let mut v = vec![floor; SCOPE_BODY_LEN];
-        // Put a boundary marker at 1800.
-        v[1800] = 1;
-        v
-    }
+    use scu_protocol::SCOPE_BODY_LEN;
 
     #[test]
-    fn finds_marker_after_bin_500() {
-        let body = flat_body(230);
-        assert_eq!(find_spectrum_end(&body), 1800);
-        assert_eq!(usable_bin_count(&body), 900);
-    }
-
-    #[test]
-    fn ignores_strong_signal_before_500() {
-        let mut body = flat_body(230);
-        body[100] = 0;
-        body[200] = 0;
-        assert_eq!(find_spectrum_end(&body), 1800);
-    }
-
-    #[test]
-    fn fallback_uses_reference_block() {
-        // No marker <= 1 anywhere; a high-average block after 500 triggers fallback.
-        let mut body = vec![230u8; SCOPE_BODY_LEN];
-        for b in body.iter_mut().take(1900).skip(1900 - 64) {
-            *b = 240;
-        }
-        let end = find_spectrum_end(&body);
-        assert!(end >= 100);
-        assert!(end <= 1900);
-    }
-
-    #[test]
-    fn decode_length_and_range() {
-        let line = decode(&flat_body(200));
-        assert_eq!(line.bins.len(), 900);
-        assert_eq!(line.boundary, 1800);
-        assert!(line.bins.iter().all(|m| (0.0..=1.0).contains(m)));
-        // floor 200 -> 1 - 200/255
-        assert!((line.bins[0] - (1.0 - 200.0 / 255.0)).abs() < 1e-6);
-    }
-
-    #[test]
-    fn split_covers_full_region_but_contiguous_only_half() {
-        // Even bytes carry one sweep; odd bytes carry a second (interleaved) stream.
+    fn decode_reads_wf1_contiguously() {
+        // `wf1` is the first 850 bytes, one bin per byte. `wf2` (850..1700)
+        // must not bleed into the decoded line.
         let mut body = vec![255u8; SCOPE_BODY_LEN];
-        body[1800] = 1;
-        for i in (0..1800).step_by(2) {
-            body[i] = 40; // a strong bin every other byte: front..back
-        }
-        for i in (1..1800).step_by(2) {
-            body[i] = 200; // interleaved weak stream
-        }
+        body[..WF1_BINS].fill(200);
+        body[0] = 0; // strongest bin in wf1
+        body[WF1_BINS] = 0; // first byte of wf2, must be ignored
 
-        let split = decode_with(&body, BinInterleave::Split);
-        assert_eq!(split.bins.len(), 900);
-        // Every visible bin came from the strong even stream...
-        assert!(split.bins.iter().all(|m| (*m - normalize(40)).abs() < 1e-6));
-
-        let contiguous = decode_with(&body, BinInterleave::Contiguous);
-        // ...while the old rule mixes the two streams.
-        assert!(contiguous
-            .bins
-            .iter()
-            .any(|m| (*m - normalize(40)).abs() < 1e-6));
-        assert!(contiguous
-            .bins
-            .iter()
-            .any(|m| (*m - normalize(200)).abs() < 1e-6));
+        let line = decode(&body);
+        assert_eq!(line.bins.len(), WF1_BINS);
+        assert_eq!(line.bins[0], 1.0);
+        assert!((line.bins[1] - (1.0 - 200.0 / 255.0)).abs() < 1e-6);
+        assert!(line.bins.iter().all(|m| (0.0..=1.0).contains(m)));
     }
 
     #[test]
-    fn decode_empty_body_is_safe() {
-        let line = decode(&[]);
-        assert!(line.bins.is_empty());
+    fn decode_short_body_is_safe() {
+        assert!(decode(&[]).bins.is_empty());
+        assert_eq!(decode(&[0, 128, 255]).bins.len(), 3);
     }
 
     #[test]
@@ -345,5 +211,15 @@ mod tests {
         let axis = FrequencyAxis::new(7_007_000.0, 200_000.0);
         assert_eq!(axis.hz_at(0.5), 7_007_000.0);
         assert_eq!(axis.hz_at(0.0), 7_007_000.0 - 100_000.0);
+        assert_eq!(axis.hz_at(1.0), 7_007_000.0 + 100_000.0);
+    }
+
+    #[test]
+    fn frequency_axis_maps_ft8_offset_from_vfo() {
+        let axis = FrequencyAxis::new(7_030_000.0, 100_000.0);
+
+        // 7.074 MHz is 44 kHz above a 7.030 MHz carrier-centred VFO, so it
+        // belongs at 94% of a 100 kHz scope span.
+        assert_eq!(axis.hz_at(0.94), 7_074_000.0);
     }
 }

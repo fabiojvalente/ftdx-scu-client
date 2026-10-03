@@ -605,10 +605,12 @@ pub fn if_width_options(model: RadioModel, mode: Mode) -> Option<Vec<(u8, u16)>>
     Some(options.to_vec())
 }
 
-/// Bandwidth in Hz used when the `SH` code is `0` (the mode default).
+/// Bandwidth in Hz used when the `SH` code is `0` (the mode default). The SSB
+/// default is 3 kHz with the 12 kHz roofing filter; the CW/RTTY/PSK default is
+/// 500 Hz.
 pub fn default_if_width_hz(mode: Mode) -> Option<u16> {
     Some(match if_width_group(mode)? {
-        IfWidthGroup::Ssb => 2400,
+        IfWidthGroup::Ssb => 3000,
         IfWidthGroup::Cw => 500,
     })
 }
@@ -634,9 +636,11 @@ fn full_carrier_width_hz(mode: Mode) -> Option<u16> {
     })
 }
 
-/// Nominal passband centre by mode, in Hz relative to the suppressed carrier.
-/// Full-carrier modes (AM / FM) are centred on the carrier itself.
-fn if_passband_center_hz(mode: Mode) -> Option<i32> {
+/// Nominal passband / IF centre by mode, in Hz relative to the suppressed
+/// carrier. This is the radio's "carrier point" (`SCOPE CTR = CARRIER`): about
+/// +1.5 kHz in USB, -1.5 kHz in LSB, the sidetone pitch in CW. Full-carrier
+/// modes (AM / FM) are centred on the carrier itself.
+pub fn if_passband_center_hz(mode: Mode) -> Option<i32> {
     Some(match mode {
         Mode::Usb | Mode::DataU | Mode::Psk | Mode::RttyU => 1_500,
         Mode::Lsb | Mode::DataL | Mode::RttyL => -1_500,
@@ -646,21 +650,49 @@ fn if_passband_center_hz(mode: Mode) -> Option<i32> {
     })
 }
 
+/// Upper-sideband audio edges `(low_hz, high_hz)` for an SSB `SH` filter of
+/// `width` Hz. Narrow filters (< 1 kHz) sit symmetrically about the 1500 Hz IF
+/// centre; wider ones keep a ~100 Hz low edge and take the width off the high
+/// side, so a 4 kHz filter spans ~100..4100 Hz instead of straddling the
+/// carrier. Measured on an FTdx101MP, which shares the FTDX10's filter design.
+fn ssb_passband_edges_hz(width: i32) -> (i32, i32) {
+    if width < 1000 {
+        let half = width / 2;
+        (1500 - half, 1500 + half)
+    } else {
+        let lo = 100 + ((3000 - width).max(0) as f32 * 0.3) as i32;
+        (lo, lo + width)
+    }
+}
+
 /// Audio passband edges `(low_hz, high_hz)` relative to the carrier, derived
 /// from the mode, the `SH` width code and the `IS` shift.
 ///
-/// The passband is modelled as the IF filter bandwidth centred on the mode's
-/// nominal audio offset, displaced by the IF shift. Full-carrier modes (AM /
-/// FM), which expose no IF width, use a fixed nominal bandwidth.
+/// USB / LSB are **anchored to the carrier** (see [`ssb_passband_edges_hz`]).
+/// Other modes keep the nominal centre of [`if_passband_center_hz`], displaced
+/// by the IF shift. Full-carrier modes (AM / FM), which expose no IF width, use
+/// a fixed nominal bandwidth.
 pub fn if_passband_hz(
     model: RadioModel,
     mode: Mode,
     width_code: u8,
     shift_hz: i32,
 ) -> Option<(i32, i32)> {
-    let center = if_passband_center_hz(mode)? + clamp_if_shift_hz(shift_hz);
     let width =
         if_width_hz(model, mode, width_code).or_else(|| full_carrier_width_hz(mode))? as i32;
+    let shift = clamp_if_shift_hz(shift_hz);
+
+    if matches!(mode, Mode::Usb | Mode::Lsb) {
+        let (lo, hi) = ssb_passband_edges_hz(width);
+        let (lo, hi) = (lo + shift, hi + shift);
+        return Some(if matches!(mode, Mode::Lsb) {
+            (-hi, -lo)
+        } else {
+            (lo, hi)
+        });
+    }
+
+    let center = if_passband_center_hz(mode)? + shift;
     let half = width / 2;
     Some((center - half, center + half))
 }
@@ -1105,6 +1137,47 @@ pub fn parse_scope_mode(frame: &str) -> Option<ScopeMode> {
         return None;
     }
     ScopeMode::from_code(value.chars().next()?)
+}
+
+/// What the scope screen is centred on (`SCOPE CTR`, menu `EX040202`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeCenter {
+    /// Centred on the centre of the IF filter (offset from the carrier by the
+    /// passband centre).
+    Filter,
+    /// Centred on the signal carrier point, i.e. the VFO (the default).
+    Carrier,
+}
+
+impl ScopeCenter {
+    pub fn label(self) -> &'static str {
+        match self {
+            ScopeCenter::Filter => "FILTER",
+            ScopeCenter::Carrier => "CARRIER",
+        }
+    }
+}
+
+/// Build a "read scope centre" command (menu `DISPLAY SETTING -> SCOPE ->
+/// SCOPE CTR`, `EX040202`).
+pub fn read_scope_center() -> &'static str {
+    "EX040202;"
+}
+
+/// Parse an `EX040202v;` answer: `0` = FILTER, `1` = CARRIER.
+pub fn parse_scope_center(frame: &str) -> Option<ScopeCenter> {
+    let parsed = split(frame)?;
+    if parsed.command != "EX" || parsed.payload.len() < 7 {
+        return None;
+    }
+    if &parsed.payload[0..6] != "040202" {
+        return None;
+    }
+    match parsed.payload.as_bytes()[6] {
+        b'0' => Some(ScopeCenter::Filter),
+        b'1' => Some(ScopeCenter::Carrier),
+        _ => None,
+    }
 }
 
 /// What the scope is drawn over.
@@ -2007,6 +2080,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_scope_center_answer() {
+        assert_eq!(parse_scope_center("EX0402020;"), Some(ScopeCenter::Filter));
+        assert_eq!(parse_scope_center("EX0402021;"), Some(ScopeCenter::Carrier));
+        assert_eq!(parse_scope_center("EX040203;"), None);
+        assert_eq!(parse_scope_center("EX0104051500;"), None);
+        assert_eq!(read_scope_center(), "EX040202;");
+    }
+
+    #[test]
     fn scope_mode_round_trips_and_centers() {
         for code in '0'..='9' {
             let mode = ScopeMode::from_code(code).unwrap();
@@ -2331,25 +2413,35 @@ mod tests {
 
     #[test]
     fn if_passband_tracks_mode_width_and_shift() {
-        // USB, default width (2400 Hz) centred at +1500.
+        // USB, default width (code 0 -> 3000 Hz) anchors the low edge near
+        // 100 Hz and grows upward, not a fixed centre.
         assert_eq!(
             if_passband_hz(RadioModel::Ftdx10, Mode::Usb, 0, 0),
-            Some((300, 2700))
+            Some((100, 3100))
         );
-        // Narrower width (code 3 = 600 Hz) shrinks symmetrically.
+        // Narrower width (code 3 = 600 Hz) shrinks symmetrically about 1500.
         assert_eq!(
             if_passband_hz(RadioModel::Ftdx10, Mode::Usb, 3, 0),
             Some((1200, 1800))
         );
+        // A wide filter (code 23 = 4000 Hz) stays entirely above the carrier.
+        assert_eq!(
+            if_passband_hz(RadioModel::Ftdx10, Mode::Usb, 23, 0),
+            Some((100, 4100))
+        );
         // LSB mirrors to negative frequencies.
         assert_eq!(
             if_passband_hz(RadioModel::Ftdx10, Mode::Lsb, 0, 0),
-            Some((-2700, -300))
+            Some((-3100, -100))
+        );
+        assert_eq!(
+            if_passband_hz(RadioModel::Ftdx10, Mode::Lsb, 23, 0),
+            Some((-4100, -100))
         );
         // A positive shift moves the passband up, also in LSB.
         assert_eq!(
             if_passband_hz(RadioModel::Ftdx10, Mode::Lsb, 0, 500),
-            Some((-2200, 200))
+            Some((-3600, -600))
         );
         // CW sits around the 700 Hz sidetone pitch.
         assert_eq!(
