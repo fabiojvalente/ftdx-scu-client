@@ -2360,6 +2360,27 @@ impl ScuApp {
             let y = rect.bottom() - t * rect.height();
             points.push(egui::pos2(x, y));
         }
+
+        let fill_color = theme::spectrum_orange().gamma_multiply(0.15);
+        let mut mesh = egui::Mesh::with_texture(egui::TextureId::default());
+        mesh.reserve_vertices(n * 2);
+        mesh.reserve_triangles((n - 1) * 2);
+        for &p in &points {
+            mesh.colored_vertex(p, fill_color);
+        }
+        for &p in &points {
+            mesh.colored_vertex(egui::pos2(p.x, rect.bottom()), fill_color);
+        }
+        for i in 0..(n - 1) {
+            let a = i as u32;
+            let b = (i + 1) as u32;
+            let c = (n + i + 1) as u32;
+            let d = (n + i) as u32;
+            mesh.add_triangle(a, b, c);
+            mesh.add_triangle(a, c, d);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+
         painter.add(egui::Shape::line(
             points,
             egui::Stroke::new(1.2, theme::spectrum_orange()),
