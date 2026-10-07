@@ -1536,40 +1536,39 @@ impl ScuApp {
                     self.roofing_filter = Some(filter);
                 }
             }
+            // `NL`, `RL`, `PA`, `RA`, `SH` and `IS` all have P1 fixed to `0` on
+            // the FTDX10: their replies describe the *operating* VFO, never a
+            // fixed VFO-A/B. Filing them by the P1 digit would always land on
+            // VFO-A, leaving VFO-B stuck on its defaults, so they follow the
+            // VFO that is receiving now (each is re-read when the VFO changes).
             "NL" => {
                 if let Some(level) = scu_cat::parse_noise_blanker_level(text) {
-                    let sub = frame_vfo_sub(text, self.rx_sub);
-                    self.noise_blanker_level[sub as usize] = level;
+                    self.noise_blanker_level[self.rx_sub as usize] = level;
                 }
             }
             "RL" => {
                 if let Some(level) = scu_cat::parse_noise_reduction_level(text) {
-                    let sub = frame_vfo_sub(text, self.rx_sub);
-                    self.noise_reduction_level[sub as usize] = level;
+                    self.noise_reduction_level[self.rx_sub as usize] = level;
                 }
             }
             "PA" => {
                 if let Some(preamp) = scu_cat::parse_preamp(text) {
-                    let sub = frame_vfo_sub(text, self.rx_sub);
-                    self.preamp[sub as usize] = Some(preamp);
+                    self.preamp[self.rx_sub as usize] = Some(preamp);
                 }
             }
             "RA" => {
                 if let Some(code) = scu_cat::parse_attenuator(text) {
-                    let sub = frame_vfo_sub(text, self.rx_sub);
-                    self.attenuator[sub as usize] = code;
+                    self.attenuator[self.rx_sub as usize] = code;
                 }
             }
             "SH" => {
                 if let Some(code) = scu_cat::parse_if_width(text) {
-                    let sub = frame_vfo_sub(text, self.rx_sub);
-                    self.if_width[sub as usize] = code;
+                    self.if_width[self.rx_sub as usize] = code;
                 }
             }
             "IS" => {
                 if let Some(hz) = scu_cat::parse_if_shift(text) {
-                    let sub = frame_vfo_sub(text, self.rx_sub);
-                    self.if_shift_hz[sub as usize] = hz;
+                    self.if_shift_hz[self.rx_sub as usize] = hz;
                 }
             }
             "GT" => {
@@ -5930,14 +5929,13 @@ mod tests {
 
     #[test]
     fn cat_frames_route_to_their_vfo() {
+        // The helper backs `MD`, whose P1 digit is relative (0 = the operating
+        // VFO). The P1-fixed commands (`SH`/`IS`/`PA`/`RA`/`NL`/`RL`) bypass
+        // it and always follow the operating VFO.
         assert!(!frame_vfo_sub("MD01;", true));
         assert!(frame_vfo_sub("MD12;", false));
-        assert!(!frame_vfo_sub("SH0008;", true));
-        assert!(frame_vfo_sub("SH1021;", false));
-        assert!(frame_vfo_sub("IS10+0600;", false));
-        assert!(!frame_vfo_sub("IS00+0600;", true));
         // No payload falls back to the caller's active VFO.
-        assert!(frame_vfo_sub("IS;", true));
+        assert!(frame_vfo_sub("MD;", true));
     }
 
     #[test]
