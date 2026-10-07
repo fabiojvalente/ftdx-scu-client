@@ -484,6 +484,10 @@ pub struct ScuApp {
     focus_freq: [bool; 2],
     /// IF width (`SH`) code per VFO; 0 is the radio's mode default.
     if_width: [u8; 2],
+    /// Whether the user last chose the mode default (`SH` code 0) on a VFO.
+    /// The radio resolves code 0 to a concrete width, so this keeps the control
+    /// on "Default" until the user picks a specific width instead.
+    if_width_default: [bool; 2],
     /// IF shift (`IS`) in Hz per VFO.
     if_shift_hz: [i32; 2],
     /// While set and in the future, crossed per-VFO width/shift frames from the
@@ -679,6 +683,7 @@ impl ScuApp {
             notice: None,
             focus_freq: [false, false],
             if_width: [0, 0],
+            if_width_default: [false, false],
             if_shift_hz: [0, 0],
             vfo_switch_ignore_until: None,
             vfo_switch_refresh: false,
@@ -3670,12 +3675,20 @@ impl ScuApp {
         }
         let options = self.current_if_width_options();
         let current_width = self.active_if_width();
-        let width_label = self.if_width_label(current_width);
+        // The radio resolves a default width to a concrete code on its own, so
+        // keep the combo on "Default" (code 0) while that is what the user
+        // picked, even though `if_width` already holds the resolved code.
+        let selection = if self.if_width_default[self.rx_sub as usize] {
+            0
+        } else {
+            current_width
+        };
+        let width_label = self.if_width_label(selection);
         ui.horizontal(|ui| {
             ui.label("IF width");
             match &options {
                 Some(options) => {
-                    let mut choice = current_width;
+                    let mut choice = selection;
                     egui::ComboBox::from_id_salt("if-width")
                         .selected_text(width_label.clone())
                         .show_ui(ui, |ui| {
@@ -3690,7 +3703,7 @@ impl ScuApp {
                                 ui.selectable_value(&mut choice, *code, label);
                             }
                         });
-                    if choice != current_width {
+                    if choice != selection {
                         self.set_if_width(choice);
                     }
                 }
@@ -5302,7 +5315,9 @@ impl ScuApp {
     }
 
     fn set_if_width(&mut self, code: u8) {
-        self.if_width[self.rx_sub as usize] = code;
+        let sub = self.rx_sub as usize;
+        self.if_width[sub] = code;
+        self.if_width_default[sub] = code == 0;
         if let Some(handle) = &self.handle {
             handle.send_cat(&scu_cat::set_if_width(self.rx_sub, code));
         }
