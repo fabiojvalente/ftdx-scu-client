@@ -865,14 +865,17 @@ impl Preamp {
     pub const ALL: [Preamp; 3] = [Preamp::Ipo, Preamp::Amp1, Preamp::Amp2];
 }
 
-/// Build a "set preamp / IPO" command (`PA` + VFO + code).
-pub fn set_preamp(sub: bool, preamp: Preamp) -> String {
-    format!("PA{}{};", sub as u8, preamp.code())
+/// Build a "set preamp / IPO" command (`PA0` + code).
+///
+/// The FTDX10 `PA` command has P1 fixed at `0`: IPO / AMP1 / AMP2 is a single
+/// global front-end setting, not a per-VFO one (`PA1...` is rejected).
+pub fn set_preamp(preamp: Preamp) -> String {
+    format!("PA0{};", preamp.code())
 }
 
-/// Build a "read preamp / IPO" command (`PA0;` / `PA1;`).
-pub fn read_preamp(sub: bool) -> String {
-    format!("PA{};", sub as u8)
+/// Build a "read preamp / IPO" command (`PA0;`).
+pub fn read_preamp() -> &'static str {
+    "PA0;"
 }
 
 /// Parse the preamp / IPO from a `PA0P2;` response.
@@ -887,15 +890,18 @@ pub fn parse_preamp(frame: &str) -> Option<Preamp> {
 /// Attenuator steps in dB, indexed by the `RA` code (0 = off).
 pub const ATTENUATOR_STEPS_DB: [u8; 4] = [0, 6, 12, 18];
 
-/// Build a "set attenuator" command (`RA` + VFO + step code, 0-3).
-pub fn set_attenuator(sub: bool, code: u8) -> String {
+/// Build a "set attenuator" command (`RA0` + step code, 0-3).
+///
+/// Like `PA`, the FTDX10 `RA` command has P1 fixed at `0`: the attenuator is a
+/// single global setting (`RA1...` is rejected).
+pub fn set_attenuator(code: u8) -> String {
     let code = code.min((ATTENUATOR_STEPS_DB.len() - 1) as u8);
-    format!("RA{}{};", sub as u8, code)
+    format!("RA0{code};")
 }
 
-/// Build a "read attenuator" command (`RA0;` / `RA1;`).
-pub fn read_attenuator(sub: bool) -> String {
-    format!("RA{};", sub as u8)
+/// Build a "read attenuator" command (`RA0;`).
+pub fn read_attenuator() -> &'static str {
+    "RA0;"
 }
 
 /// Parse the attenuator step code from an `RA0P2;` response.
@@ -2327,24 +2333,22 @@ mod tests {
 
     #[test]
     fn build_and_parse_preamp_and_attenuator() {
-        assert_eq!(set_preamp(false, Preamp::Amp2), "PA02;");
-        assert_eq!(set_preamp(true, Preamp::Ipo), "PA10;");
-        assert_eq!(read_preamp(false), "PA0;");
-        assert_eq!(read_preamp(true), "PA1;");
+        assert_eq!(set_preamp(Preamp::Amp2), "PA02;");
+        assert_eq!(set_preamp(Preamp::Ipo), "PA00;");
+        assert_eq!(read_preamp(), "PA0;");
         assert_eq!(parse_preamp("PA02;"), Some(Preamp::Amp2));
-        assert_eq!(parse_preamp("PA10;"), Some(Preamp::Ipo));
+        assert_eq!(parse_preamp("PA00;"), Some(Preamp::Ipo));
         assert_eq!(parse_preamp("GT02;"), None);
         for preamp in Preamp::ALL {
             assert_eq!(Preamp::from_code(preamp.code()), Some(preamp));
         }
 
-        assert_eq!(set_attenuator(false, 2), "RA02;");
-        assert_eq!(set_attenuator(true, 3), "RA13;");
-        assert_eq!(set_attenuator(false, 99), "RA03;");
-        assert_eq!(read_attenuator(false), "RA0;");
-        assert_eq!(read_attenuator(true), "RA1;");
+        assert_eq!(set_attenuator(2), "RA02;");
+        assert_eq!(set_attenuator(3), "RA03;");
+        assert_eq!(set_attenuator(99), "RA03;");
+        assert_eq!(read_attenuator(), "RA0;");
         assert_eq!(parse_attenuator("RA00;"), Some(0));
-        assert_eq!(parse_attenuator("RA13;"), Some(3));
+        assert_eq!(parse_attenuator("RA03;"), Some(3));
         assert_eq!(parse_attenuator("RG0128;"), None);
         assert_eq!(ATTENUATOR_STEPS_DB, [0, 6, 12, 18]);
     }

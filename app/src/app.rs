@@ -423,10 +423,12 @@ pub struct ScuApp {
     noise_blanker_level: [u8; 2],
     /// Noise reduction (DNR) level (`RL`, 1-15) per VFO.
     noise_reduction_level: [u8; 2],
-    /// Receiver front-end stage (`PA`) per VFO (0 = A/Main, 1 = B/Sub).
-    preamp: [Option<Preamp>; 2],
-    /// Attenuator step code (`RA`, 0 = off ... 3 = 18 dB) per VFO.
-    attenuator: [u8; 2],
+    /// Receiver front-end stage (`PA`, `None` until the radio answers).
+    ///
+    /// On the FTDX10 this is a single global setting, not per-VFO.
+    preamp: Option<Preamp>,
+    /// Attenuator step code (`RA`, 0 = off ... 3 = 18 dB). Global on the FTDX10.
+    attenuator: u8,
     agc: Option<Agc>,
     rf_gain: u8,
     squelch: u8,
@@ -645,8 +647,8 @@ impl ScuApp {
             scope_center: None,
             noise_blanker_level: [10, 10],
             noise_reduction_level: [1, 1],
-            preamp: [None, None],
-            attenuator: [0, 0],
+            preamp: None,
+            attenuator: 0,
             agc: None,
             rf_gain: 128,
             squelch: 0,
@@ -1289,9 +1291,7 @@ impl ScuApp {
                 "RL1;",
                 "GT0;",
                 "PA0;",
-                "PA1;",
                 "RA0;",
-                "RA1;",
                 "RG0;",
                 "SQ0;",
                 "TX;",
@@ -1541,11 +1541,12 @@ impl ScuApp {
                     self.roofing_filter = Some(filter);
                 }
             }
-            // `NL`, `RL`, `PA`, `RA`, `SH` and `IS` all have P1 fixed to `0` on
-            // the FTDX10: their replies describe the *operating* VFO, never a
-            // fixed VFO-A/B. Filing them by the P1 digit would always land on
-            // VFO-A, leaving VFO-B stuck on its defaults, so they follow the
-            // VFO that is receiving now (each is re-read when the VFO changes).
+            // `NL`, `RL`, `SH` and `IS` all have P1 fixed to `0` on the FTDX10:
+            // their replies describe the *operating* VFO, never a fixed
+            // VFO-A/B. Filing them by the P1 digit would always land on VFO-A,
+            // leaving VFO-B stuck on its defaults, so they follow the VFO that
+            // is receiving now (each is re-read when the VFO changes). `PA` and
+            // `RA` are handled above as global state instead.
             "NL" => {
                 if let Some(level) = scu_cat::parse_noise_blanker_level(text) {
                     self.noise_blanker_level[self.rx_sub as usize] = level;
@@ -1558,12 +1559,12 @@ impl ScuApp {
             }
             "PA" => {
                 if let Some(preamp) = scu_cat::parse_preamp(text) {
-                    self.preamp[self.rx_sub as usize] = Some(preamp);
+                    self.preamp = Some(preamp);
                 }
             }
             "RA" => {
                 if let Some(code) = scu_cat::parse_attenuator(text) {
-                    self.attenuator[self.rx_sub as usize] = code;
+                    self.attenuator = code;
                 }
             }
             "SH" => {
@@ -2084,21 +2085,19 @@ impl ScuApp {
         }
     }
 
-    /// Set the receiver front-end stage (`PA`) for the active VFO.
+    /// Set the receiver front-end stage (`PA`).
     fn set_preamp(&mut self, preamp: Preamp) {
-        let sub = self.rx_sub;
-        self.preamp[sub as usize] = Some(preamp);
+        self.preamp = Some(preamp);
         if let Some(handle) = &self.handle {
-            handle.send_cat(&scu_cat::set_preamp(sub, preamp));
+            handle.send_cat(&scu_cat::set_preamp(preamp));
         }
     }
 
-    /// Set the attenuator step (`RA`) for the active VFO.
+    /// Set the attenuator step (`RA`).
     fn set_attenuator(&mut self, code: u8) {
-        let sub = self.rx_sub;
-        self.attenuator[sub as usize] = code;
+        self.attenuator = code;
         if let Some(handle) = &self.handle {
-            handle.send_cat(&scu_cat::set_attenuator(sub, code));
+            handle.send_cat(&scu_cat::set_attenuator(code));
         }
     }
 
@@ -2177,9 +2176,7 @@ impl ScuApp {
                     "RL1;",
                     "GT0;",
                     "PA0;",
-                    "PA1;",
                     "RA0;",
-                    "RA1;",
                     "RG0;",
                     "SQ0;",
                     "TX;",
@@ -3601,7 +3598,7 @@ impl ScuApp {
                 self.set_agc(agc);
             }
         }
-        let current_preamp = self.preamp[self.rx_sub as usize];
+        let current_preamp = self.preamp;
         let mut selected_preamp = current_preamp;
         egui::ComboBox::from_id_salt("preamp")
             .selected_text(format!(
@@ -3618,7 +3615,7 @@ impl ScuApp {
                 self.set_preamp(preamp);
             }
         }
-        let current_att = self.attenuator[self.rx_sub as usize];
+        let current_att = self.attenuator;
         let att_label = if current_att == 0 {
             "Off".to_string()
         } else {
