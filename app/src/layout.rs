@@ -520,8 +520,7 @@ pub fn delete_user_layout(id: &str) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn config_dir() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(std::path::PathBuf::from(home).join(".config/scu-client"))
+    crate::paths::config_dir()
 }
 
 #[cfg(not(target_arch = "wasm32"))]

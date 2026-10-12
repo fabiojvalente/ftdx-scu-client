@@ -8,6 +8,7 @@ mod hotkeys;
 mod layout;
 mod logging;
 mod meter;
+mod paths;
 mod shortcuts;
 mod theme;
 mod waterfall;

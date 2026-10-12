@@ -5831,8 +5831,7 @@ fn config_default_freq() -> u64 {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn config_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config/scu-client/config.toml"))
+    Some(crate::paths::config_dir()?.join("config.toml"))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -5857,8 +5856,7 @@ fn save_config(config: &ConnectConfig) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn settings_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config/scu-client/settings.toml"))
+    Some(crate::paths::config_dir()?.join("settings.toml"))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
