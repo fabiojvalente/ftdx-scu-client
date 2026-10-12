@@ -162,6 +162,10 @@ cat > "$BUNDLE/Contents/Info.plist" <<EOF
   <string>${MIN_MACOS}</string>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Transmit audio from your microphone.</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Connect to your Yaesu SCU-LAN10 radio on the local network.</string>
 ${ICON_KEY}
 </dict>
 </plist>
