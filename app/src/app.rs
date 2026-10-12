@@ -71,12 +71,12 @@ pub struct AppSettings {
     pub rx_stream_enabled: bool,
     #[serde(default)]
     pub rx_stream_device: Option<String>,
-    /// Take TX audio from a loopback device instead of the local microphone.
+    /// Use the loopback TX preset instead of the local-microphone preset.
     #[serde(default)]
     pub tx_stream_enabled: bool,
     #[serde(default)]
     pub tx_stream_device: Option<String>,
-    /// Capture gain applied to the streaming (loopback) TX device.
+    /// Capture gain for the loopback TX preset.
     #[serde(default = "default_mic_capture_gain")]
     pub tx_stream_gain: f32,
     /// Voice-operated transmit.
@@ -112,10 +112,10 @@ pub struct AppSettings {
     /// Route channel 1 to the right output instead of duplicating to both.
     #[serde(default)]
     pub stereo: bool,
-    /// Capture gain applied to the local microphone.
+    /// Capture gain for the local-microphone TX preset.
     #[serde(default = "default_mic_capture_gain")]
     pub mic_gain: f32,
-    /// Preferred local microphone device (`None` = system default).
+    /// Local-microphone TX preset device (`None` = system default).
     #[serde(default)]
     pub mic_device: Option<String>,
     /// Tuning step used by the frequency editors and step buttons.
@@ -492,9 +492,10 @@ pub struct ScuApp {
     tx_power: u16,
     radio_mic_gain: u8,
     atu_on: bool,
-    mic: Option<MicInput>,
-    mic_devices: Vec<String>,
-    mic_status: String,
+    /// Active TX capture source (microphone or loopback preset).
+    tx_input: Option<MicInput>,
+    tx_input_devices: Vec<String>,
+    tx_input_status: String,
 
     settings: AppSettings,
     show_settings: bool,
@@ -583,11 +584,7 @@ pub struct ScuApp {
     #[cfg(not(target_arch = "wasm32"))]
     rx_stream: Option<AudioOutput>,
     #[cfg(not(target_arch = "wasm32"))]
-    tx_stream: Option<MicInput>,
-    #[cfg(not(target_arch = "wasm32"))]
     rx_stream_devices: Vec<String>,
-    #[cfg(not(target_arch = "wasm32"))]
-    tx_stream_devices: Vec<String>,
     #[cfg(not(target_arch = "wasm32"))]
     vox: Vox,
     #[cfg(not(target_arch = "wasm32"))]
@@ -701,9 +698,9 @@ impl ScuApp {
             tx_power: scu_cat::POWER_MAX_W,
             radio_mic_gain: 50,
             atu_on: false,
-            mic: None,
-            mic_devices: MicInput::devices(),
-            mic_status: String::new(),
+            tx_input: None,
+            tx_input_devices: MicInput::devices(),
+            tx_input_status: String::new(),
             settings,
             show_settings: false,
             settings_tab: SettingsTab::default(),
@@ -742,11 +739,7 @@ impl ScuApp {
             #[cfg(not(target_arch = "wasm32"))]
             rx_stream: None,
             #[cfg(not(target_arch = "wasm32"))]
-            tx_stream: None,
-            #[cfg(not(target_arch = "wasm32"))]
             rx_stream_devices: AudioOutput::devices(),
-            #[cfg(not(target_arch = "wasm32"))]
-            tx_stream_devices: MicInput::devices(),
             #[cfg(not(target_arch = "wasm32"))]
             vox: Vox::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -828,12 +821,8 @@ impl ScuApp {
             }
         }
         self.ptt = false;
-        self.mic = None;
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.tx_stream = None;
-        }
-        self.mic_status.clear();
+        self.tx_input = None;
+        self.tx_input_status.clear();
         self.sync_audio_enabled();
     }
 
@@ -1003,14 +992,14 @@ impl ScuApp {
         }
     }
 
-    /// Side-rail section for routing RX/TX audio to a loopback device so
-    /// external software (WSJT-X, fldigi, …) can share the radio's audio.
+    /// Side-rail section for routing RX audio to a loopback device so external
+    /// software (WSJT-X, fldigi, …) can share the radio's audio.
     #[cfg(not(target_arch = "wasm32"))]
     fn ui_audio_streaming(&mut self, ui: &mut egui::Ui) {
         theme::section(ui, "Audio Streaming");
         ui.label(
             egui::RichText::new(
-                "Bridge RX/TX to a virtual device (BlackHole, Loopback, Common-Radio, VB-Cable).",
+                "Bridge RX to a virtual device (BlackHole, Loopback, Common-Radio, VB-Cable).",
             )
             .small()
             .color(theme::text_faint()),
@@ -1043,53 +1032,9 @@ impl ScuApp {
             }
         }
 
-        // TX: external app -> loopback -> radio.
-        let mut tx_enabled = self.settings.tx_stream_enabled;
-        if ui
-            .checkbox(&mut tx_enabled, "Take TX from a device")
-            .on_hover_text(
-                "Send audio captured from a virtual device to the radio (replaces the mic)",
-            )
-            .changed()
-        {
-            self.settings.tx_stream_enabled = tx_enabled;
-            save_settings(&self.settings);
-            if tx_enabled {
-                if let Some(handle) = self.handle.clone() {
-                    self.ensure_tx_stream(handle);
-                }
-            } else {
-                self.tx_stream = None;
-            }
-            self.sync_tx_sources();
-        }
-        if let Some(choice) = device_combo(
-            ui,
-            "tx-stream-device",
-            "Input",
-            &self.tx_stream_devices,
-            &self.settings.tx_stream_device,
-        ) {
-            self.settings.tx_stream_device = choice;
-            save_settings(&self.settings);
-            if self.settings.tx_stream_enabled {
-                self.tx_stream = None;
-                if let Some(handle) = self.handle.clone() {
-                    self.ensure_tx_stream(handle);
-                }
-                self.sync_tx_sources();
-            }
-        }
-        ui.label(
-            egui::RichText::new("TX streaming replaces the local microphone while enabled.")
-                .small()
-                .color(theme::text_faint()),
-        );
-
         if ui.button("Rescan audio devices").clicked() {
             self.rx_stream_devices = AudioOutput::devices();
-            self.tx_stream_devices = MicInput::devices();
-            self.mic_devices = MicInput::devices();
+            self.tx_input_devices = MicInput::devices();
         }
     }
 
@@ -1161,76 +1106,77 @@ impl ScuApp {
             save_settings(&self.settings);
         }
         ui.label(
-            egui::RichText::new("Uses whichever TX audio source is active (mic or streaming).")
+            egui::RichText::new("Uses whichever TX audio source is active (mic or loopback).")
                 .small()
                 .color(theme::text_faint()),
         );
     }
 
-    /// Open the configured microphone and route its encoded TX audio to the
-    /// session. Called once the session handle is available.
-    fn ensure_mic(&mut self, handle: ScuHandle) {
-        if self.mic.is_some() {
+    /// Whether the loopback (external-software) preset is the active TX source.
+    fn tx_use_stream(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.settings.tx_stream_enabled
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
+    }
+
+    /// Device and capture gain for the active TX preset.
+    fn active_tx_config(&self) -> MicConfig {
+        if self.tx_use_stream() {
+            MicConfig {
+                device: self.settings.tx_stream_device.clone(),
+                gain: self.settings.tx_stream_gain,
+            }
+        } else {
+            MicConfig {
+                device: self.settings.mic_device.clone(),
+                gain: self.settings.mic_gain,
+            }
+        }
+    }
+
+    /// Open the active TX capture source and route its encoded audio to the
+    /// session. Called once a session handle is available.
+    fn ensure_tx_input(&mut self, handle: ScuHandle) {
+        if self.tx_input.is_some() {
             return;
         }
         let sink: TxAudioSink = Box::new(move |body: &[u8]| handle.send_tx_audio(body));
-        let config = MicConfig {
-            device: self.settings.mic_device.clone(),
-            gain: self.settings.mic_gain,
-        };
+        let config = self.active_tx_config();
         match MicInput::new(config, sink) {
-            Ok(mic) => {
-                self.mic_status = format!(
-                    "mic: {} ({} Hz, {} ch)",
-                    mic.info().device_name,
-                    mic.info().sample_rate,
-                    mic.info().channels
+            Ok(input) => {
+                self.tx_input_status = format!(
+                    "{} ({} Hz, {} ch)",
+                    input.info().device_name,
+                    input.info().sample_rate,
+                    input.info().channels
                 );
-                self.mic = Some(mic);
+                self.tx_input = Some(input);
                 self.sync_tx_sources();
             }
-            Err(e) => self.mic_status = format!("mic unavailable: {e}"),
+            Err(e) => self.tx_input_status = format!("unavailable: {e}"),
         }
     }
 
-    /// Open the streaming (external-software) TX input device, if enabled.
+    /// Reopen the TX capture source after a preset or device change.
     #[cfg(not(target_arch = "wasm32"))]
-    fn ensure_tx_stream(&mut self, handle: ScuHandle) {
-        if !self.settings.tx_stream_enabled || self.tx_stream.is_some() {
-            return;
-        }
-        let sink: TxAudioSink = Box::new(move |body: &[u8]| handle.send_tx_audio(body));
-        let config = MicConfig {
-            device: self.settings.tx_stream_device.clone(),
-            gain: self.settings.tx_stream_gain,
-        };
-        match MicInput::new(config, sink) {
-            Ok(mic) => {
-                self.tx_stream = Some(mic);
-                self.sync_tx_sources();
-            }
-            Err(e) => {
-                self.settings.tx_stream_enabled = false;
-                self.status = format!("TX stream unavailable: {e}");
-            }
+    fn reopen_tx_input(&mut self) {
+        self.tx_input = None;
+        self.tx_input_status.clear();
+        if let Some(handle) = self.handle.clone() {
+            self.ensure_tx_input(handle);
         }
     }
 
-    /// Enable exactly one TX audio source (microphone or streaming device)
-    /// while transmitting.
+    /// Gate the active TX capture source on the transmit state.
     fn sync_tx_sources(&mut self) {
         let keyed = self.tx_keyed();
-        #[cfg(not(target_arch = "wasm32"))]
-        let use_stream = self.settings.tx_stream_enabled && self.tx_stream.is_some();
-        #[cfg(target_arch = "wasm32")]
-        let use_stream = false;
-
-        if let Some(mic) = &self.mic {
-            mic.set_enabled(keyed && !use_stream);
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(stream) = &self.tx_stream {
-            stream.set_enabled(keyed && use_stream);
+        if let Some(input) = &self.tx_input {
+            input.set_enabled(keyed);
         }
     }
 
@@ -1255,11 +1201,7 @@ impl ScuApp {
     /// Current peak level of the active TX audio source.
     #[cfg(not(target_arch = "wasm32"))]
     fn tx_level(&self) -> u16 {
-        if self.settings.tx_stream_enabled {
-            self.tx_stream.as_ref().map(MicInput::level).unwrap_or(0)
-        } else {
-            self.mic.as_ref().map(MicInput::level).unwrap_or(0)
-        }
+        self.tx_input.as_ref().map(MicInput::level).unwrap_or(0)
     }
 
     /// Advance the VOX state machine and key/unkey the transmitter.
@@ -1370,14 +1312,12 @@ impl ScuApp {
     fn on_engine_msg(&mut self, message: EngineMsg) {
         match message {
             EngineMsg::Handle(handle) => {
-                self.mic_devices = MicInput::devices();
-                self.ensure_mic(handle.clone());
+                self.tx_input_devices = MicInput::devices();
+                self.ensure_tx_input(handle.clone());
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     self.rx_stream_devices = AudioOutput::devices();
-                    self.tx_stream_devices = MicInput::devices();
                     self.sync_rx_stream();
-                    self.ensure_tx_stream(handle.clone());
                 }
                 self.handle = Some(handle);
                 self.connecting = false;
@@ -3967,7 +3907,7 @@ impl ScuApp {
         }
     }
 
-    /// Transmit pane: power, microphone gain and capture device.
+    /// Transmit pane: power, radio microphone gain and the TX capture source.
     fn pane_transmit(&mut self, ui: &mut egui::Ui) {
         theme::section(ui, "Transmit");
         let mut power = self.tx_power as i32;
@@ -4003,74 +3943,78 @@ impl ScuApp {
             }
         }
 
-        ui.horizontal(|ui| {
-            ui.label("Mic");
-            let current = self
-                .settings
-                .mic_device
-                .clone()
-                .unwrap_or_else(|| "Default".to_string());
-            let mut changed = false;
-            egui::ComboBox::from_id_salt("mic-device")
-                .selected_text(current)
-                .show_ui(ui, |ui| {
-                    if ui
-                        .selectable_label(self.settings.mic_device.is_none(), "Default")
-                        .clicked()
-                    {
-                        self.settings.mic_device = None;
-                        changed = true;
-                    }
-                    let devices = self.mic_devices.clone();
-                    for name in devices {
-                        let selected = self.settings.mic_device.as_deref() == Some(name.as_str());
-                        if ui.selectable_label(selected, &name).clicked() {
-                            self.settings.mic_device = Some(name);
-                            changed = true;
-                        }
-                    }
-                });
-            if changed {
-                save_settings(&self.settings);
-                self.mic = None;
-                if let Some(handle) = self.handle.clone() {
-                    self.ensure_mic(handle);
-                }
-            }
-        });
-        #[cfg(target_arch = "wasm32")]
-        let using_stream = false;
+        ui.add_space(4.0);
+        self.ui_tx_input(ui);
+    }
+
+    /// TX capture source: a microphone/loopback preset plus the device and
+    /// capture gain for the active preset.
+    fn ui_tx_input(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "TX Input");
+
         #[cfg(not(target_arch = "wasm32"))]
-        let using_stream = self.settings.tx_stream_enabled;
-        let mut capture_gain = if using_stream {
+        {
+            let mut use_stream = self.settings.tx_stream_enabled;
+            ui.horizontal(|ui| {
+                ui.label("Source");
+                ui.radio_value(&mut use_stream, false, "Microphone");
+                ui.radio_value(&mut use_stream, true, "Loopback")
+                    .on_hover_text("Capture from a virtual device (WSJT-X, fldigi, …)");
+            });
+            if use_stream != self.settings.tx_stream_enabled {
+                self.settings.tx_stream_enabled = use_stream;
+                save_settings(&self.settings);
+                self.reopen_tx_input();
+            }
+        }
+
+        let use_stream = self.tx_use_stream();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let devices = self.tx_input_devices.clone();
+            let current = if use_stream {
+                self.settings.tx_stream_device.clone()
+            } else {
+                self.settings.mic_device.clone()
+            };
+            if let Some(choice) = device_combo(ui, "tx-input-device", "Device", &devices, &current)
+            {
+                if use_stream {
+                    self.settings.tx_stream_device = choice;
+                } else {
+                    self.settings.mic_device = choice;
+                }
+                save_settings(&self.settings);
+                self.reopen_tx_input();
+            }
+        }
+
+        let mut gain = if use_stream {
             self.settings.tx_stream_gain
         } else {
             self.settings.mic_gain
         };
         if ui
             .add(
-                egui::Slider::new(&mut capture_gain, 0.0..=10.0)
+                egui::Slider::new(&mut gain, 0.0..=10.0)
                     .text("Capture gain")
                     .logarithmic(true),
             )
             .changed()
         {
-            if using_stream {
-                self.settings.tx_stream_gain = capture_gain;
-                #[cfg(not(target_arch = "wasm32"))]
-                if let Some(stream) = &self.tx_stream {
-                    stream.set_gain(capture_gain);
-                }
+            if use_stream {
+                self.settings.tx_stream_gain = gain;
             } else {
-                self.settings.mic_gain = capture_gain;
-                if let Some(mic) = &self.mic {
-                    mic.set_gain(capture_gain);
-                }
+                self.settings.mic_gain = gain;
+            }
+            if let Some(input) = &self.tx_input {
+                input.set_gain(gain);
             }
             save_settings(&self.settings);
         }
-        if !self.mic_status.is_empty() {
-            ui.label(egui::RichText::new(&self.mic_status).small().weak());
+
+        if !self.tx_input_status.is_empty() {
+            ui.label(egui::RichText::new(&self.tx_input_status).small().weak());
         }
     }
 
@@ -4249,9 +4193,7 @@ impl ScuApp {
         let mut auto_connect = self.settings.auto_connect;
         if ui
             .checkbox(&mut auto_connect, "Connect automatically on start")
-            .on_hover_text(
-                "Open a session on launch, and reconnect with backoff if it drops",
-            )
+            .on_hover_text("Open a session on launch, and reconnect with backoff if it drops")
             .changed()
         {
             self.settings.auto_connect = auto_connect;
