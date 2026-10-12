@@ -171,6 +171,17 @@ ${ICON_KEY}
 </plist>
 EOF
 
+# Sign the assembled bundle so TCC (microphone / local-network) can persist the
+# user's grant. An unsigned bundle keeps its linker-only ad-hoc signature, the
+# Info.plist stays unbound and macOS re-prompts on every launch (infinite loop).
+# Override with CODESIGN_IDENTITY <id> to use a Developer ID; default is ad-hoc.
+CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
+if ! codesign --force --deep --sign "$CODESIGN_IDENTITY" "$BUNDLE"; then
+  echo "error: codesign failed for identity '$CODESIGN_IDENTITY'." >&2
+  echo "  set CODESIGN_IDENTITY to a Developer ID, or omit it for ad-hoc." >&2
+  exit 1
+fi
+
 APP_BUNDLE="$OUT_DIR/$APP_NAME.app"
 if [ "$APP_ONLY" = 1 ]; then
   mv "$BUNDLE" "$APP_BUNDLE"
