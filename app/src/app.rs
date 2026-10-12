@@ -29,6 +29,7 @@ use crate::meter::{scale_for, LinearMeter};
 use crate::shortcuts;
 use crate::theme;
 use crate::waterfall::Waterfall;
+use crate::widgets;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::cat_server::CatServerState;
@@ -1081,27 +1082,24 @@ impl ScuApp {
             .color(theme::text_faint()),
         );
 
-        let mut threshold = self.settings.vox_threshold;
-        if ui
-            .add(egui::Slider::new(&mut threshold, 0..=32767).text("Threshold"))
-            .changed()
-        {
-            self.settings.vox_threshold = threshold;
+        let mut threshold = self.settings.vox_threshold as i32;
+        let response = ui.add(egui::Slider::new(&mut threshold, 0..=32767).text("Threshold"));
+        let wheeled = widgets::scroll_value(ui, &response, &mut threshold, 100, 0, 32767);
+        if response.changed() || wheeled {
+            self.settings.vox_threshold = threshold as u16;
             save_settings(&self.settings);
         }
         let mut attack = self.settings.vox_attack_ms as i32;
-        if ui
-            .add(egui::Slider::new(&mut attack, 0..=1000).text("Attack (ms)"))
-            .changed()
-        {
+        let response = ui.add(egui::Slider::new(&mut attack, 0..=1000).text("Attack (ms)"));
+        let wheeled = widgets::scroll_value(ui, &response, &mut attack, 10, 0, 1000);
+        if response.changed() || wheeled {
             self.settings.vox_attack_ms = attack as u32;
             save_settings(&self.settings);
         }
         let mut hang = self.settings.vox_hang_ms as i32;
-        if ui
-            .add(egui::Slider::new(&mut hang, 0..=3000).text("Hang (ms)"))
-            .changed()
-        {
+        let response = ui.add(egui::Slider::new(&mut hang, 0..=3000).text("Hang (ms)"));
+        let wheeled = widgets::scroll_value(ui, &response, &mut hang, 10, 0, 3000);
+        if response.changed() || wheeled {
             self.settings.vox_hang_ms = hang as u32;
             save_settings(&self.settings);
         }
@@ -3311,16 +3309,30 @@ impl ScuApp {
                     // directly, so the inactive VFO can be changed too.
                     let current = self.mode[sub as usize];
                     let mut selected = current;
-                    ui.add_enabled_ui(self.handle.is_some(), |ui| {
-                        egui::ComboBox::from_id_salt(("vfo-mode", idx))
-                            .selected_text(current.map(|m| m.label()).unwrap_or("--"))
-                            .width(92.0)
-                            .show_ui(ui, |ui| {
-                                for mode in Mode::ALL {
-                                    ui.selectable_value(&mut selected, Some(mode), mode.label());
-                                }
-                            });
-                    });
+                    let response = ui
+                        .add_enabled_ui(self.handle.is_some(), |ui| {
+                            egui::ComboBox::from_id_salt(("vfo-mode", idx))
+                                .selected_text(current.map(|m| m.label()).unwrap_or("--"))
+                                .width(92.0)
+                                .show_ui(ui, |ui| {
+                                    for mode in Mode::ALL {
+                                        ui.selectable_value(
+                                            &mut selected,
+                                            Some(mode),
+                                            mode.label(),
+                                        );
+                                    }
+                                })
+                                .response
+                        })
+                        .inner;
+                    let index = selected
+                        .and_then(|mode| Mode::ALL.iter().position(|m| *m == mode))
+                        .unwrap_or(0);
+                    if let Some(next) = widgets::scroll_index(ui, &response, index, Mode::ALL.len())
+                    {
+                        selected = Some(Mode::ALL[next]);
+                    }
                     if selected != current {
                         if let Some(mode) = selected {
                             self.set_mode_for(sub, mode);
@@ -3476,14 +3488,22 @@ impl ScuApp {
                     .color(theme::text_faint()),
             );
             let mut step = self.settings.freq_step_hz;
-            egui::ComboBox::from_id_salt("freq-step")
+            let response = egui::ComboBox::from_id_salt("freq-step")
                 .selected_text(step_label(self.settings.freq_step_hz))
                 .width(88.0)
                 .show_ui(ui, |ui| {
                     for (value, label) in FREQ_STEPS {
                         ui.selectable_value(&mut step, value, label);
                     }
-                });
+                })
+                .response;
+            let index = FREQ_STEPS
+                .iter()
+                .position(|(value, _)| *value == step)
+                .unwrap_or(0);
+            if let Some(next) = widgets::scroll_index(ui, &response, index, FREQ_STEPS.len()) {
+                step = FREQ_STEPS[next].0;
+            }
             if step != self.settings.freq_step_hz {
                 self.settings.freq_step_hz = step;
                 save_settings(&self.settings);
@@ -3514,16 +3534,16 @@ impl ScuApp {
             }
         });
         let mut offset = self.clarifier_offset_hz;
-        if ui
+        let response = ui
             .add(
                 egui::Slider::new(&mut offset, -9990..=9990)
                     .step_by(10.0)
                     .text("Clarifier offset")
                     .suffix(" Hz"),
             )
-            .on_hover_text("One offset, shared by RIT and XIT")
-            .changed()
-        {
+            .on_hover_text("One offset, shared by RIT and XIT");
+        let wheeled = widgets::scroll_value(ui, &response, &mut offset, 10, -9990, 9990);
+        if response.changed() || wheeled {
             self.set_clarifier_offset(offset);
         }
     }
@@ -3537,13 +3557,19 @@ impl ScuApp {
         }
         let sub = self.rx_sub as usize;
         let mut nb_level = self.noise_blanker_level[sub] as i32;
-        if ui
-            .add(
-                egui::Slider::new(&mut nb_level, 1..=scu_cat::NOISE_BLANKER_LEVEL_MAX as i32)
-                    .text("NB level"),
-            )
-            .changed()
-        {
+        let response = ui.add(
+            egui::Slider::new(&mut nb_level, 1..=scu_cat::NOISE_BLANKER_LEVEL_MAX as i32)
+                .text("NB level"),
+        );
+        let wheeled = widgets::scroll_value(
+            ui,
+            &response,
+            &mut nb_level,
+            1,
+            1,
+            scu_cat::NOISE_BLANKER_LEVEL_MAX as i32,
+        );
+        if response.changed() || wheeled {
             self.set_noise_blanker_level(nb_level as u8);
         }
         let mut nr = self.noise_reduction;
@@ -3551,14 +3577,21 @@ impl ScuApp {
             self.set_noise_reduction(nr);
         }
         let mut nr_level = self.noise_reduction_level[sub] as i32;
-        if ui
+        let response = ui
             .add(
                 egui::Slider::new(&mut nr_level, 1..=scu_cat::NOISE_REDUCTION_LEVEL_MAX as i32)
                     .text("DNR level"),
             )
-            .on_hover_text("On the FTDX10 this selects the DNR algorithm (1-15)")
-            .changed()
-        {
+            .on_hover_text("On the FTDX10 this selects the DNR algorithm (1-15)");
+        let wheeled = widgets::scroll_value(
+            ui,
+            &response,
+            &mut nr_level,
+            1,
+            1,
+            scu_cat::NOISE_REDUCTION_LEVEL_MAX as i32,
+        );
+        if response.changed() || wheeled {
             self.set_noise_reduction_level(nr_level as u8);
         }
         let mut notch = self.auto_notch;
@@ -3576,7 +3609,7 @@ impl ScuApp {
         theme::section(ui, "Receiver");
         let current_agc = self.agc;
         let mut selected_agc = current_agc;
-        egui::ComboBox::from_id_salt("agc")
+        let response = egui::ComboBox::from_id_salt("agc")
             .selected_text(format!(
                 "AGC {}",
                 current_agc.map(|a| a.label()).unwrap_or("--")
@@ -3585,7 +3618,14 @@ impl ScuApp {
                 for agc in Agc::ALL {
                     ui.selectable_value(&mut selected_agc, Some(agc), agc.label());
                 }
-            });
+            })
+            .response;
+        let index = selected_agc
+            .and_then(|agc| Agc::ALL.iter().position(|a| *a == agc))
+            .unwrap_or(0);
+        if let Some(next) = widgets::scroll_index(ui, &response, index, Agc::ALL.len()) {
+            selected_agc = Some(Agc::ALL[next]);
+        }
         if selected_agc != current_agc {
             if let Some(agc) = selected_agc {
                 self.set_agc(agc);
@@ -3593,7 +3633,7 @@ impl ScuApp {
         }
         let current_preamp = self.preamp;
         let mut selected_preamp = current_preamp;
-        egui::ComboBox::from_id_salt("preamp")
+        let response = egui::ComboBox::from_id_salt("preamp")
             .selected_text(format!(
                 "Preamp {}",
                 current_preamp.map(|p| p.label()).unwrap_or("--")
@@ -3602,7 +3642,14 @@ impl ScuApp {
                 for preamp in Preamp::ALL {
                     ui.selectable_value(&mut selected_preamp, Some(preamp), preamp.label());
                 }
-            });
+            })
+            .response;
+        let index = selected_preamp
+            .and_then(|preamp| Preamp::ALL.iter().position(|p| *p == preamp))
+            .unwrap_or(0);
+        if let Some(next) = widgets::scroll_index(ui, &response, index, Preamp::ALL.len()) {
+            selected_preamp = Some(Preamp::ALL[next]);
+        }
         if selected_preamp != current_preamp {
             if let Some(preamp) = selected_preamp {
                 self.set_preamp(preamp);
@@ -3615,7 +3662,7 @@ impl ScuApp {
             format!("{} dB", scu_cat::ATTENUATOR_STEPS_DB[current_att as usize])
         };
         let mut selected_att = current_att;
-        egui::ComboBox::from_id_salt("attenuator")
+        let response = egui::ComboBox::from_id_salt("attenuator")
             .selected_text(format!("ATT {att_label}"))
             .show_ui(ui, |ui| {
                 for (code, db) in scu_cat::ATTENUATOR_STEPS_DB.iter().enumerate() {
@@ -3626,22 +3673,45 @@ impl ScuApp {
                     };
                     ui.selectable_value(&mut selected_att, code as u8, label);
                 }
-            });
+            })
+            .response;
+        if let Some(next) = widgets::scroll_index(
+            ui,
+            &response,
+            current_att as usize,
+            scu_cat::ATTENUATOR_STEPS_DB.len(),
+        ) {
+            selected_att = next as u8;
+        }
         if selected_att != current_att {
             self.set_attenuator(selected_att);
         }
         let mut rf_gain = self.rf_gain as i32;
-        if ui
-            .add(egui::Slider::new(&mut rf_gain, 0..=scu_cat::RF_GAIN_MAX as i32).text("RF gain"))
-            .changed()
-        {
+        let response = ui
+            .add(egui::Slider::new(&mut rf_gain, 0..=scu_cat::RF_GAIN_MAX as i32).text("RF gain"));
+        let wheeled = widgets::scroll_value(
+            ui,
+            &response,
+            &mut rf_gain,
+            1,
+            0,
+            scu_cat::RF_GAIN_MAX as i32,
+        );
+        if response.changed() || wheeled {
             self.set_rf_gain(rf_gain as u8);
         }
         let mut squelch = self.squelch as i32;
-        if ui
-            .add(egui::Slider::new(&mut squelch, 0..=scu_cat::SQUELCH_MAX as i32).text("Squelch"))
-            .changed()
-        {
+        let response = ui
+            .add(egui::Slider::new(&mut squelch, 0..=scu_cat::SQUELCH_MAX as i32).text("Squelch"));
+        let wheeled = widgets::scroll_value(
+            ui,
+            &response,
+            &mut squelch,
+            1,
+            0,
+            scu_cat::SQUELCH_MAX as i32,
+        );
+        if response.changed() || wheeled {
             self.set_squelch(squelch as u8);
         }
 
@@ -3650,13 +3720,22 @@ impl ScuApp {
         let mut selected_roofing = current_roofing;
         ui.horizontal(|ui| {
             ui.label("Roofing filter");
-            egui::ComboBox::from_id_salt("roofing-filter")
+            let response = egui::ComboBox::from_id_salt("roofing-filter")
                 .selected_text(current_roofing.map(|f| f.label()).unwrap_or("--"))
                 .show_ui(ui, |ui| {
                     for filter in RoofingFilter::ALL {
                         ui.selectable_value(&mut selected_roofing, Some(filter), filter.label());
                     }
-                });
+                })
+                .response;
+            let index = selected_roofing
+                .and_then(|filter| RoofingFilter::ALL.iter().position(|f| *f == filter))
+                .unwrap_or(0);
+            if let Some(next) =
+                widgets::scroll_index(ui, &response, index, RoofingFilter::ALL.len())
+            {
+                selected_roofing = Some(RoofingFilter::ALL[next]);
+            }
         });
         if selected_roofing != current_roofing {
             if let Some(filter) = selected_roofing {
@@ -3679,7 +3758,7 @@ impl ScuApp {
             match &options {
                 Some(options) => {
                     let mut choice = selection;
-                    egui::ComboBox::from_id_salt("if-width")
+                    let response = egui::ComboBox::from_id_salt("if-width")
                         .selected_text(width_label.clone())
                         .show_ui(ui, |ui| {
                             for (code, hz) in options {
@@ -3692,7 +3771,15 @@ impl ScuApp {
                                 };
                                 ui.selectable_value(&mut choice, *code, label);
                             }
-                        });
+                        })
+                        .response;
+                    let index = options
+                        .iter()
+                        .position(|(code, _)| *code == choice)
+                        .unwrap_or(0);
+                    if let Some(next) = widgets::scroll_index(ui, &response, index, options.len()) {
+                        choice = options[next].0;
+                    }
                     if choice != selection {
                         self.set_if_width(choice);
                     }
@@ -3709,18 +3796,24 @@ impl ScuApp {
 
         let current_shift = self.active_if_shift_hz();
         let mut shift = current_shift;
-        if ui
-            .add(
-                egui::Slider::new(
-                    &mut shift,
-                    scu_cat::IF_SHIFT_MIN_HZ..=scu_cat::IF_SHIFT_MAX_HZ,
-                )
-                .step_by(scu_cat::IF_SHIFT_STEP_HZ as f64)
-                .text("IF shift")
-                .suffix(" Hz"),
+        let response = ui.add(
+            egui::Slider::new(
+                &mut shift,
+                scu_cat::IF_SHIFT_MIN_HZ..=scu_cat::IF_SHIFT_MAX_HZ,
             )
-            .changed()
-        {
+            .step_by(scu_cat::IF_SHIFT_STEP_HZ as f64)
+            .text("IF shift")
+            .suffix(" Hz"),
+        );
+        let wheeled = widgets::scroll_value(
+            ui,
+            &response,
+            &mut shift,
+            scu_cat::IF_SHIFT_STEP_HZ,
+            scu_cat::IF_SHIFT_MIN_HZ,
+            scu_cat::IF_SHIFT_MAX_HZ,
+        );
+        if response.changed() || wheeled {
             let next = scu_cat::clamp_if_shift_hz(shift);
             if next != current_shift {
                 self.set_if_shift_hz(next);
@@ -3787,7 +3880,7 @@ impl ScuApp {
         let mut selected_span: Option<usize> = None;
         ui.horizontal(|ui| {
             ui.label("Span");
-            egui::ComboBox::from_id_salt("span")
+            let response = egui::ComboBox::from_id_salt("span")
                 .selected_text(span_label(self.span_hz))
                 .show_ui(ui, |ui| {
                     for (index, span) in scu_cat::SCOPE_SPANS_HZ.iter().enumerate() {
@@ -3796,7 +3889,14 @@ impl ScuApp {
                             selected_span = Some(index);
                         }
                     }
-                });
+                })
+                .response;
+            let index = self.span_index().unwrap_or(7);
+            if let Some(next) =
+                widgets::scroll_index(ui, &response, index, scu_cat::SCOPE_SPANS_HZ.len())
+            {
+                selected_span = Some(next);
+            }
         });
         if let Some(index) = selected_span {
             self.set_span(index);
@@ -3836,30 +3936,45 @@ impl ScuApp {
         ui.horizontal(|ui| {
             ui.label("Colormap");
             let mut colormap = self.waterfall.colormap;
-            egui::ComboBox::from_id_salt("colormap")
+            let response = egui::ComboBox::from_id_salt("colormap")
                 .selected_text(colormap.label())
                 .show_ui(ui, |ui| {
                     for map in Colormap::ALL {
                         ui.selectable_value(&mut colormap, map, map.label());
                     }
-                });
+                })
+                .response;
+            let index = Colormap::ALL
+                .iter()
+                .position(|map| *map == colormap)
+                .unwrap_or(0);
+            if let Some(next) = widgets::scroll_index(ui, &response, index, Colormap::ALL.len()) {
+                colormap = Colormap::ALL[next];
+            }
             if colormap != self.waterfall.colormap {
                 self.waterfall.colormap = colormap;
                 self.settings.waterfall_colormap = colormap;
                 save_settings(&self.settings);
             }
         });
-        if ui
-            .add(egui::Slider::new(&mut self.waterfall.black_level, 0.0..=0.9).text("Black"))
-            .changed()
-        {
+        let response =
+            ui.add(egui::Slider::new(&mut self.waterfall.black_level, 0.0..=0.9).text("Black"));
+        let wheeled = widgets::scroll_value(
+            ui,
+            &response,
+            &mut self.waterfall.black_level,
+            0.02,
+            0.0,
+            0.9,
+        );
+        if response.changed() || wheeled {
             self.settings.waterfall_black_level = self.waterfall.black_level;
             save_settings(&self.settings);
         }
-        if ui
-            .add(egui::Slider::new(&mut self.waterfall.gain, 0.2..=4.0).text("Gain"))
-            .changed()
-        {
+        let response = ui.add(egui::Slider::new(&mut self.waterfall.gain, 0.2..=4.0).text("Gain"));
+        let wheeled =
+            widgets::scroll_value(ui, &response, &mut self.waterfall.gain, 0.05, 0.2, 4.0);
+        if response.changed() || wheeled {
             self.settings.waterfall_gain = self.waterfall.gain;
             save_settings(&self.settings);
         }
@@ -3877,10 +3992,11 @@ impl ScuApp {
             self.sync_audio_enabled();
             save_settings(&self.settings);
         }
-        if ui
-            .add(egui::Slider::new(&mut self.settings.volume, 0.0..=1.5).text("Volume"))
-            .changed()
-        {
+        let response =
+            ui.add(egui::Slider::new(&mut self.settings.volume, 0.0..=1.5).text("Volume"));
+        let wheeled =
+            widgets::scroll_value(ui, &response, &mut self.settings.volume, 0.02, 0.0, 1.5);
+        if response.changed() || wheeled {
             if let Some(audio) = &self.audio {
                 audio.set_volume(self.settings.volume);
             }
@@ -3911,17 +4027,23 @@ impl ScuApp {
     fn pane_transmit(&mut self, ui: &mut egui::Ui) {
         theme::section(ui, "Transmit");
         let mut power = self.tx_power as i32;
-        if ui
-            .add(
-                egui::Slider::new(
-                    &mut power,
-                    scu_cat::POWER_MIN_W as i32..=scu_cat::POWER_MAX_W as i32,
-                )
-                .text("TX power")
-                .suffix(" W"),
+        let response = ui.add(
+            egui::Slider::new(
+                &mut power,
+                scu_cat::POWER_MIN_W as i32..=scu_cat::POWER_MAX_W as i32,
             )
-            .changed()
-        {
+            .text("TX power")
+            .suffix(" W"),
+        );
+        let wheeled = widgets::scroll_value(
+            ui,
+            &response,
+            &mut power,
+            1,
+            scu_cat::POWER_MIN_W as i32,
+            scu_cat::POWER_MAX_W as i32,
+        );
+        if response.changed() || wheeled {
             self.tx_power = power as u16;
             if let Some(handle) = &self.handle {
                 handle.send_cat(&scu_cat::set_power(self.tx_power));
@@ -3929,14 +4051,20 @@ impl ScuApp {
         }
 
         let mut mic_gain = self.radio_mic_gain as i32;
-        if ui
-            .add(
-                egui::Slider::new(&mut mic_gain, 0..=scu_cat::MIC_GAIN_MAX as i32)
-                    .text("Mic gain")
-                    .suffix(" %"),
-            )
-            .changed()
-        {
+        let response = ui.add(
+            egui::Slider::new(&mut mic_gain, 0..=scu_cat::MIC_GAIN_MAX as i32)
+                .text("Mic gain")
+                .suffix(" %"),
+        );
+        let wheeled = widgets::scroll_value(
+            ui,
+            &response,
+            &mut mic_gain,
+            1,
+            0,
+            scu_cat::MIC_GAIN_MAX as i32,
+        );
+        if response.changed() || wheeled {
             self.radio_mic_gain = mic_gain as u8;
             if let Some(handle) = &self.handle {
                 handle.send_cat(&scu_cat::set_mic_gain(self.radio_mic_gain));
@@ -3994,14 +4122,13 @@ impl ScuApp {
         } else {
             self.settings.mic_gain
         };
-        if ui
-            .add(
-                egui::Slider::new(&mut gain, 0.0..=10.0)
-                    .text("Capture gain")
-                    .logarithmic(true),
-            )
-            .changed()
-        {
+        let response = ui.add(
+            egui::Slider::new(&mut gain, 0.0..=10.0)
+                .text("Capture gain")
+                .logarithmic(true),
+        );
+        let wheeled = widgets::scroll_value(ui, &response, &mut gain, 0.1, 0.0, 10.0);
+        if response.changed() || wheeled {
             if use_stream {
                 self.settings.tx_stream_gain = gain;
             } else {
@@ -4518,14 +4645,22 @@ impl ScuApp {
     fn settings_logging(&mut self, ui: &mut egui::Ui) {
         theme::section(ui, "Console log level");
         let before = self.settings.log_level;
-        egui::ComboBox::from_id_salt("log-level")
+        let response = egui::ComboBox::from_id_salt("log-level")
             .selected_text(self.settings.log_level.label())
             .width(160.0)
             .show_ui(ui, |ui| {
                 for level in LogLevel::ALL {
                     ui.selectable_value(&mut self.settings.log_level, level, level.label());
                 }
-            });
+            })
+            .response;
+        let index = LogLevel::ALL
+            .iter()
+            .position(|level| *level == self.settings.log_level)
+            .unwrap_or(0);
+        if let Some(next) = widgets::scroll_index(ui, &response, index, LogLevel::ALL.len()) {
+            self.settings.log_level = LogLevel::ALL[next];
+        }
         if self.settings.log_level != before {
             crate::logging::set_level(self.settings.log_level.filter());
             save_settings(&self.settings);
@@ -5666,6 +5801,11 @@ fn device_combo(
     current: &Option<String>,
 ) -> Option<Option<String>> {
     let mut choice = None;
+    let current_index = current
+        .as_ref()
+        .and_then(|name| devices.iter().position(|device| device == name))
+        .map(|index| index + 1)
+        .unwrap_or(0);
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new(label)
@@ -5675,7 +5815,7 @@ fn device_combo(
         let text = current
             .clone()
             .unwrap_or_else(|| "System default".to_string());
-        egui::ComboBox::from_id_salt(id)
+        let response = egui::ComboBox::from_id_salt(id)
             .selected_text(text)
             .show_ui(ui, |ui| {
                 if ui
@@ -5690,7 +5830,15 @@ fn device_combo(
                         choice = Some(Some(name.clone()));
                     }
                 }
+            })
+            .response;
+        if let Some(next) = widgets::scroll_index(ui, &response, current_index, devices.len() + 1) {
+            choice = Some(if next == 0 {
+                None
+            } else {
+                Some(devices[next - 1].clone())
             });
+        }
     });
     choice
 }

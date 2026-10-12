@@ -12,6 +12,7 @@ mod paths;
 mod shortcuts;
 mod theme;
 mod waterfall;
+mod widgets;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
