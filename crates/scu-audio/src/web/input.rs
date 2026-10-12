@@ -149,7 +149,7 @@ impl MicInput {
     pub fn new(config: MicConfig, sink: TxAudioSink) -> Result<Self, InputError> {
         let shared = Arc::new(Shared {
             enabled: AtomicBool::new(false),
-            gain_bits: AtomicU32::new(config.gain.clamp(0.0, 4.0).to_bits()),
+            gain_bits: AtomicU32::new(config.gain.clamp(0.0, 16.0).to_bits()),
             seq: AtomicU8::new(0),
             in_rate: AtomicU32::new(48_000),
             resampler: Mutex::new(None),
@@ -191,7 +191,7 @@ impl MicInput {
     pub fn set_gain(&self, gain: f32) {
         self.shared
             .gain_bits
-            .store(gain.clamp(0.0, 4.0).to_bits(), Ordering::Relaxed);
+            .store(gain.clamp(0.0, 16.0).to_bits(), Ordering::Relaxed);
     }
 
     pub fn gain(&self) -> f32 {

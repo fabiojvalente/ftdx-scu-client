@@ -76,6 +76,9 @@ pub struct AppSettings {
     pub tx_stream_enabled: bool,
     #[serde(default)]
     pub tx_stream_device: Option<String>,
+    /// Capture gain applied to the streaming (loopback) TX device.
+    #[serde(default = "default_mic_capture_gain")]
+    pub tx_stream_gain: f32,
     /// Voice-operated transmit.
     #[serde(default)]
     pub vox_enabled: bool,
@@ -165,6 +168,9 @@ pub struct AppSettings {
     /// (`"alt+KeyP"`, `"F13"`, ...). `None` disables it.
     #[serde(default)]
     pub ptt_hotkey: Option<String>,
+    /// Connect to the radio automatically when the app starts.
+    #[serde(default)]
+    pub auto_connect: bool,
 }
 
 impl Default for AppSettings {
@@ -179,6 +185,7 @@ impl Default for AppSettings {
             rx_stream_device: None,
             tx_stream_enabled: false,
             tx_stream_device: None,
+            tx_stream_gain: default_mic_capture_gain(),
             vox_enabled: false,
             vox_threshold: default_vox_threshold(),
             vox_attack_ms: default_vox_attack(),
@@ -209,6 +216,7 @@ impl Default for AppSettings {
             antenna_ports: default_antenna_ports(),
             antenna_poll_secs: default_antenna_poll_secs(),
             ptt_hotkey: None,
+            auto_connect: false,
         }
     }
 }
@@ -312,6 +320,12 @@ fn scope_axis_span_hz(reported_span_hz: f64) -> f64 {
 /// both the spectrum and the waterfall are visible.
 const SPECTRUM_SHARE: f32 = 0.38;
 
+/// Base delay before the first automatic reconnect attempt.
+const RECONNECT_BASE_DELAY_SECS: u64 = 1;
+
+/// Maximum delay between automatic reconnect attempts.
+const RECONNECT_MAX_DELAY_SECS: u64 = 30;
+
 /// Console log verbosity, applied live to the tracing subscriber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum LogLevel {
@@ -359,6 +373,7 @@ impl LogLevel {
 enum SettingsTab {
     #[default]
     Appearance,
+    Connection,
     Meters,
     Antenna,
     Keys,
@@ -368,8 +383,9 @@ enum SettingsTab {
 }
 
 impl SettingsTab {
-    const ALL: [SettingsTab; 7] = [
+    const ALL: [SettingsTab; 8] = [
         SettingsTab::Appearance,
+        SettingsTab::Connection,
         SettingsTab::Meters,
         SettingsTab::Antenna,
         SettingsTab::Keys,
@@ -381,6 +397,7 @@ impl SettingsTab {
     fn label(self) -> &'static str {
         match self {
             SettingsTab::Appearance => "Appearance",
+            SettingsTab::Connection => "Connection",
             SettingsTab::Meters => "Meters",
             SettingsTab::Antenna => "Antenna",
             SettingsTab::Keys => "Keys",
@@ -399,6 +416,12 @@ pub struct ScuApp {
     engine_rx: Option<std::sync::mpsc::Receiver<EngineMsg>>,
     shutdown: Option<Arc<AtomicBool>>,
     connecting: bool,
+    /// Set after the first frame so one-shot start-up actions run exactly once.
+    started: bool,
+    /// When to attempt the next automatic reconnect, if one is scheduled.
+    reconnect_at: Option<Instant>,
+    /// Consecutive automatic reconnect attempts, used for exponential backoff.
+    reconnect_attempt: u32,
 
     status: String,
     radio: Option<RadioModel>,
@@ -629,6 +652,9 @@ impl ScuApp {
             engine_rx: None,
             shutdown: None,
             connecting: false,
+            started: false,
+            reconnect_at: None,
+            reconnect_attempt: 0,
             status: "disconnected".into(),
             radio: None,
             radio_power: None,
@@ -737,6 +763,7 @@ impl ScuApp {
         if self.connecting || self.engine_rx.is_some() {
             return;
         }
+        self.reconnect_at = None;
         save_config(&self.config);
         self.ensure_audio();
         self.sync_audio_sinks();
@@ -756,13 +783,34 @@ impl ScuApp {
             self.engine_rx = None;
             self.shutdown = None;
             self.status = "failed to start engine".into();
+            self.schedule_reconnect();
         }
+    }
+
+    /// Schedule the next automatic reconnect, backing off exponentially.
+    /// No-op unless the user enabled auto-connect or a retry is already queued.
+    fn schedule_reconnect(&mut self) {
+        if !self.settings.auto_connect || self.reconnect_at.is_some() {
+            return;
+        }
+        let exp = self.reconnect_attempt.min(5);
+        let secs = (RECONNECT_BASE_DELAY_SECS << exp).min(RECONNECT_MAX_DELAY_SECS);
+        self.reconnect_attempt = self.reconnect_attempt.saturating_add(1);
+        self.reconnect_at = Some(Instant::now() + Duration::from_secs(secs));
+        self.status = format!("reconnecting in {secs}s");
+    }
+
+    /// Cancel any scheduled reconnect and reset the backoff counter.
+    fn clear_reconnect(&mut self) {
+        self.reconnect_at = None;
+        self.reconnect_attempt = 0;
     }
 
     fn disconnect(&mut self) {
         if let Some(flag) = &self.shutdown {
             flag.store(true, Ordering::Relaxed);
         }
+        self.clear_reconnect();
         self.stop_tx();
         self.shutdown = None;
         self.engine_rx = None;
@@ -1154,7 +1202,7 @@ impl ScuApp {
         let sink: TxAudioSink = Box::new(move |body: &[u8]| handle.send_tx_audio(body));
         let config = MicConfig {
             device: self.settings.tx_stream_device.clone(),
-            gain: 1.0,
+            gain: self.settings.tx_stream_gain,
         };
         match MicInput::new(config, sink) {
             Ok(mic) => {
@@ -1333,6 +1381,7 @@ impl ScuApp {
                 }
                 self.handle = Some(handle);
                 self.connecting = false;
+                self.clear_reconnect();
                 self.scope_centered_sent = false;
                 self.meters = [None; 10];
                 self.meter_peak = [0.0; 10];
@@ -1348,6 +1397,7 @@ impl ScuApp {
                 self.stop_tx();
                 self.status = format!("connect failed: {error}");
                 self.sync_cat_server();
+                self.schedule_reconnect();
             }
             EngineMsg::Stopped => {
                 self.connecting = false;
@@ -1359,6 +1409,7 @@ impl ScuApp {
                 self.handle = None;
                 self.stop_tx();
                 self.sync_cat_server();
+                self.schedule_reconnect();
             }
         }
     }
@@ -1400,6 +1451,7 @@ impl ScuApp {
                 self.radio_tx = false;
                 self.stop_tx();
                 self.sync_cat_server();
+                self.schedule_reconnect();
             }
         }
     }
@@ -2661,6 +2713,7 @@ impl ScuApp {
                         .clicked()
                     {
                         let ctx = ui.ctx().clone();
+                        self.clear_reconnect();
                         self.connect(ctx);
                     }
 
@@ -3985,12 +4038,34 @@ impl ScuApp {
                 }
             }
         });
+        #[cfg(target_arch = "wasm32")]
+        let using_stream = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        let using_stream = self.settings.tx_stream_enabled;
+        let mut capture_gain = if using_stream {
+            self.settings.tx_stream_gain
+        } else {
+            self.settings.mic_gain
+        };
         if ui
-            .add(egui::Slider::new(&mut self.settings.mic_gain, 0.0..=3.0).text("Capture gain"))
+            .add(
+                egui::Slider::new(&mut capture_gain, 0.0..=10.0)
+                    .text("Capture gain")
+                    .logarithmic(true),
+            )
             .changed()
         {
-            if let Some(mic) = &self.mic {
-                mic.set_gain(self.settings.mic_gain);
+            if using_stream {
+                self.settings.tx_stream_gain = capture_gain;
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(stream) = &self.tx_stream {
+                    stream.set_gain(capture_gain);
+                }
+            } else {
+                self.settings.mic_gain = capture_gain;
+                if let Some(mic) = &self.mic {
+                    mic.set_gain(capture_gain);
+                }
             }
             save_settings(&self.settings);
         }
@@ -4107,6 +4182,7 @@ impl ScuApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| match self.settings_tab {
                         SettingsTab::Appearance => self.settings_appearance(ui),
+                        SettingsTab::Connection => self.settings_connection(ui),
                         SettingsTab::Meters => self.settings_meters(ui),
                         SettingsTab::Antenna => self.settings_antenna(ui),
                         SettingsTab::Keys => self.settings_keys(ui),
@@ -4165,6 +4241,30 @@ impl ScuApp {
             self.settings.large_targets = large_targets;
             save_settings(&self.settings);
         }
+    }
+
+    /// Connection tab: session start-up and reconnect behaviour.
+    fn settings_connection(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "Startup");
+        let mut auto_connect = self.settings.auto_connect;
+        if ui
+            .checkbox(&mut auto_connect, "Connect automatically on start")
+            .on_hover_text(
+                "Open a session on launch, and reconnect with backoff if it drops",
+            )
+            .changed()
+        {
+            self.settings.auto_connect = auto_connect;
+            if !auto_connect {
+                self.clear_reconnect();
+            }
+            save_settings(&self.settings);
+        }
+        ui.label(
+            egui::RichText::new("The radio address is set in the connection bar at the top.")
+                .small()
+                .weak(),
+        );
     }
 
     /// Meters tab: which `RM` meters are shown.
@@ -4633,10 +4733,21 @@ impl ScuApp {
 impl eframe::App for ScuApp {
     /// Runs every frame, even when the window is hidden or unfocused, so the
     /// session keeps polling and the UI keeps receiving engine messages.
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.started {
+            self.started = true;
+            if self.settings.auto_connect {
+                self.connect(ctx.clone());
+            }
+        }
         self.drain_engine();
+        if let Some(at) = self.reconnect_at {
+            if !self.connecting && self.engine_rx.is_none() && Instant::now() >= at {
+                self.connect(ctx.clone());
+            }
+        }
         #[cfg(not(target_arch = "wasm32"))]
-        self.poll_antenna(_ctx);
+        self.poll_antenna(ctx);
         self.maybe_refresh_vfo();
         #[cfg(not(target_arch = "wasm32"))]
         self.cat_server

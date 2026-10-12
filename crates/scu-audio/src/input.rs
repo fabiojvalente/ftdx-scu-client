@@ -113,7 +113,7 @@ impl MicInput {
 
         let control = Arc::new(Control {
             enabled: AtomicBool::new(false),
-            gain_bits: AtomicU32::new(config.gain.clamp(0.0, 4.0).to_bits()),
+            gain_bits: AtomicU32::new(config.gain.clamp(0.0, 16.0).to_bits()),
             stop: AtomicBool::new(false),
             level: AtomicU16::new(0),
         });
@@ -172,7 +172,7 @@ impl MicInput {
     pub fn set_gain(&self, gain: f32) {
         self.control
             .gain_bits
-            .store(gain.clamp(0.0, 4.0).to_bits(), Ordering::Relaxed);
+            .store(gain.clamp(0.0, 16.0).to_bits(), Ordering::Relaxed);
     }
 
     pub fn gain(&self) -> f32 {
