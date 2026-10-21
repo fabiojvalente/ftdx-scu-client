@@ -20,7 +20,7 @@ pub const DEFAULT_ID: &str = "__default__";
 pub const DASHBOARD_ID: &str = "__dashboard__";
 
 /// Bumped when the on-disk layout shape changes so stale files fall back.
-const LAYOUT_VERSION: u32 = 1;
+const LAYOUT_VERSION: u32 = 2;
 
 /// Globally-unique id for the dock tree.
 pub const TREE_ID: &str = "scu-flex-tree";
@@ -42,7 +42,6 @@ pub enum Pane {
     Meters,
     Scope,
     Audio,
-    Transmit,
     CatConsole,
     CatServer,
     Vox,
@@ -56,7 +55,7 @@ pub enum Pane {
 
 impl Pane {
     /// Catalogue, in menu order.
-    pub const ALL: [Pane; 19] = [
+    pub const ALL: [Pane; 18] = [
         Pane::VfoA,
         Pane::VfoB,
         Pane::Operate,
@@ -71,7 +70,6 @@ impl Pane {
         Pane::Meters,
         Pane::Scope,
         Pane::Audio,
-        Pane::Transmit,
         Pane::CatConsole,
         Pane::CatServer,
         Pane::Vox,
@@ -94,7 +92,6 @@ impl Pane {
             Pane::Meters => "Meters",
             Pane::Scope => "Scope",
             Pane::Audio => "Audio",
-            Pane::Transmit => "Transmit",
             Pane::CatConsole => "CAT Console",
             Pane::CatServer => "Radio Server (CAT)",
             Pane::Vox => "VOX",
@@ -157,7 +154,6 @@ pub fn default_tree() -> Tree<Pane> {
         &mut t,
         &[
             Pane::Audio,
-            Pane::Transmit,
             Pane::CatConsole,
             Pane::CatServer,
             Pane::Vox,

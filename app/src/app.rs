@@ -107,9 +107,15 @@ pub struct AppSettings {
     /// Local playback volume (`0.0..=1.5`).
     #[serde(default = "default_volume")]
     pub volume: f32,
+    /// Show the radio microphone gain control in the Operate pane.
+    #[serde(default = "default_true")]
+    pub show_tx_mic_gain: bool,
     /// Silence local RX playback.
     #[serde(default)]
     pub muted: bool,
+    /// Local playback output device (`None` = system default).
+    #[serde(default)]
+    pub rx_device: Option<String>,
     /// Route channel 1 to the right output instead of duplicating to both.
     #[serde(default)]
     pub stereo: bool,
@@ -197,7 +203,9 @@ impl Default for AppSettings {
             large_targets: false,
             log_level: LogLevel::default(),
             volume: default_volume(),
+            show_tx_mic_gain: true,
             muted: false,
+            rx_device: None,
             stereo: false,
             mic_gain: default_mic_capture_gain(),
             mic_device: None,
@@ -585,7 +593,7 @@ pub struct ScuApp {
     #[cfg(not(target_arch = "wasm32"))]
     rx_stream: Option<AudioOutput>,
     #[cfg(not(target_arch = "wasm32"))]
-    rx_stream_devices: Vec<String>,
+    output_devices: Vec<String>,
     #[cfg(not(target_arch = "wasm32"))]
     vox: Vox,
     #[cfg(not(target_arch = "wasm32"))]
@@ -740,7 +748,7 @@ impl ScuApp {
             #[cfg(not(target_arch = "wasm32"))]
             rx_stream: None,
             #[cfg(not(target_arch = "wasm32"))]
-            rx_stream_devices: AudioOutput::devices(),
+            output_devices: AudioOutput::devices(),
             #[cfg(not(target_arch = "wasm32"))]
             vox: Vox::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -847,7 +855,7 @@ impl ScuApp {
         if self.audio.is_some() {
             return;
         }
-        match AudioOutput::new() {
+        match AudioOutput::with_device(self.settings.rx_device.clone()) {
             Ok(output) => {
                 output.set_volume(self.settings.volume);
                 output.set_enabled(!self.settings.muted && !self.tx_keyed());
@@ -858,6 +866,18 @@ impl ScuApp {
                 self.status = format!("audio unavailable: {e}");
             }
         }
+    }
+
+    /// Reopen local playback after the output device changes. Does nothing
+    /// before a session exists; `connect` opens it with the new setting.
+    fn reopen_rx_output(&mut self) {
+        if self.audio.is_none() && self.handle.is_none() {
+            return;
+        }
+        self.audio = None;
+        self.ensure_audio();
+        self.sync_audio_enabled();
+        self.sync_audio_sinks();
     }
 
     /// Rebuild the fan-out list the engine writes RX frames to: the local
@@ -1013,46 +1033,55 @@ impl ScuApp {
     /// software (WSJT-X, fldigi, …) can share the radio's audio.
     #[cfg(not(target_arch = "wasm32"))]
     fn ui_audio_streaming(&mut self, ui: &mut egui::Ui) {
-        theme::section(ui, "Audio Streaming");
-        ui.label(
-            egui::RichText::new(
-                "Bridge RX to a virtual device (BlackHole, Loopback, Common-Radio, VB-Cable).",
-            )
-            .small()
-            .color(theme::text_faint()),
-        );
+        egui::CollapsingHeader::new(
+            egui::RichText::new("AUDIO STREAMING")
+                .small()
+                .strong()
+                .color(theme::accent()),
+        )
+        .id_salt("audio-streaming")
+        .default_open(self.settings.rx_stream_enabled)
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "Bridge RX to a virtual device (BlackHole, Loopback, Common-Radio, VB-Cable).",
+                )
+                .small()
+                .color(theme::text_faint()),
+            );
 
-        // RX: radio -> loopback -> external app.
-        let mut rx_enabled = self.settings.rx_stream_enabled;
-        if ui
-            .checkbox(&mut rx_enabled, "Stream RX to a device")
-            .on_hover_text(
-                "Play decoded RX audio to a virtual device the external app records from",
-            )
-            .changed()
-        {
-            self.settings.rx_stream_enabled = rx_enabled;
-            save_settings(&self.settings);
-            self.sync_rx_stream();
-        }
-        if let Some(choice) = device_combo(
-            ui,
-            "rx-stream-device",
-            "Output",
-            &self.rx_stream_devices,
-            &self.settings.rx_stream_device,
-        ) {
-            self.settings.rx_stream_device = choice;
-            save_settings(&self.settings);
-            if self.settings.rx_stream_enabled {
+            // RX: radio -> loopback -> external app.
+            let mut rx_enabled = self.settings.rx_stream_enabled;
+            if ui
+                .checkbox(&mut rx_enabled, "Stream RX to a device")
+                .on_hover_text(
+                    "Play decoded RX audio to a virtual device the external app records from",
+                )
+                .changed()
+            {
+                self.settings.rx_stream_enabled = rx_enabled;
+                save_settings(&self.settings);
                 self.sync_rx_stream();
             }
-        }
+            if let Some(choice) = device_combo(
+                ui,
+                "rx-stream-device",
+                "Loopback device",
+                &self.output_devices,
+                &self.settings.rx_stream_device,
+            ) {
+                self.settings.rx_stream_device = choice;
+                save_settings(&self.settings);
+                if self.settings.rx_stream_enabled {
+                    self.sync_rx_stream();
+                }
+            }
 
-        if ui.button("Rescan audio devices").clicked() {
-            self.rx_stream_devices = AudioOutput::devices();
-            self.tx_input_devices = MicInput::devices();
-        }
+            if ui.button("Rescan audio devices").clicked() {
+                self.output_devices = AudioOutput::devices();
+                self.tx_input_devices = MicInput::devices();
+            }
+        });
     }
 
     /// Side-rail section for voice-operated transmit.
@@ -1330,7 +1359,7 @@ impl ScuApp {
                 self.ensure_tx_input(handle.clone());
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    self.rx_stream_devices = AudioOutput::devices();
+                    self.output_devices = AudioOutput::devices();
                     self.sync_rx_stream();
                 }
                 self.handle = Some(handle);
@@ -2742,6 +2771,12 @@ impl ScuApp {
             ui.add_space(6.0);
             ui.vertical(|ui| self.quick_toggles(ui));
         });
+        ui.add_space(6.0);
+        self.ui_tx_power(ui);
+        if self.settings.show_tx_mic_gain {
+            ui.add_space(6.0);
+            self.ui_radio_mic_gain(ui);
+        }
         self.ptt_held = ptt_held;
     }
 
@@ -3045,7 +3080,6 @@ impl ScuApp {
             Pane::Meters => self.pane_meters(ui),
             Pane::Scope => self.pane_scope(ui),
             Pane::Audio => self.pane_audio(ui),
-            Pane::Transmit => self.pane_transmit(ui),
             Pane::CatConsole => self.pane_cat_console(ui),
             Pane::CatServer => {
                 #[cfg(not(target_arch = "wasm32"))]
@@ -4001,25 +4035,41 @@ impl ScuApp {
         }
     }
 
-    /// Audio pane: mute, volume and stereo.
+    /// Audio pane: every audio path in one place, split by direction.
     fn pane_audio(&mut self, ui: &mut egui::Ui) {
-        theme::section(ui, "Audio");
-        let mut muted = self.settings.muted;
-        if ui.checkbox(&mut muted, "Mute").changed() {
-            self.settings.muted = muted;
-            self.sync_audio_enabled();
-            save_settings(&self.settings);
-        }
-        let response =
-            ui.add(egui::Slider::new(&mut self.settings.volume, 0.0..=1.5).text("Volume"));
-        let wheeled =
-            widgets::scroll_value(ui, &response, &mut self.settings.volume, 0.02, 0.0, 1.5);
-        if response.changed() || wheeled {
-            if let Some(audio) = &self.audio {
-                audio.set_volume(self.settings.volume);
+        theme::section(ui, "Reception");
+        ui.horizontal(|ui| {
+            let mut muted = self.settings.muted;
+            if ui.checkbox(&mut muted, "Mute").changed() {
+                self.settings.muted = muted;
+                self.sync_audio_enabled();
+                save_settings(&self.settings);
             }
+            let response =
+                ui.add(egui::Slider::new(&mut self.settings.volume, 0.0..=1.5).text("Volume"));
+            let wheeled =
+                widgets::scroll_value(ui, &response, &mut self.settings.volume, 0.02, 0.0, 1.5);
+            if response.changed() || wheeled {
+                if let Some(audio) = &self.audio {
+                    audio.set_volume(self.settings.volume);
+                }
+                save_settings(&self.settings);
+            }
+        });
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(choice) = device_combo(
+            ui,
+            "rx-output-device",
+            "Output",
+            &self.output_devices,
+            &self.settings.rx_device,
+        ) {
+            self.settings.rx_device = choice;
             save_settings(&self.settings);
+            self.reopen_rx_output();
         }
+
         let mut stereo = self.settings.stereo;
         if ui
             .checkbox(&mut stereo, "Stereo (ch1 -> right)")
@@ -4033,24 +4083,29 @@ impl ScuApp {
             save_settings(&self.settings);
         }
 
-        // Loopback streaming shares this panel with local playback.
+        ui.add_space(8.0);
+        theme::section(ui, "Transmission");
+        self.ui_tx_input(ui);
+
         #[cfg(not(target_arch = "wasm32"))]
         {
+            ui.add_space(6.0);
+            self.ui_vox(ui);
             ui.add_space(6.0);
             self.ui_audio_streaming(ui);
         }
     }
 
-    /// Transmit pane: power, radio microphone gain and the TX capture source.
-    fn pane_transmit(&mut self, ui: &mut egui::Ui) {
-        theme::section(ui, "Transmit");
+    /// RF transmit power, sent to the radio over CAT.
+    fn ui_tx_power(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "TX power");
         let mut power = self.tx_power as i32;
         let response = ui.add(
             egui::Slider::new(
                 &mut power,
                 scu_cat::POWER_MIN_W as i32..=scu_cat::POWER_MAX_W as i32,
             )
-            .text("TX power")
+            .text("Power")
             .suffix(" W"),
         );
         let wheeled = widgets::scroll_value(
@@ -4067,11 +4122,15 @@ impl ScuApp {
                 handle.send_cat(&scu_cat::set_power(self.tx_power));
             }
         }
+    }
 
+    /// Radio microphone gain, sent to the radio over CAT (`MG`).
+    fn ui_radio_mic_gain(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "TX mic gain");
         let mut mic_gain = self.radio_mic_gain as i32;
         let response = ui.add(
             egui::Slider::new(&mut mic_gain, 0..=scu_cat::MIC_GAIN_MAX as i32)
-                .text("Mic gain")
+                .text("Gain")
                 .suffix(" %"),
         );
         let wheeled = widgets::scroll_value(
@@ -4088,9 +4147,6 @@ impl ScuApp {
                 handle.send_cat(&scu_cat::set_mic_gain(self.radio_mic_gain));
             }
         }
-
-        ui.add_space(4.0);
-        self.ui_tx_input(ui);
     }
 
     /// TX capture source: a microphone/loopback preset plus the device and
@@ -4648,6 +4704,17 @@ impl ScuApp {
                 .small()
                 .color(theme::text_faint()),
         );
+
+        theme::section(ui, "Operate pane");
+        let mut show_mic_gain = self.settings.show_tx_mic_gain;
+        if ui
+            .checkbox(&mut show_mic_gain, "Radio mic gain")
+            .on_hover_text("Show the radio's TX microphone gain control in the Operate pane")
+            .changed()
+        {
+            self.settings.show_tx_mic_gain = show_mic_gain;
+            save_settings(&self.settings);
+        }
 
         theme::section(ui, "Layout");
         if ui
