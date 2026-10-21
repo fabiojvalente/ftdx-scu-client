@@ -3247,7 +3247,7 @@ dependencies = [
 
 [[package]]
 name = "scu-app"
-version = "0.1.0"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -3276,7 +3276,7 @@ dependencies = [
 
 [[package]]
 name = "scu-audio"
-version = "0.1.0"
+version = "0.5.3"
 dependencies = [
  "cpal",
  "crossbeam-channel",
@@ -3292,7 +3292,7 @@ dependencies = [
 
 [[package]]
 name = "scu-bridge"
-version = "0.1.0"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -3305,7 +3305,7 @@ dependencies = [
 
 [[package]]
 name = "scu-cat"
-version = "0.1.0"
+version = "0.5.3"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -3313,7 +3313,7 @@ dependencies = [
 
 [[package]]
 name = "scu-client"
-version = "0.1.0"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "futures",
@@ -3337,7 +3337,7 @@ dependencies = [
 
 [[package]]
 name = "scu-protocol"
-version = "0.1.0"
+version = "0.5.3"
 dependencies = [
  "getrandom 0.2.17",
  "rand",
@@ -3346,7 +3346,7 @@ dependencies = [
 
 [[package]]
 name = "scu-rigctld"
-version = "0.1.0"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "scu-cat",
@@ -3359,7 +3359,7 @@ dependencies = [
 
 [[package]]
 name = "scu-scope"
-version = "0.1.0"
+version = "0.5.3"
 dependencies = [
  "scu-protocol",
  "serde",
