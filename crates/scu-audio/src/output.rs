@@ -5,7 +5,7 @@
 //! pushes interleaved `f32` into a lock-free ring buffer consumed by the audio
 //! callback (which never allocates or locks).
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -44,6 +44,8 @@ struct Control {
     enabled: AtomicBool,
     volume_bits: AtomicU32,
     stereo: AtomicBool,
+    ring_samples: AtomicUsize,
+    queue_frames: AtomicUsize,
 }
 
 impl Control {
@@ -105,6 +107,8 @@ impl AudioOutput {
             enabled: AtomicBool::new(true),
             volume_bits: AtomicU32::new(1.0f32.to_bits()),
             stereo: AtomicBool::new(false),
+            ring_samples: AtomicUsize::new(0),
+            queue_frames: AtomicUsize::new(0),
         });
 
         let worker_control = Arc::clone(&control);
@@ -183,6 +187,16 @@ impl AudioOutput {
         self.control.volume()
     }
 
+    /// Current buffered playback in milliseconds, as `(ring, frame queue)`.
+    /// Diagnostic only: how much already-decoded audio is waiting to be heard.
+    pub fn buffered_ms(&self) -> (f32, f32) {
+        let samples = self.control.ring_samples.load(Ordering::Relaxed) as f32;
+        let channels = self.info.channels.max(1) as f32;
+        let ring_ms = samples / (channels * self.info.sample_rate as f32) * 1000.0;
+        let queue_ms = self.control.queue_frames.load(Ordering::Relaxed) as f32 * 10.0;
+        (ring_ms, queue_ms)
+    }
+
     /// Names of the available output devices.
     pub fn devices() -> Vec<String> {
         let host = cpal::default_host();
@@ -256,6 +270,7 @@ fn worker_loop<P: Producer<Item = f32>>(
     let out_ch = out_channels.max(1) as usize;
 
     while let Ok(frame) = rx.recv() {
+        control.queue_frames.store(rx.len(), Ordering::Relaxed);
         if frame.samples.is_empty() {
             continue;
         }
@@ -315,5 +330,8 @@ fn worker_loop<P: Producer<Item = f32>>(
                 let _ = producer.try_push(value);
             }
         }
+        control
+            .ring_samples
+            .store(producer.occupied_len(), Ordering::Relaxed);
     }
 }

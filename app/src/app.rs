@@ -800,7 +800,23 @@ impl ScuApp {
         self.reconnect_attempt = 0;
     }
 
+    /// Log how much already-decoded audio is still queued for playback.
+    fn log_audio_buffer(&self, context: &str) {
+        let Some(audio) = &self.audio else {
+            return;
+        };
+        let (ring_ms, queue_ms) = audio.buffered_ms();
+        tracing::info!(
+            context,
+            ring_ms = ring_ms as f64,
+            queue_ms = queue_ms as f64,
+            total_ms = (ring_ms + queue_ms) as f64,
+            "audio buffer at stop"
+        );
+    }
+
     fn disconnect(&mut self) {
+        self.log_audio_buffer("disconnect");
         if let Some(flag) = &self.shutdown {
             flag.store(true, Ordering::Relaxed);
         }
@@ -1338,6 +1354,7 @@ impl ScuApp {
                 self.schedule_reconnect();
             }
             EngineMsg::Stopped => {
+                self.log_audio_buffer("engine stopped");
                 self.connecting = false;
                 self.engine_rx = None;
                 self.shutdown = None;
@@ -1375,6 +1392,7 @@ impl ScuApp {
             }
             Event::Error(message) => self.push_log(format!("! {message}")),
             Event::Disconnected(reason) => {
+                self.log_audio_buffer("remote disconnect");
                 self.status = format!("disconnected: {reason}");
                 // Tear the engine down here as well as via `Stopped`: the session
                 // is already dead, and leaving `engine_rx` set would make
@@ -5611,6 +5629,7 @@ impl ScuApp {
     }
 
     fn toggle_mute(&mut self) {
+        self.log_audio_buffer("mute toggle");
         self.settings.muted = !self.settings.muted;
         self.sync_audio_enabled();
         save_settings(&self.settings);

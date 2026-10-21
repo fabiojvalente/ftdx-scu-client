@@ -296,4 +296,13 @@ impl AudioOutput {
     pub fn volume(&self) -> f32 {
         self.shared.volume()
     }
+
+    /// Current buffered playback in milliseconds, as `(ring, frame queue)`.
+    /// Diagnostic only: how much already-decoded audio is waiting to be heard.
+    pub fn buffered_ms(&self) -> (f32, f32) {
+        let ring = self.shared.ring.lock().unwrap();
+        let frames = ring.len() as f32 / 2.0;
+        let ms = frames / self.info.sample_rate as f32 * 1000.0;
+        (ms, 0.0)
+    }
 }
