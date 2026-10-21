@@ -41,6 +41,13 @@ pub struct OutputInfo {
 /// Interleaved stereo frames held before playback.
 const RING_FRAMES: usize = 1 << 15;
 
+/// Target amount of RX audio kept buffered ahead of the device, in milliseconds.
+const TARGET_BUFFER_MS: f64 = 50.0;
+/// Maximum clock-drift correction applied to the resampler, in ppm.
+const MAX_DRIFT_PPM: f64 = 1000.0;
+/// Ring-fill error (ms) that produces the maximum correction.
+const DRIFT_FULL_SCALE_MS: f64 = 25.0;
+
 struct ResamplerState {
     channels: usize,
     rate: u32,
@@ -82,11 +89,26 @@ impl Shared {
 
         {
             let mut state = self.resamplers.lock().unwrap();
+            let nominal_step = in_rate as f64 / self.out_rate as f64;
             if state.channels != sc || state.rate != in_rate {
-                let step = in_rate as f64 / self.out_rate as f64;
                 state.channels = sc;
                 state.rate = in_rate;
-                state.resamplers = (0..sc).map(|_| ChannelResampler::new(step)).collect();
+                state.resamplers = (0..sc)
+                    .map(|_| ChannelResampler::new(nominal_step))
+                    .collect();
+            }
+
+            // Clock-drift correction: nudge the ratio so the ring fill stays
+            // near the target instead of slowly accumulating over hours.
+            let queued = self.ring.lock().unwrap().len() as f64;
+            let samples_per_sec = self.out_rate as f64 * 2.0;
+            let target_samples = samples_per_sec * TARGET_BUFFER_MS / 1000.0;
+            let error_ms = (queued - target_samples) / samples_per_sec * 1000.0;
+            let correction =
+                (error_ms / DRIFT_FULL_SCALE_MS).clamp(-1.0, 1.0) * MAX_DRIFT_PPM * 1e-6;
+            let step = nominal_step * (1.0 + correction);
+            for resampler in &mut state.resamplers {
+                resampler.set_step(step);
             }
         }
 
@@ -184,6 +206,12 @@ pub struct AudioOutput {
 }
 
 impl AudioOutput {
+    /// Open an `AudioContext` and start playback. The browser picks the output
+    /// device itself, so `device` is ignored (kept for API parity with cpal).
+    pub fn with_device(_device: Option<String>) -> Result<Self, OutputError> {
+        Self::new()
+    }
+
     /// Open an `AudioContext` and start playback.
     pub fn new() -> Result<Self, OutputError> {
         let context =
@@ -265,6 +293,12 @@ impl AudioOutput {
         AudioSink {
             shared: Arc::clone(&self.shared),
         }
+    }
+
+    /// Discard all audio queued for playback. Used when muting or changing TX
+    /// state so buffered frames don't play out afterwards.
+    pub fn flush(&self) {
+        self.shared.ring.lock().unwrap().clear();
     }
 
     /// When `true`, source channel 1 is routed to the right output; when `false`

@@ -11,7 +11,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
@@ -261,6 +261,7 @@ fn worker_loop<C: Consumer<Item = f32>>(
     let mut raw: Vec<f32> = Vec::new();
     let mut pending: Vec<f32> = Vec::with_capacity(AUDIO_FRAMES_PER_PACKET * 2);
     let mut seq: u8 = 0;
+    let mut last_sample = Instant::now();
 
     loop {
         if control.stop.load(Ordering::Relaxed) {
@@ -269,9 +270,15 @@ fn worker_loop<C: Consumer<Item = f32>>(
 
         let n = consumer.pop_slice(&mut scratch);
         if n == 0 {
+            // A stalled stream must not leave a stale peak latched, or VOX
+            // never observes the level dropping and holds TX forever.
+            if last_sample.elapsed() >= Duration::from_millis(500) {
+                control.level.store(0, Ordering::Relaxed);
+            }
             std::thread::sleep(Duration::from_millis(2));
             continue;
         }
+        last_sample = Instant::now();
 
         // Publish the input peak before the enabled gate so VOX can key the
         // transmitter while capture is otherwise idle.

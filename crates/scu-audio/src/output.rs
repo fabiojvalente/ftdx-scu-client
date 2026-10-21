@@ -40,12 +40,20 @@ pub struct OutputInfo {
     pub channels: u16,
 }
 
+/// Target amount of RX audio kept buffered ahead of the device, in milliseconds.
+const TARGET_BUFFER_MS: f64 = 50.0;
+/// Maximum clock-drift correction applied to the resampler, in ppm.
+const MAX_DRIFT_PPM: f64 = 1000.0;
+/// Ring-fill error (ms) that produces the maximum correction.
+const DRIFT_FULL_SCALE_MS: f64 = 25.0;
+
 struct Control {
     enabled: AtomicBool,
     volume_bits: AtomicU32,
     stereo: AtomicBool,
     ring_samples: AtomicUsize,
     queue_frames: AtomicUsize,
+    flush_gen: AtomicU32,
 }
 
 impl Control {
@@ -101,7 +109,14 @@ impl AudioOutput {
         let out_rate = config.sample_rate.0;
 
         let capacity = (out_rate as usize) * (out_channels as usize) * 2;
-        let (producer, consumer) = HeapRb::<f32>::new(capacity).split();
+        let (mut producer, consumer) = HeapRb::<f32>::new(capacity).split();
+
+        // Start at the target depth so drift correction only has to counter
+        // clock mismatch, never build the buffer up from empty.
+        let target_samples =
+            (out_rate as f64 * out_channels as f64 * TARGET_BUFFER_MS / 1000.0) as usize;
+        let silence = vec![0.0f32; target_samples.min(capacity)];
+        producer.push_slice(&silence);
 
         let control = Arc::new(Control {
             enabled: AtomicBool::new(true),
@@ -109,6 +124,7 @@ impl AudioOutput {
             stereo: AtomicBool::new(false),
             ring_samples: AtomicUsize::new(0),
             queue_frames: AtomicUsize::new(0),
+            flush_gen: AtomicU32::new(0),
         });
 
         let worker_control = Arc::clone(&control);
@@ -120,9 +136,15 @@ impl AudioOutput {
 
         let err_fn = |err| tracing::error!(%err, "audio stream error");
         let stream = match sample_format {
-            SampleFormat::F32 => build_stream::<f32, _>(&device, &config, consumer, err_fn),
-            SampleFormat::I16 => build_stream::<i16, _>(&device, &config, consumer, err_fn),
-            SampleFormat::U16 => build_stream::<u16, _>(&device, &config, consumer, err_fn),
+            SampleFormat::F32 => {
+                build_stream::<f32, _>(&device, &config, consumer, Arc::clone(&control), err_fn)
+            }
+            SampleFormat::I16 => {
+                build_stream::<i16, _>(&device, &config, consumer, Arc::clone(&control), err_fn)
+            }
+            SampleFormat::U16 => {
+                build_stream::<u16, _>(&device, &config, consumer, Arc::clone(&control), err_fn)
+            }
             other => return Err(OutputError::SampleFormat(other)),
         }?;
 
@@ -157,6 +179,12 @@ impl AudioOutput {
         AudioSink {
             tx: self.tx.clone(),
         }
+    }
+
+    /// Discard all audio queued for playback. Used when muting or changing TX
+    /// state so buffered (and gated-silent) frames don't play out afterwards.
+    pub fn flush(&self) {
+        self.control.flush_gen.fetch_add(1, Ordering::Relaxed);
     }
 
     /// When `true`, source channel 1 is routed to the right output; when `false`
@@ -237,16 +265,23 @@ fn build_stream<T, C>(
     device: &cpal::Device,
     config: &StreamConfig,
     mut consumer: C,
+    control: Arc<Control>,
     err_fn: impl FnMut(cpal::StreamError) + Send + 'static,
 ) -> Result<Stream, OutputError>
 where
     T: SizedSample + FromSample<f32>,
     C: Consumer<Item = f32> + Send + 'static,
 {
+    let mut last_flush = control.flush_gen.load(Ordering::Relaxed);
     device
         .build_output_stream(
             config,
             move |data: &mut [T], _| {
+                let flush_gen = control.flush_gen.load(Ordering::Relaxed);
+                if flush_gen != last_flush {
+                    last_flush = flush_gen;
+                    consumer.clear();
+                }
                 for slot in data.iter_mut() {
                     let value = consumer.try_pop().unwrap_or(0.0);
                     *slot = T::from_sample(value);
@@ -266,11 +301,27 @@ fn worker_loop<P: Producer<Item = f32>>(
     control: Arc<Control>,
 ) {
     let mut src_channels = 0usize;
+    let mut src_rate = 0u32;
+    let mut nominal_step = 1.0f64;
     let mut resamplers: Vec<ChannelResampler> = Vec::new();
     let out_ch = out_channels.max(1) as usize;
+    let samples_per_sec = out_rate as f64 * out_ch as f64;
+    let target_samples = samples_per_sec * TARGET_BUFFER_MS / 1000.0;
+    let mut last_flush = control.flush_gen.load(Ordering::Relaxed);
 
     while let Ok(frame) = rx.recv() {
         control.queue_frames.store(rx.len(), Ordering::Relaxed);
+
+        // A flush discards both the queued frames and (via the callback) the
+        // ring contents. Drop the frame we just pulled too: it predates the
+        // flush and would otherwise keep the old audio alive.
+        let flush_gen = control.flush_gen.load(Ordering::Relaxed);
+        if flush_gen != last_flush {
+            last_flush = flush_gen;
+            while rx.try_recv().is_ok() {}
+            continue;
+        }
+
         if frame.samples.is_empty() {
             continue;
         }
@@ -281,10 +332,24 @@ fn worker_loop<P: Producer<Item = f32>>(
             frame.sample_rate
         };
 
-        if sc != src_channels {
+        if sc != src_channels || in_rate != src_rate {
             src_channels = sc;
-            let step = in_rate as f64 / out_rate as f64;
-            resamplers = (0..sc).map(|_| ChannelResampler::new(step)).collect();
+            src_rate = in_rate;
+            nominal_step = in_rate as f64 / out_rate as f64;
+            resamplers = (0..sc)
+                .map(|_| ChannelResampler::new(nominal_step))
+                .collect();
+        }
+
+        // Clock-drift correction: nudge the resampling ratio so the ring fill
+        // converges on `TARGET_BUFFER_MS` instead of slowly accumulating.
+        let error_ms =
+            (producer.occupied_len() as f64 - target_samples) / samples_per_sec * 1000.0;
+        let correction =
+            (error_ms / DRIFT_FULL_SCALE_MS).clamp(-1.0, 1.0) * MAX_DRIFT_PPM * 1e-6;
+        let step = nominal_step * (1.0 + correction);
+        for resampler in &mut resamplers {
+            resampler.set_step(step);
         }
 
         let frames = frame.samples.len() / sc;

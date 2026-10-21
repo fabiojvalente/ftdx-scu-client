@@ -750,7 +750,11 @@ pub struct FlexBehavior<'a> {
 impl Behavior<Pane> for FlexBehavior<'_> {
     fn pane_ui(&mut self, ui: &mut egui::Ui, _tile_id: TileId, pane: &mut Pane) -> UiResponse {
         let theme = self.theme;
-        self.app.render_pane(*pane, ui, theme);
+        // Keep pane content a few pixels clear of the tab bar and the tile
+        // borders, which otherwise sit flush against labels and widgets.
+        egui::Frame::new()
+            .inner_margin(egui::Margin::same(5))
+            .show(ui, |ui| self.app.render_pane(*pane, ui, theme));
         UiResponse::None
     }
 

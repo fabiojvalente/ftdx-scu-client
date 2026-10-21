@@ -20,6 +20,11 @@ impl ChannelResampler {
         }
     }
 
+    /// Adjust the resampling ratio, e.g. for slow clock-drift correction.
+    pub(crate) fn set_step(&mut self, step: f64) {
+        self.step = step;
+    }
+
     /// Push resampled output for a new block of mono input samples.
     pub(crate) fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
         let n = input.len();

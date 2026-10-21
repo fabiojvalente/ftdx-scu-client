@@ -49,6 +49,7 @@ Binary entrypoints:
   - `NSLocalNetworkUsageDescription` — LAN access to the radio (UDP/TCP). Required on macOS 15 Sequoia+.
   - Global hotkeys use Carbon (`global-hotkey`), which needs **no** Accessibility/Input Monitoring grant.
   - If the app is ever sandboxed, add `com.apple.security.network.client` (and `.server` for the `scu-rigctld` listener) to an entitlements file.
+  - The `.app` **must be codesigned** (`package-macos.sh` does ad-hoc by default; override with `CODESIGN_IDENTITY`). Without a bundle signature the Info.plist stays unbound and TCC re-prompts on every launch (infinite permission loop). Ad-hoc cdhash changes per rebuild, so expect a one-time re-prompt after each build.
 
 ## `cfg`-gated features
 

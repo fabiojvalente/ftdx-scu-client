@@ -839,16 +839,24 @@ impl ScuApp {
     }
 
     /// Unkey the radio (if needed) and release the microphone.
+    ///
+    /// `tx_keyed()` also covers an external rigctld PTT, so teardown releases
+    /// the radio even when the local `ptt` flag was never set.
     fn stop_tx(&mut self) {
-        if self.ptt {
+        let was_keyed = self.tx_keyed();
+        self.ptt = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        self.vox.reset();
+        if was_keyed {
             if let Some(handle) = &self.handle {
                 handle.set_transmit(false);
+                self.push_log(format!("> {}", scu_cat::transmit(false)));
             }
         }
-        self.ptt = false;
         self.tx_input = None;
         self.tx_input_status.clear();
         self.sync_audio_enabled();
+        self.flush_audio();
     }
 
     fn ensure_audio(&mut self) {
@@ -899,6 +907,14 @@ impl ScuApp {
     fn sync_audio_enabled(&self) {
         if let Some(audio) = &self.audio {
             audio.set_enabled(!self.settings.muted && !self.tx_keyed());
+        }
+    }
+
+    /// Drop audio that is already queued for playback, so stale or gated-silent
+    /// frames don't play out after a mute or PTT change.
+    fn flush_audio(&self) {
+        if let Some(audio) = &self.audio {
+            audio.flush();
         }
     }
 
@@ -1076,11 +1092,6 @@ impl ScuApp {
                     self.sync_rx_stream();
                 }
             }
-
-            if ui.button("Rescan audio devices").clicked() {
-                self.output_devices = AudioOutput::devices();
-                self.tx_input_devices = MicInput::devices();
-            }
         });
     }
 
@@ -1097,9 +1108,7 @@ impl ScuApp {
             self.settings.vox_enabled = enabled;
             if !enabled {
                 self.vox.reset();
-                if self.ptt {
-                    self.set_ptt(false);
-                }
+                self.set_ptt(self.manual_ptt(ui.ctx()));
             }
             save_settings(&self.settings);
         }
@@ -1247,18 +1256,44 @@ impl ScuApp {
         self.tx_input.as_ref().map(MicInput::level).unwrap_or(0)
     }
 
-    /// Advance the VOX state machine and key/unkey the transmitter.
+    /// Whether a manual PTT source (button, space or global hotkey) is active.
     #[cfg(not(target_arch = "wasm32"))]
-    fn update_vox(&mut self) {
+    fn manual_ptt(&self, ctx: &egui::Context) -> bool {
+        if self.handle.is_none() {
+            return false;
+        }
+        let space =
+            ctx.memory(|m| m.focused().is_none()) && ctx.input(|i| i.key_down(egui::Key::Space));
+        space || self.ptt_held || self.hotkeys.is_pressed()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn manual_ptt(&self, ctx: &egui::Context) -> bool {
+        if self.handle.is_none() {
+            return false;
+        }
+        let space =
+            ctx.memory(|m| m.focused().is_none()) && ctx.input(|i| i.key_down(egui::Key::Space));
+        space || self.ptt_held
+    }
+
+    /// Advance the VOX state machine and key/unkey the transmitter.
+    ///
+    /// This must reconcile against manual PTT rather than drive `ptt` on its
+    /// own: otherwise a VOX release would cut off a held PTT, and the UI pass
+    /// (which renders `ptt_held`) would fight this one every frame.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn update_vox(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         let dt = now.duration_since(self.vox_last).as_millis().min(500) as u32;
         self.vox_last = now;
 
+        let manual = self.manual_ptt(ctx);
         if !self.settings.vox_enabled || self.handle.is_none() {
             if self.vox.keyed() {
                 self.vox.reset();
-                self.set_ptt(false);
             }
+            self.set_ptt(manual);
             return;
         }
 
@@ -1268,10 +1303,8 @@ impl ScuApp {
             hang_ms: self.settings.vox_hang_ms,
         };
         let level = self.tx_level();
-        let keyed = self.vox.update(level, &config, dt);
-        if keyed != self.ptt {
-            self.set_ptt(keyed);
-        }
+        self.vox.update(level, &config, dt);
+        self.set_ptt(manual || self.vox.keyed());
     }
 
     /// Key (`on = true`) or unkey the transmitter and gate TX capture.
@@ -1282,6 +1315,7 @@ impl ScuApp {
         self.ptt = on;
         self.sync_tx_sources();
         self.sync_audio_enabled();
+        self.flush_audio();
         if let Some(handle) = &self.handle {
             handle.set_transmit(on);
             self.push_log(format!("> {}", scu_cat::transmit(on)));
@@ -1390,8 +1424,9 @@ impl ScuApp {
                 if self.handle.is_some() {
                     self.status = "disconnected".into();
                 }
-                self.handle = None;
+                // Release PTT while the session handle can still send `TX0;`.
                 self.stop_tx();
+                self.handle = None;
                 self.sync_cat_server();
                 self.schedule_reconnect();
             }
@@ -1429,12 +1464,12 @@ impl ScuApp {
                 if let Some(flag) = &self.shutdown {
                     flag.store(true, Ordering::Relaxed);
                 }
+                self.stop_tx();
                 self.handle = None;
                 self.engine_rx = None;
                 self.shutdown = None;
                 self.connecting = false;
                 self.radio_tx = false;
-                self.stop_tx();
                 self.sync_cat_server();
                 self.schedule_reconnect();
             }
@@ -4043,6 +4078,7 @@ impl ScuApp {
             if ui.checkbox(&mut muted, "Mute").changed() {
                 self.settings.muted = muted;
                 self.sync_audio_enabled();
+                self.flush_audio();
                 save_settings(&self.settings);
             }
             let response =
@@ -4068,6 +4104,16 @@ impl ScuApp {
             self.settings.rx_device = choice;
             save_settings(&self.settings);
             self.reopen_rx_output();
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if ui
+            .button("Rescan audio devices")
+            .on_hover_text("Refresh the list of playback and capture devices")
+            .clicked()
+        {
+            self.output_devices = AudioOutput::devices();
+            self.tx_input_devices = MicInput::devices();
         }
 
         let mut stereo = self.settings.stereo;
@@ -4918,7 +4964,7 @@ impl eframe::App for ScuApp {
         #[cfg(not(target_arch = "wasm32"))]
         self.reconcile_external_ptt();
         #[cfg(not(target_arch = "wasm32"))]
-        self.update_vox();
+        self.update_vox(ctx);
         self.maybe_save_layout();
     }
 
@@ -4959,14 +5005,11 @@ impl eframe::App for ScuApp {
         self.process_close_requests();
         self.render_popped(&ctx);
 
-        let space = self.handle.is_some()
-            && ctx.memory(|m| m.focused().is_none())
-            && ctx.input(|i| i.key_down(egui::Key::Space));
         #[cfg(not(target_arch = "wasm32"))]
-        let global_ptt = self.handle.is_some() && self.hotkeys.is_pressed();
+        let keyed = self.manual_ptt(&ctx) || (self.settings.vox_enabled && self.vox.keyed());
         #[cfg(target_arch = "wasm32")]
-        let global_ptt = false;
-        self.set_ptt(self.ptt_held || space || global_ptt);
+        let keyed = self.manual_ptt(&ctx);
+        self.set_ptt(keyed);
 
         #[cfg(not(target_arch = "wasm32"))]
         if self.recording_hotkey {
@@ -4980,6 +5023,13 @@ impl eframe::App for ScuApp {
         self.ui_layout_prompt(&ctx);
         self.ui_shortcuts_help(&ctx);
         ctx.request_repaint_after(Duration::from_millis(16));
+    }
+
+    /// Release the transmitter when the window is closed, so the radio does
+    /// not stay keyed after the app exits.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn on_exit(&mut self) {
+        self.stop_tx();
     }
 }
 
@@ -5699,6 +5749,7 @@ impl ScuApp {
         self.log_audio_buffer("mute toggle");
         self.settings.muted = !self.settings.muted;
         self.sync_audio_enabled();
+        self.flush_audio();
         save_settings(&self.settings);
         self.show_notice(if self.settings.muted {
             "Muted"
