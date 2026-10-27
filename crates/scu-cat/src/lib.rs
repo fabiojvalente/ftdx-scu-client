@@ -697,14 +697,19 @@ pub fn if_passband_hz(
     Some((center - half, center + half))
 }
 
-/// Build a "set IF width" command (`SH` P1=0/1 + three-digit code).
-pub fn set_if_width(sub: bool, code: u8) -> String {
-    format!("SH{}{:03};", sub as u8, code)
+/// Build a "set IF width" command (`SH00` + two-digit code).
+///
+/// The FTDX10 `SH` command has P1 and P2 fixed at `0`; it always addresses the
+/// operating VFO (`SH1...` is rejected, so the width never changes on VFO-B).
+pub fn set_if_width(code: u8) -> String {
+    format!("SH00{code:02};")
 }
 
-/// Build a "read IF width" command for `sub`'s VFO.
-pub fn read_if_width(sub: bool) -> String {
-    format!("SH{};", sub as u8)
+/// Build a "read IF width" command (`SH0;`).
+///
+/// `SH` reads the operating VFO only; P1 is fixed at `0`.
+pub fn read_if_width() -> &'static str {
+    "SH0;"
 }
 
 /// Parse the `SH` code from an `SH0xxx;` response.
@@ -727,16 +732,21 @@ pub fn clamp_if_shift_hz(hz: i32) -> i32 {
     (steps * IF_SHIFT_STEP_HZ).clamp(IF_SHIFT_MIN_HZ, IF_SHIFT_MAX_HZ)
 }
 
-/// Build a "set IF shift" command (`IS` P1=0/1 + `0` + sign + four digits).
-pub fn set_if_shift(sub: bool, hz: i32) -> String {
+/// Build a "set IF shift" command (`IS00` + sign + four digits).
+///
+/// The FTDX10 `IS` command has P1 and P2 fixed at `0`; it always addresses the
+/// operating VFO (`IS1...` is rejected, so the shift never changes on VFO-B).
+pub fn set_if_shift(hz: i32) -> String {
     let hz = clamp_if_shift_hz(hz);
     let sign = if hz < 0 { '-' } else { '+' };
-    format!("IS{}0{}{:04};", sub as u8, sign, hz.abs())
+    format!("IS00{}{:04};", sign, hz.abs())
 }
 
-/// Build a "read IF shift" command for `sub`'s VFO.
-pub fn read_if_shift(sub: bool) -> String {
-    format!("IS{};", sub as u8)
+/// Build a "read IF shift" command (`IS0;`).
+///
+/// `IS` reads the operating VFO only; P1 is fixed at `0`.
+pub fn read_if_shift() -> &'static str {
+    "IS0;"
 }
 
 /// Parse the IF shift in Hz from an `IS` response (`IS00[+-]dddd;`).
@@ -2464,12 +2474,12 @@ mod tests {
 
     #[test]
     fn build_and_parse_if_width() {
-        assert_eq!(set_if_width(false, 8), "SH0008;");
-        assert_eq!(set_if_width(true, 12), "SH1012;");
-        assert_eq!(read_if_width(false), "SH0;");
-        assert_eq!(read_if_width(true), "SH1;");
+        assert_eq!(set_if_width(8), "SH0008;");
+        assert_eq!(set_if_width(12), "SH0012;");
+        assert_eq!(set_if_width(23), "SH0023;");
+        assert_eq!(read_if_width(), "SH0;");
         assert_eq!(parse_if_width("SH0008;"), Some(8));
-        assert_eq!(parse_if_width("SH1021;"), Some(21));
+        assert_eq!(parse_if_width("SH0021;"), Some(21));
         assert_eq!(parse_if_width("IS0;"), None);
     }
 
@@ -2497,16 +2507,15 @@ mod tests {
 
     #[test]
     fn build_and_parse_if_shift() {
-        assert_eq!(set_if_shift(false, 600), "IS00+0600;");
-        assert_eq!(set_if_shift(true, -240), "IS10-0240;");
-        assert_eq!(set_if_shift(false, 0), "IS00+0000;");
+        assert_eq!(set_if_shift(600), "IS00+0600;");
+        assert_eq!(set_if_shift(-240), "IS00-0240;");
+        assert_eq!(set_if_shift(0), "IS00+0000;");
         // 20 Hz grid and +-1000 Hz clamp.
-        assert_eq!(set_if_shift(false, 104), "IS00+0100;");
-        assert_eq!(set_if_shift(false, 20_000_000), "IS00+1000;");
-        assert_eq!(read_if_shift(false), "IS0;");
-        assert_eq!(read_if_shift(true), "IS1;");
+        assert_eq!(set_if_shift(104), "IS00+0100;");
+        assert_eq!(set_if_shift(20_000_000), "IS00+1000;");
+        assert_eq!(read_if_shift(), "IS0;");
         assert_eq!(parse_if_shift("IS00+0600;"), Some(600));
-        assert_eq!(parse_if_shift("IS10-0240;"), Some(-240));
+        assert_eq!(parse_if_shift("IS00-0240;"), Some(-240));
         assert_eq!(parse_if_shift("SH0008;"), None);
     }
 

@@ -1343,9 +1343,7 @@ impl ScuApp {
                 "FT;",
                 "ST;",
                 "SH0;",
-                "SH1;",
                 "IS0;",
-                "IS1;",
                 "SM0;",
                 "PS;",
                 "PC;",
@@ -2004,7 +2002,7 @@ impl ScuApp {
         self.vfo_switch_ignore_until = None;
         let cf = if self.rx_sub { "CF101;" } else { "CF001;" };
         if let Some(handle) = &self.handle {
-            for command in ["MD0;", "MD1;", "FT;", "SH0;", "SH1;", "IS0;", "IS1;", cf] {
+            for command in ["MD0;", "MD1;", "FT;", "SH0;", "IS0;", cf] {
                 handle.send_cat(command);
             }
             // The native scope follows a *tune*, not the CAT VFO select, so
@@ -2262,9 +2260,7 @@ impl ScuApp {
                     "FT;",
                     "ST;",
                     "SH0;",
-                    "SH1;",
                     "IS0;",
-                    "IS1;",
                     cf,
                     "SM0;",
                     "PC;",
@@ -5773,7 +5769,7 @@ impl ScuApp {
         self.if_width[sub] = code;
         self.if_width_default[sub] = code == 0;
         if let Some(handle) = &self.handle {
-            handle.send_cat(&scu_cat::set_if_width(self.rx_sub, code));
+            handle.send_cat(&scu_cat::set_if_width(code));
         }
         self.show_notice(format!("IF width {}", self.if_width_label(code)));
     }
@@ -5814,7 +5810,7 @@ impl ScuApp {
     fn set_if_shift_hz(&mut self, hz: i32) {
         self.if_shift_hz[self.rx_sub as usize] = hz;
         if let Some(handle) = &self.handle {
-            handle.send_cat(&scu_cat::set_if_shift(self.rx_sub, hz));
+            handle.send_cat(&scu_cat::set_if_shift(hz));
         }
         self.show_notice(format!("IF shift {hz:+} Hz"));
     }
