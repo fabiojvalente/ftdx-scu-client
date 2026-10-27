@@ -119,7 +119,6 @@ pub struct Theme {
 
     // Accents
     pub accent: Color32,
-    pub accent_deep: Color32,
     pub rx_green: Color32,
     pub tx_red: Color32,
     pub warn_amber: Color32,
@@ -162,7 +161,6 @@ impl Theme {
             text_dim: rgb(151, 159, 171),
             text_faint: rgb(104, 111, 123),
             accent: rgb(74, 142, 218),
-            accent_deep: rgb(38, 74, 116),
             rx_green: rgb(72, 178, 114),
             tx_red: rgb(207, 74, 68),
             warn_amber: rgb(226, 172, 72),
@@ -189,7 +187,6 @@ impl Theme {
             text_dim: rgb(108, 117, 125),
             text_faint: rgb(134, 142, 150),
             accent: rgb(13, 110, 253),
-            accent_deep: rgb(10, 88, 202),
             rx_green: rgb(25, 135, 84),
             tx_red: rgb(220, 53, 69),
             warn_amber: rgb(255, 193, 7),
@@ -216,7 +213,6 @@ impl Theme {
             text_dim: rgb(154, 163, 173),
             text_faint: rgb(110, 110, 110),
             accent: rgb(255, 122, 24),
-            accent_deep: rgb(179, 84, 14),
             rx_green: rgb(88, 207, 154),
             tx_red: rgb(220, 53, 69),
             warn_amber: rgb(255, 193, 7),
@@ -243,7 +239,6 @@ impl Theme {
             text_dim: rgb(127, 168, 201),
             text_faint: rgb(79, 109, 138),
             accent: rgb(0, 229, 255),
-            accent_deep: rgb(0, 119, 170),
             rx_green: rgb(57, 255, 20),
             tx_red: rgb(255, 43, 94),
             warn_amber: rgb(255, 212, 0),
@@ -361,9 +356,6 @@ pub fn current() -> Theme {
 
 pub fn accent() -> Color32 {
     current().accent
-}
-pub fn accent_deep() -> Color32 {
-    current().accent_deep
 }
 pub fn rx_green() -> Color32 {
     current().rx_green

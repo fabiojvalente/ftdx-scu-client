@@ -63,6 +63,8 @@ pub enum Action {
     VolumeDown,
     VolumeUp,
     ToggleMute,
+    ToggleAtu,
+    AtuTune,
     ToggleHelp,
     /// A key that exists in the Yaesu keymap but has no matching feature here.
     Unavailable(&'static str),
@@ -259,6 +261,19 @@ pub const HELP_ROWS: &[HelpRow] = &[
         action: "IF shift \u{00b1}100 Hz",
         note: None,
     },
+    // Operate
+    HelpRow {
+        group: "Operate",
+        keys: "t",
+        action: "Toggle ATU on / off",
+        note: None,
+    },
+    HelpRow {
+        group: "Operate",
+        keys: "T",
+        action: "Trigger an ATU tune cycle",
+        note: None,
+    },
     // Panels
     HelpRow {
         group: "Panels",
@@ -326,12 +341,6 @@ pub const HELP_ROWS: &[HelpRow] = &[
         group: "Display",
         keys: "o / O",
         action: "Scope reference level",
-        note: Some(UNAVAILABLE),
-    },
-    HelpRow {
-        group: "Display",
-        keys: "t",
-        action: "Toggle shortcut display target",
         note: Some(UNAVAILABLE),
     },
     // DX / tools
@@ -596,10 +605,12 @@ pub fn resolve(c: &Chord) -> Option<Action> {
             "Remote audio is not available in this build",
         ));
     }
-    if is_key(c, Key::T) && plain(c) {
-        return Some(Action::Unavailable(
-            "Shortcut display target is not available",
-        ));
+    if is_key(c, Key::T) && bare(c) {
+        return Some(if c.shift {
+            Action::AtuTune
+        } else {
+            Action::ToggleAtu
+        });
     }
 
     // Volume.
@@ -744,6 +755,13 @@ mod tests {
             resolve(&shifted(Key::D)),
             Some(Action::Unavailable(_))
         ));
+    }
+
+    #[test]
+    fn atu_keys() {
+        assert_eq!(resolve(&chord(Key::T)), Some(Action::ToggleAtu));
+        assert_eq!(resolve(&shifted(Key::T)), Some(Action::AtuTune));
+        assert_eq!(resolve(&alted(Key::T)), None);
     }
 
     #[test]

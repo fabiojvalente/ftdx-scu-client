@@ -1114,6 +1114,73 @@ pub fn set_scope_mode(code: char) -> String {
     format!("SS06{}0000;", code)
 }
 
+/// Lowest scope peak (color density) level, `LV1` (`SS01`).
+pub const SCOPE_PEAK_MIN: u8 = 1;
+
+/// Highest scope peak (color density) level, `LV5` (`SS01`).
+pub const SCOPE_PEAK_MAX: u8 = 5;
+
+/// Read the MAIN scope peak level (`SS01;`).
+pub fn read_scope_peak() -> &'static str {
+    "SS01;"
+}
+
+/// Set the MAIN scope peak level (`LV1`-`LV5`), encoded as digits `0`-`4`.
+pub fn set_scope_peak(level: u8) -> String {
+    let index = level.clamp(SCOPE_PEAK_MIN, SCOPE_PEAK_MAX) - SCOPE_PEAK_MIN;
+    format!("SS01{index}0000;")
+}
+
+/// Parse the peak level from an `SS01n0000;` answer (`LV1`-`LV5`).
+pub fn parse_scope_peak(frame: &str) -> Option<u8> {
+    let (_, p2, value) = parse_scope_field(frame)?;
+    if p2 != '1' {
+        return None;
+    }
+    let digit = value.chars().next()?.to_digit(10)?;
+    if digit > (SCOPE_PEAK_MAX - SCOPE_PEAK_MIN) as u32 {
+        return None;
+    }
+    Some(digit as u8 + SCOPE_PEAK_MIN)
+}
+
+/// Lowest scope reference level in dB, `SS04`.
+pub const SCOPE_LEVEL_MIN_DB: f32 = -30.0;
+
+/// Highest scope reference level in dB, `SS04`.
+pub const SCOPE_LEVEL_MAX_DB: f32 = 30.0;
+
+/// Resolution of the scope reference level in dB, `SS04`.
+pub const SCOPE_LEVEL_STEP_DB: f32 = 0.5;
+
+/// Read the MAIN scope reference level (`SS04;`).
+pub fn read_scope_level() -> &'static str {
+    "SS04;"
+}
+
+/// Set the MAIN scope reference level in dB (`-30.0`..=`+30.0`, 0.5 dB steps).
+pub fn set_scope_level(db: f32) -> String {
+    let db = (db.clamp(SCOPE_LEVEL_MIN_DB, SCOPE_LEVEL_MAX_DB) / SCOPE_LEVEL_STEP_DB).round()
+        * SCOPE_LEVEL_STEP_DB;
+    let db = if db == 0.0 { 0.0 } else { db };
+    format!("SS04{db:+05.1};")
+}
+
+/// Parse the reference level from an `SS04` answer, in dB.
+pub fn parse_scope_level(frame: &str) -> Option<f32> {
+    let parsed = split(frame)?;
+    if parsed.command != "SS" || parsed.payload.len() < 7 {
+        return None;
+    }
+    if &parsed.payload[0..2] != "04" {
+        return None;
+    }
+    let db: f32 = parsed.payload[2..7].parse().ok()?;
+    (SCOPE_LEVEL_MIN_DB..=SCOPE_LEVEL_MAX_DB)
+        .contains(&db)
+        .then_some(db)
+}
+
 /// Parse an `SS` answer into `(P1, P2, value)` where `value` is the 5-byte field.
 ///
 /// Answer shape: `SS P1 P2 P3P4P5P6P7;` (e.g. `SS0590000;`).
@@ -2182,6 +2249,34 @@ mod tests {
         assert_eq!(read_scope_mode(), "SS06;");
         assert_eq!(set_scope_span(7), "SS0570000;");
         assert_eq!(set_scope_mode('4'), "SS0640000;");
+    }
+
+    #[test]
+    fn build_and_parse_scope_peak() {
+        assert_eq!(read_scope_peak(), "SS01;");
+        assert_eq!(set_scope_peak(1), "SS0100000;");
+        assert_eq!(set_scope_peak(3), "SS0120000;");
+        assert_eq!(set_scope_peak(5), "SS0140000;");
+        assert_eq!(set_scope_peak(99), "SS0140000;");
+        assert_eq!(parse_scope_peak("SS0100000;"), Some(1));
+        assert_eq!(parse_scope_peak("SS0120000;"), Some(3));
+        assert_eq!(parse_scope_peak("SS0140000;"), Some(5));
+        assert_eq!(parse_scope_peak("SS0150000;"), None);
+        assert_eq!(parse_scope_peak("SS0500000;"), None);
+    }
+
+    #[test]
+    fn build_and_parse_scope_level() {
+        assert_eq!(read_scope_level(), "SS04;");
+        assert_eq!(set_scope_level(-30.0), "SS04-30.0;");
+        assert_eq!(set_scope_level(0.0), "SS04+00.0;");
+        assert_eq!(set_scope_level(12.5), "SS04+12.5;");
+        assert_eq!(set_scope_level(0.24), "SS04+00.0;");
+        assert_eq!(set_scope_level(99.0), "SS04+30.0;");
+        assert_eq!(parse_scope_level("SS04-30.0;"), Some(-30.0));
+        assert_eq!(parse_scope_level("SS04+00.0;"), Some(0.0));
+        assert_eq!(parse_scope_level("SS04+12.5;"), Some(12.5));
+        assert_eq!(parse_scope_level("SS0500000;"), None);
     }
 
     #[test]

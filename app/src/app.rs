@@ -477,6 +477,10 @@ pub struct ScuApp {
     span_hz: f64,
     scope_mode: Option<ScopeMode>,
     scope_centered_sent: bool,
+    /// Radio-side scope reference level (`SS04`), in dB.
+    scope_level_db: f32,
+    /// Radio-side scope peak/color density (`SS01`), LV1-LV5.
+    scope_peak: u8,
 
     latest_bins: Vec<f32>,
     /// Smoothed lower/upper bounds of the spectrum magnitude, used to auto-scale
@@ -693,6 +697,8 @@ impl ScuApp {
             span_hz: 200_000.0,
             scope_mode: None,
             scope_centered_sent: false,
+            scope_level_db: 0.0,
+            scope_peak: 3,
             latest_bins: Vec::new(),
             spectrum_lo: f32::INFINITY,
             spectrum_hi: f32::NEG_INFINITY,
@@ -1365,6 +1371,8 @@ impl ScuApp {
                 "AI1;",
                 "SS05;",
                 "SS06;",
+                "SS01;",
+                "SS04;",
                 "EX040202;",
             ] {
                 handle.send_cat(cmd);
@@ -1726,6 +1734,14 @@ impl ScuApp {
     }
 
     fn on_scope_settings(&mut self, text: &str) {
+        if let Some(level) = scu_cat::parse_scope_peak(text) {
+            self.scope_peak = level;
+            return;
+        }
+        if let Some(db) = scu_cat::parse_scope_level(text) {
+            self.scope_level_db = db;
+            return;
+        }
         if let Some(index) = scu_cat::parse_scope_span_index(text) {
             if let Some(span) = scu_cat::SCOPE_SPANS_HZ.get(index) {
                 self.span_hz = *span;
@@ -1751,6 +1767,24 @@ impl ScuApp {
         self.span_hz = hz;
         if let Some(handle) = &self.handle {
             handle.send_cat(&scu_cat::set_scope_span(index as u8));
+        }
+    }
+
+    fn set_scope_peak(&mut self, level: u8) {
+        self.scope_peak = level.clamp(scu_cat::SCOPE_PEAK_MIN, scu_cat::SCOPE_PEAK_MAX);
+        if let Some(handle) = &self.handle {
+            handle.send_cat(&scu_cat::set_scope_peak(self.scope_peak));
+        }
+    }
+
+    fn set_scope_level_db(&mut self, db: f32) {
+        let db = (db.clamp(scu_cat::SCOPE_LEVEL_MIN_DB, scu_cat::SCOPE_LEVEL_MAX_DB)
+            / scu_cat::SCOPE_LEVEL_STEP_DB)
+            .round()
+            * scu_cat::SCOPE_LEVEL_STEP_DB;
+        self.scope_level_db = if db == 0.0 { 0.0 } else { db };
+        if let Some(handle) = &self.handle {
+            handle.send_cat(&scu_cat::set_scope_level(self.scope_level_db));
         }
     }
 
@@ -2253,6 +2287,8 @@ impl ScuApp {
                     "SQ0;",
                     "TX;",
                     "SS05;",
+                    "SS01;",
+                    "SS04;",
                     "EX040202;",
                     "RM3;",
                     "RM4;",
@@ -2804,10 +2840,14 @@ impl ScuApp {
             ui.add_space(10.0);
             ui.separator();
             ui.add_space(6.0);
-            ui.vertical(|ui| self.quick_toggles(ui));
+            ui.vertical(|ui| {
+                self.quick_toggles(ui);
+                ui.add_space(6.0);
+                self.ui_tx_power(ui);
+                ui.add_space(6.0);
+                self.vfo_switch_buttons(ui);
+            });
         });
-        ui.add_space(6.0);
-        self.ui_tx_power(ui);
         if self.settings.show_tx_mic_gain {
             ui.add_space(6.0);
             self.ui_radio_mic_gain(ui);
@@ -2891,11 +2931,13 @@ impl ScuApp {
         }
     }
 
-    /// One VFO read-out pane, sized to the available width. Carries the VFO's
-    /// S-meter and the VFO switch/copy shortcuts.
+    /// One VFO read-out pane, sized to the available width.
     fn pane_vfo(&mut self, ui: &mut egui::Ui, sub: bool) {
         self.vfo_card(ui, sub);
-        ui.add_space(6.0);
+    }
+
+    /// VFO switch/copy buttons, shown under the transmit controls.
+    fn vfo_switch_buttons(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(self.handle.is_some(), egui::Button::new("A/B").small())
@@ -3185,16 +3227,42 @@ impl ScuApp {
         }
     }
 
+    fn toggle_atu(&mut self) {
+        self.atu_on = !self.atu_on;
+        if let Some(handle) = &self.handle {
+            handle.send_cat(&scu_cat::set_atu(self.atu_on));
+        }
+        self.show_notice(if self.atu_on { "ATU ON" } else { "ATU OFF" });
+    }
+
     fn tune_button(&self, ui: &mut egui::Ui) -> bool {
-        let button = egui::Button::new(egui::RichText::new("TUNE").strong())
-            .min_size(egui::Vec2::new(84.0, 26.0))
-            .fill(if self.atu_on {
-                theme::accent_deep()
-            } else {
-                theme::button_bg()
-            });
+        let on = self.atu_on;
+        let fill = if on {
+            theme::tx_red()
+        } else {
+            egui::Color32::from_rgb(48, 54, 64)
+        };
+        let stroke = if on {
+            theme::tx_red()
+        } else {
+            theme::outline()
+        };
+        let text_color = if on {
+            theme::on_accent()
+        } else {
+            theme::text()
+        };
+        let button = egui::Button::new(
+            egui::RichText::new("TUNE")
+                .strong()
+                .size(19.0)
+                .color(text_color),
+        )
+        .min_size(egui::Vec2::new(84.0, 52.0))
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.5, stroke));
         ui.add_enabled(self.handle.is_some(), button)
-            .on_hover_text("Start an ATU tuning cycle (keys a carrier)")
+            .on_hover_text("Start an ATU tuning cycle (keys a carrier) [Shift+T]")
             .clicked()
     }
 
@@ -3241,8 +3309,9 @@ impl ScuApp {
                     );
                     // A bounded right-aligned cluster; an unbounded
                     // right-to-left layout would swallow all remaining width.
+                    let status_width = if self.atu_on { 118.0 } else { 78.0 };
                     ui.allocate_ui_with_layout(
-                        egui::Vec2::new(78.0, 20.0),
+                        egui::Vec2::new(status_width, 20.0),
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
                             let (fill, text_color) = if active {
@@ -3265,6 +3334,22 @@ impl ScuApp {
                                 .clicked()
                             {
                                 self.select_rx_vfo(sub);
+                            }
+                            if self.atu_on {
+                                egui::Frame::new()
+                                    .fill(theme::tx_red())
+                                    .corner_radius(3)
+                                    .inner_margin(egui::Margin::symmetric(5, 1))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new("ATU")
+                                                .small()
+                                                .strong()
+                                                .color(theme::on_accent()),
+                                        );
+                                    })
+                                    .response
+                                    .on_hover_text("The radio's antenna tuner is enabled");
                             }
                             if self.tx_on(sub) {
                                 ui.label(
@@ -3486,11 +3571,8 @@ impl ScuApp {
             if toggle_chip(ui, self.xit_on, "XIT") {
                 self.set_xit(!self.xit_on);
             }
-            if toggle_chip(ui, self.atu_on, "ATU") {
-                self.atu_on = !self.atu_on;
-                if let Some(handle) = &self.handle {
-                    handle.send_cat(&scu_cat::set_atu(self.atu_on));
-                }
+            if atu_chip(ui, self.atu_on) {
+                self.toggle_atu();
             }
         });
     }
@@ -3999,6 +4081,30 @@ impl ScuApp {
         }
 
         ui.horizontal(|ui| {
+            ui.label("Peak");
+            let mut peak = self.scope_peak;
+            let response = egui::ComboBox::from_id_salt("scope_peak")
+                .selected_text(format!("LV{peak}"))
+                .show_ui(ui, |ui| {
+                    for level in scu_cat::SCOPE_PEAK_MIN..=scu_cat::SCOPE_PEAK_MAX {
+                        ui.selectable_value(&mut peak, level, format!("LV{level}"));
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Radio S.MENU PEAK: signal color density (SS01). \
+                     This changes the scope data sent over the network.",
+                );
+            let index = (peak - scu_cat::SCOPE_PEAK_MIN) as usize;
+            let count = (scu_cat::SCOPE_PEAK_MAX - scu_cat::SCOPE_PEAK_MIN + 1) as usize;
+            if let Some(next) = widgets::scroll_index(ui, &response, index, count) {
+                peak = scu_cat::SCOPE_PEAK_MIN + next as u8;
+            }
+            if peak != self.scope_peak {
+                self.set_scope_peak(peak);
+            }
+        });
+        ui.horizontal(|ui| {
             ui.label("Display");
             let mut spectrum = self.settings.show_spectrum;
             if ui
@@ -4044,8 +4150,33 @@ impl ScuApp {
                 save_settings(&self.settings);
             }
         });
-        let response =
-            ui.add(egui::Slider::new(&mut self.waterfall.black_level, 0.0..=0.9).text("Black"));
+        let response = ui
+            .add(
+                egui::Slider::new(
+                    &mut self.scope_level_db,
+                    scu_cat::SCOPE_LEVEL_MIN_DB..=scu_cat::SCOPE_LEVEL_MAX_DB,
+                )
+                .step_by(scu_cat::SCOPE_LEVEL_STEP_DB as f64)
+                .text("Level"),
+            )
+            .on_hover_text(
+                "Radio S.MENU LEVEL: scope reference level in dB (SS04). \
+                 Adjust this when changing bands or span.",
+            );
+        let wheeled = widgets::scroll_value(
+            ui,
+            &response,
+            &mut self.scope_level_db,
+            scu_cat::SCOPE_LEVEL_STEP_DB,
+            scu_cat::SCOPE_LEVEL_MIN_DB,
+            scu_cat::SCOPE_LEVEL_MAX_DB,
+        );
+        if response.changed() || wheeled {
+            self.set_scope_level_db(self.scope_level_db);
+        }
+        let response = ui
+            .add(egui::Slider::new(&mut self.waterfall.black_level, 0.0..=0.9).text("Black"))
+            .on_hover_text("Local waterfall floor; does not change the radio");
         let wheeled = widgets::scroll_value(
             ui,
             &response,
@@ -4058,7 +4189,9 @@ impl ScuApp {
             self.settings.waterfall_black_level = self.waterfall.black_level;
             save_settings(&self.settings);
         }
-        let response = ui.add(egui::Slider::new(&mut self.waterfall.gain, 0.2..=4.0).text("Gain"));
+        let response = ui
+            .add(egui::Slider::new(&mut self.waterfall.gain, 0.2..=4.0).text("Gain"))
+            .on_hover_text("Local waterfall contrast; does not change the radio");
         let wheeled =
             widgets::scroll_value(ui, &response, &mut self.waterfall.gain, 0.05, 0.2, 4.0);
         if response.changed() || wheeled {
@@ -4144,7 +4277,6 @@ impl ScuApp {
 
     /// RF transmit power, sent to the radio over CAT.
     fn ui_tx_power(&mut self, ui: &mut egui::Ui) {
-        theme::section(ui, "TX power");
         let mut power = self.tx_power as i32;
         let response = ui.add(
             egui::Slider::new(
@@ -5571,6 +5703,8 @@ impl ScuApp {
             Action::VolumeDown => self.nudge_volume(-0.05),
             Action::VolumeUp => self.nudge_volume(0.05),
             Action::ToggleMute => self.toggle_mute(),
+            Action::ToggleAtu => self.toggle_atu(),
+            Action::AtuTune => self.start_atu_tune(),
             Action::ToggleHelp => self.show_shortcuts = true,
             Action::Unavailable(message) => self.show_notice(message),
         }
@@ -6008,6 +6142,43 @@ fn toggle_chip(ui: &mut egui::Ui, on: bool, label: &str) -> bool {
         .stroke(egui::Stroke::new(1.0, stroke))
         .min_size(egui::Vec2::new(44.0, 24.0)),
     )
+    .clicked()
+}
+
+/// The ATU toggle. Stays deliberately loud while enabled so it is not left on
+/// by mistake across bands.
+fn atu_chip(ui: &mut egui::Ui, on: bool) -> bool {
+    let (label, fill, stroke, text_color) = if on {
+        (
+            "ATU ON",
+            theme::tx_red(),
+            theme::tx_red(),
+            theme::on_accent(),
+        )
+    } else {
+        (
+            "ATU",
+            theme::button_bg(),
+            theme::outline(),
+            theme::text_dim(),
+        )
+    };
+    ui.add(
+        egui::Button::new(
+            egui::RichText::new(label)
+                .small()
+                .strong()
+                .color(text_color),
+        )
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, stroke))
+        .min_size(egui::Vec2::new(52.0, 24.0)),
+    )
+    .on_hover_text(if on {
+        "ATU enabled: the tuner stays inline and retunes on other bands. Click to bypass."
+    } else {
+        "Enable the radio's internal ATU"
+    })
     .clicked()
 }
 
